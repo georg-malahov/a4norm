@@ -77,6 +77,7 @@ docker run --rm -p 8080:8080 ghcr.io/georg-malahov/a4norm:latest serve
 | `GET /health` | `{"status":"ok", …}` |
 | `POST /scan` | one or more images → `application/pdf` |
 | `POST /scan?format=jpg` | a single image → `image/jpeg` |
+| `POST /pages` | a PDF this service made → its page images, as JSON |
 
 Send images as `multipart/form-data` (any field names, repeat for several pages,
 page order = part order), as a raw body with an image content type for one
@@ -89,6 +90,20 @@ underscores allowed: `?paper_thr=85`). The response carries `X-Pages` and
 ```bash
 curl -X POST http://localhost:8080/scan \
   -F p1=@page1.HEIC -F p2=@page2.HEIC -o document.pdf
+```
+
+`/pages` is the cheap way back to images. a4norm writes one JPEG per page, so
+the pages of its own PDF are already sitting there as streams and can be copied
+out without re-encoding — milliseconds, against about a minute per page to scan
+them again. Send the PDF as a raw body or as JSON `{"pdf": "<base64>"}`; the
+answer is `{"count": N, "types": ["jpg", …], "pages": ["<base64>", …]}` in page
+order. A PDF of vector text has nothing embedded to copy and comes back `422`.
+The route does no image processing, so it does not take a concurrency slot and
+never queues behind a scan.
+
+```bash
+curl -X POST http://localhost:8080/pages \
+  -H 'Content-Type: application/pdf' --data-binary @document.pdf
 ```
 
 Concurrency is capped at one page at a time by default (`--max-concurrency`):

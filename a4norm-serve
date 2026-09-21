@@ -4,6 +4,7 @@
     GET  /health                     -> {"status":"ok", ...}
     POST /scan                       -> application/pdf
     POST /scan?format=jpg            -> image/jpeg  (single page only)
+    POST /pages                      -> {"count":N, "types":[...], "pages":[b64]}
 
 Send the images as multipart/form-data (any field names, repeat for several
 pages, page order = part order) or, for one image, as a raw request body with an
@@ -14,9 +15,16 @@ Query parameters, all optional: format=pdf|jpg, dpi, quality, gray=1,
 rectify=auto|on|off, plus any other a4norm flag passed through as
 flag=value (dashes or underscores both work, e.g. paper_thr=85).
 
+/pages takes a PDF this service produced (raw body, or JSON {"pdf": "<base64>"})
+and hands back its page images without re-encoding anything. A scan's PDF is one
+JPEG per page plus a few hundred bytes of boilerplate, so the embedded streams
+can simply be copied out. It costs milliseconds, where re-running /scan on the
+same pages costs about a minute each.
+
 Stdlib only, like a4norm itself. Concurrency is capped on purpose: one page is
 tens of seconds of CPU, so an unbounded server is a denial-of-service switch for
-whatever else runs on the box.
+whatever else runs on the box. /pages does no image processing and so does not
+take a slot.
 """
 
 import argparse
@@ -42,6 +50,9 @@ RESERVED = {"format", "separate", "o", "output", "preview", "dry-run", "dry_run"
 # end up in an argv list (never a shell), but a flag that looks like a path or a
 # redirect has no business being accepted from a request.
 SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,-_%")
+# A document nobody would send to a chat. The cap exists so one crafted PDF
+# cannot make the service base64 a gigabyte into memory.
+MAX_PAGES = 60
 
 EXT = {
     b"\xff\xd8\xff": ".jpg",
@@ -111,13 +122,20 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self):
-        if urlparse(self.path).path.rstrip("/") != "/scan":
-            return self._fail(404, "not found")
-        o = self.server.opts
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        if path == "/scan":
+            return self._post_scan()
+        if path == "/pages":
+            return self._post_pages()
+        return self._fail(404, "not found")
 
+    def _guard_length(self):
+        """Content-Length, or None once 411/413 has already been answered."""
+        o = self.server.opts
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
-            return self._fail(411, "Content-Length required")
+            self._fail(411, "Content-Length required")
+            return None
         if length > o.max_bytes:
             # Drain first. Answering before reading leaves the client writing
             # into a closed socket, so it reports a connection error instead of
@@ -129,7 +147,15 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 left -= len(chunk)
             self.close_connection = True
-            return self._fail(413, f"body over {o.max_bytes} bytes")
+            self._fail(413, f"body over {o.max_bytes} bytes")
+            return None
+        return length
+
+    def _post_scan(self):
+        o = self.server.opts
+        length = self._guard_length()
+        if length is None:
+            return
 
         q = parse_qs(urlparse(self.path).query)
         one = lambda k, d=None: (q.get(k) or [d])[0]
@@ -194,6 +220,87 @@ class Handler(BaseHTTPRequestHandler):
                         "X-Seconds": f"{secs:.1f}",
                         "Content-Disposition":
                             f'attachment; filename="scan.{fmt}"'})
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def _post_pages(self):
+        """Hand back the page images of a PDF without re-encoding them.
+
+        a4norm writes one JPEG per page, so the pages are already there as
+        streams: pdfimages -all copies them out byte for byte. No slot is
+        taken because nothing is processed -- this is a read, and making it
+        queue behind a minute-long scan would defeat the point of having it.
+        """
+        o = self.server.opts
+        length = self._guard_length()
+        if length is None:
+            return
+        body = self.rfile.read(length)
+        ctype = (self.headers.get("Content-Type") or "").lower()
+
+        blob = body
+        if ctype.startswith("application/json") or body[:1] == b"{":
+            try:
+                doc = json.loads(body.decode("utf-8", "replace"))
+            except ValueError:
+                return self._fail(400, "body is not valid JSON")
+            entry = doc.get("pdf") if isinstance(doc, dict) else None
+            if not isinstance(entry, str) or not entry:
+                return self._fail(400, 'JSON body needs a "pdf" string')
+            if entry.startswith("data:") and "," in entry:
+                entry = entry.split(",", 1)[1]
+            try:
+                blob = base64.b64decode(entry)
+            except (binascii.Error, ValueError):
+                return self._fail(400, "pdf is not valid base64")
+
+        if not blob.startswith(b"%PDF"):
+            return self._fail(400, "body is not a PDF")
+
+        work = tempfile.mkdtemp(prefix="a4norm-pages-")
+        try:
+            src = os.path.join(work, "in.pdf")
+            with open(src, "wb") as fh:
+                fh.write(blob)
+
+            t0 = time.time()
+            try:
+                proc = subprocess.run(
+                    ["pdfimages", "-all", src, os.path.join(work, "page")],
+                    capture_output=True, text=True, timeout=o.job_timeout)
+            except subprocess.TimeoutExpired:
+                return self._fail(504, f"timed out after {o.job_timeout}s")
+            except FileNotFoundError:
+                return self._fail(500, "pdfimages is not installed")
+
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                self.log_message("pdfimages failed rc=%s: %s", proc.returncode,
+                                 " | ".join(tail[-3:]))
+                return self._fail(400, "could not read the PDF")
+
+            names = sorted(n for n in os.listdir(work) if n.startswith("page-"))
+            if not names:
+                # A PDF of vector text rather than a photograph. Nothing to
+                # copy out, and re-rendering it here would be a different job.
+                return self._fail(422, "no embedded page images in this PDF")
+            if len(names) > MAX_PAGES:
+                return self._fail(413, f"{len(names)} images, over the "
+                                       f"{MAX_PAGES} limit")
+
+            pages, kinds = [], []
+            for n in names:
+                with open(os.path.join(work, n), "rb") as fh:
+                    pages.append(base64.b64encode(fh.read()).decode("ascii"))
+                kinds.append(os.path.splitext(n)[1].lstrip(".").lower())
+
+            secs = time.time() - t0
+            self.log_message("-> 200 pages %d (%s) in %.2fs", len(pages),
+                             ",".join(sorted(set(kinds))), secs)
+            self._send(200, {"count": len(pages), "types": kinds,
+                             "pages": pages},
+                       extra={"X-Pages": str(len(pages)),
+                              "X-Seconds": f"{secs:.2f}"})
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
