@@ -165,8 +165,13 @@ before `503`, and a job is killed after 600 s.
    shadow or a finger goes; anything with structure survives), then clean the
    paper to pure white with a 1 px guard ring around every glyph.
 9. **Fit to A4** — from the real sheet edges when two opposite ones are visible
-   (exact px-per-mm, no assumption about the layout), otherwise from the ink
-   block and standard margins, otherwise the frame.
+   (exact px-per-mm, no assumption about the layout). Otherwise the frame, which
+   at least fills the page. The ink-block fit, which infers the scale from an
+   assumed text width, is used only when NO sheet edge was found at all — that
+   is the one case where the margins genuinely have to be guessed, and guessing
+   them when the sheet is plainly inside the frame shrinks a wide worksheet to
+   two thirds of the page (measured 2.11 against the frame's 2.69 and the real
+   sheet's 3.15 on the same photograph). `--fit content` still forces it.
 
 `--dry-run` prints which path each page took and why. Every parameter above is a
 flag; `--help` lists them.
@@ -183,6 +188,8 @@ flag; `--help` lists them.
 | the page was shot at an angle and stayed a trapezoid | the quad was refused — `--rectify on` fails loudly and says why |
 | rectification fired on something that is not a sheet | `--rectify off` |
 | text too small or too large on the page | `--fit frame`, or `--fit content --margins L,R,T` |
+| the page came out small, adrift in wide empty margins | the layout was guessed — `--fit frame`, or `--fit edges` |
+| one page of a set came out smaller than the others | its sheet edges were not all found; compare the `border cut` lines in `--dry-run` |
 | a pale stamp or a pencil note vanished | `--no-haze`, then `--paper-thr 95` |
 | a coloured stamp came out grey | `--chroma 5`, or `--chroma-grow 10` |
 | black print stayed brown or blue-ish | `--chroma 10`, or `--gray` |

@@ -110,8 +110,17 @@ def find_step(prof, core, outer_frac, min_step):
             best_d, best_i = d, i
     if best_i is None or best_d < min_step:
         return None
-    outer = sum(prof[:best_i]) / best_i
-    if abs(outer - core) < min_step:
+    outer = prof[:best_i]
+    mu = sum(outer) / len(outer)
+    var = sum((v - mu) ** 2 for v in outer) / len(outer)
+    spread = var ** 0.5
+    # "Looks like the page" has to mean page-bright AND uniform. A strip that is
+    # half desk and half paper averages out to the page's own brightness -- on a
+    # worksheet photographed against a dark surface the top strip measured mean
+    # 149.0 against a core of 153.5, so the mean alone threw a 48-unit step away
+    # and the sheet lost its top edge. Its spread was 26 where a real page
+    # margin's is 2. Both tests have to agree before an edge is discarded.
+    if abs(mu - core) < min_step and spread < min_step:
         return None
     return best_i + 2
 
@@ -912,19 +921,30 @@ def process_page(src, out_png, o, report):
         elif o.fit == "edges":
             mode_used = "frame (no pair of opposite edges found)"
     if scale is None and o.fit in ("auto", "content"):
-        bb = ink_bbox(cur)
-        if bb and bb[2] >= o.content_min / 100.0 * iw:
-            bx, by, bw, _ = bb
-            text_w = (297 if o.landscape else 210) - o.ml - o.mr
-            s = (text_w / MM * o.dpi) / bw
-            if 0.4 <= s <= 3.0:
-                scale = s
-                off_x = round(o.ml / MM * o.dpi - bx * s)
-                off_y = round(o.mt / MM * o.dpi - by * s)
-                mode_used = (f"content ({bw}px ink block -> {text_w:.0f}mm "
-                             f"text width at {o.ml:.0f}/{o.mr:.0f}/{o.mt:.0f}mm)")
-        if scale is None:
-            mode_used = "frame (no ink block wide enough to anchor on)"
+        # The content fit invents the scale from an ASSUMED text width. That is
+        # only defensible when the frame is cropped tight to the ink and the
+        # margins genuinely have to be guessed. If any sheet edge was found the
+        # sheet is inside the frame, there is nothing to guess, and anchoring on
+        # a 165 mm text column shrinks a wide worksheet to two thirds of the
+        # page -- measured 2.11 where fitting the frame gives 2.69 and the real
+        # sheet gives 3.15. --fit content still forces it.
+        if o.fit == "auto" and any(flags.get(k) for k in
+                                   ("left", "right", "top", "bottom")):
+            mode_used = "frame (a sheet edge was found; no text width to guess)"
+        else:
+            bb = ink_bbox(cur)
+            if bb and bb[2] >= o.content_min / 100.0 * iw:
+                bx, by, bw, _ = bb
+                text_w = (297 if o.landscape else 210) - o.ml - o.mr
+                s = (text_w / MM * o.dpi) / bw
+                if 0.4 <= s <= 3.0:
+                    scale = s
+                    off_x = round(o.ml / MM * o.dpi - bx * s)
+                    off_y = round(o.mt / MM * o.dpi - by * s)
+                    mode_used = (f"content ({bw}px ink block -> {text_w:.0f}mm "
+                                 f"text width at {o.ml:.0f}/{o.mr:.0f}/{o.mt:.0f}mm)")
+            if scale is None:
+                mode_used = "frame (no ink block wide enough to anchor on)"
     if scale is None:
         scale = min(pw / iw, ph / ih)
         mode_used = mode_used or "frame"
