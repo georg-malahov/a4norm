@@ -15,11 +15,14 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   -o /work/contract.pdf /work/page1.HEIC /work/page2.HEIC /work/page3.HEIC
 ```
 
-A synthetic test page is in  — a generated letter,
+A synthetic test page lives in `examples/sample-photo.jpg` — a generated letter,
 degraded to look photographed (warm cast, uneven light, a tilt, a desk border),
-with no real data in it. Handy for a smoke test:
+with no real data in it. A one-line smoke test:
 
-
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
+  --preview /work/examples/sample-photo.jpg
+```
 
 ## Run it
 
