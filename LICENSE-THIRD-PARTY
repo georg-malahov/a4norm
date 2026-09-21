@@ -1,0 +1,27 @@
+Third-party components redistributed in the a4norm:full container image.
+The a4norm source itself is MIT; see LICENSE.
+
+--------------------------------------------------------------------------
+U^2-Net  —  salient object detection weights (u2net.onnx)
+    Source:   https://github.com/xuebinqin/U-2-Net
+    Licence:  Apache License 2.0
+    Weights are redistributed inside the a4norm:full image only. The light
+    image contains no model and no inference runtime.
+
+    Cited as: Qin et al., "U^2-Net: Going Deeper with Nested U-Structure for
+    Salient Object Detection", Pattern Recognition, 2020.
+
+    Only the `u2net` weights are used. rembg's other checkpoints are NOT
+    shipped and must not be substituted: isnet-general-use and isnet-anime
+    inherit DIS5K's non-commercial terms, bria-rmbg is non-commercial, and
+    u2net_portrait was trained on APDrawing, also non-commercial. a4norm-seg
+    therefore pins the model by name and has no fallback.
+
+--------------------------------------------------------------------------
+onnxruntime
+    Source:   https://github.com/microsoft/onnxruntime
+    Licence:  MIT
+
+--------------------------------------------------------------------------
+ImageMagick, poppler, Debian and Alpine base images keep their own licences;
+they are installed by the package manager, not vendored here.

@@ -12,7 +12,9 @@ picture is fitted onto the page as shot, without any of the scanner treatment.
 So the same command also just turns a handful of snapshots into a PDF.
 
 No OpenCV, no NumPy, no ML, no ghostscript. The tool is stdlib-only Python
-driving ImageMagick and poppler, and the container is 104 MB.
+driving ImageMagick and poppler, and the container is 104 MB. A second image,
+`:full`, adds one segmentation model for the photographs the brightness rule
+cannot solve — see **Two images** below. The light image is unchanged by it.
 
 **Try it without installing anything:** [@a4norm_bot](https://t.me/a4norm_bot)
 on Telegram is this tool behind a chat window — send a photo, or a whole album,
@@ -111,13 +113,58 @@ a page is tens of seconds of CPU, so an unbounded server is a denial-of-service
 switch. Bodies over 40 MB are refused, a queued request waits 120 s for a slot
 before `503`, and a job is killed after 600 s.
 
+## Two images
+
+`ghcr.io/georg-malahov/a4norm:latest` is the tool: Alpine, 104 MB, stdlib-only
+Python over ImageMagick and poppler. Nothing about it changed.
+
+`ghcr.io/georg-malahov/a4norm:full` is the same a4norm plus `a4norm-seg`, a
+one-file helper that runs U^2-Net through onnxruntime. It exists for one
+failure the brightness rule cannot be tuned out of: **the sheet being darker
+than what it lies on**. Measured on real photographs, a grey thermal receipt on
+a marble counter reads as 0–3% paper-like where the true figure is 30–45%, so
+it was classed as a photograph and passed through untouched; a white evacuation
+sign on a white wall left the wall in the output. With segmentation all of them
+rectify.
+
+There is no flag. The model is consulted **only after** the brightness detector
+has already failed, so a page that is the brightest thing in frame never pays
+for it, and the light image behaves identically to the full one on every input
+where brightness succeeds. If you want the tool without a model, run the light
+image — that is what the two tags are for.
+
+What the model returns is not trusted on sight. It answers "what stands out
+here", which is not the same question: on a synthetic letter it picked out the
+signature (0.2% of the frame), and on a photo of a desk it outlined the
+monitor, which really is a bright quadrilateral and passes every geometric
+test. So its answer goes through the same acceptance tests as the brightness
+one, plus a last check the geometry cannot make — whether the inside of the
+region reads as paper, by the same bright/low-chroma rule measured against the
+region's own paper level. Measured: 60–97% for every real sheet here, 16% for
+the desk. `--dry-run` prints which path was taken and why.
+
+Debian, not Alpine, because onnxruntime ships no musl wheels. The model is
+baked in at build time rather than fetched on first run: the service is meant
+to run read-only with a tmpfs, where a runtime download either fails or repeats
+after every restart. Nothing is downloaded at runtime and nothing phones home.
+
+The weights are U^2-Net under Apache-2.0 and are redistributed under that
+licence; `LICENSE-THIRD-PARTY` carries the notice. Only the `u2net` checkpoint
+is shipped and it is pinned by name: several other background-removal
+checkpoints in common use (isnet-*, bria-rmbg, u2net_portrait) are licensed for
+non-commercial use only, and an automatic fallback to one of them would quietly
+change what this image may be used for.
+
 ## What it does, in order
 
 1. **Rasterize** — a PDF's embedded image is extracted rather than re-rendered;
    rendering applies the ICC profile and flattens the tonal range.
 2. **Rectify** — the sheet is the big bright low-chroma region, both tests
    relative to the image's own paper level, so a dim photo works like a bright
-   one. Its quadrilateral is warped flat. A quad is accepted only if it looks
+   one. When that assumption is simply false — a grey till slip on a marble
+   counter, a white sign on a white wall, where the background really is
+   brighter than the paper — the `:full` image asks a segmentation model
+   instead, and judges its answer by the same tests (see **Two images**). Its quadrilateral is warped flat. A quad is accepted only if it looks
    like a sheet (15–90% of the frame, filling ≥80% of its hull, corners 45–135°,
    opposite sides within 1.8×); otherwise the reason is printed and the rest of
    the pipeline carries on, because rectifying on a wrong quad is worse than not
@@ -199,6 +246,8 @@ flag; `--help` lists them.
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
 | a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
 | a document was treated as a photo and left untouched | `--photo off`, or lower `--photo-paper` |
+| a sheet darker than its background was ignored entirely | the brightness rule cannot see it — use the `:full` image |
+| the `:full` image rectified something that is not paper | `--dry-run` shows the paper share it measured; the gate is 40% |
 
 ## Speed
 

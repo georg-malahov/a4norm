@@ -1,0 +1,75 @@
+# a4norm:full — the light image plus a segmentation model.
+#
+# Two things force this build onto Debian rather than Alpine: onnxruntime ships
+# manylinux wheels only, and there is no musl build to fall back on. So the
+# light image stays Alpine at 104 MB and this one is a separate base. Both run
+# the same a4norm; only this one carries a4norm-seg.
+#
+# The model is baked in, not downloaded on first start. The service runs with a
+# read-only filesystem and a tmpfs /tmp, so a runtime download would either fail
+# outright or re-fetch 176 MB after every restart.
+FROM debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    A4NORM_MODEL=/opt/a4norm/models/u2net.onnx \
+    OMP_NUM_THREADS=2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-numpy python3-pil \
+      imagemagick poppler-utils ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# onnxruntime only. No rembg: it drags in numba and pymatting for alpha matting
+# we never ask for, and it can fall back to isnet-*/bria-rmbg weights that are
+# licensed for non-commercial use. One model, pinned, no fallbacks.
+RUN pip3 install --break-system-packages --no-cache-dir "onnxruntime==1.23.2"
+
+# U^2-Net weights, Apache-2.0 (github.com/xuebinqin/U-2-Net). Redistributed
+# here under that licence; see LICENSE-THIRD-PARTY in the repository.
+RUN mkdir -p /opt/a4norm/models \
+    && curl -fsSL -o /opt/a4norm/models/u2net.onnx \
+       https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx \
+    && printf '%s  /opt/a4norm/models/u2net.onnx\n' \
+       8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491 \
+       | sha256sum -c -
+
+COPY a4norm a4norm-serve a4norm-seg /usr/local/bin/
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/a4norm /usr/local/bin/a4norm-serve \
+             /usr/local/bin/a4norm-seg /usr/local/bin/entrypoint.sh
+
+# Same build-time smoke test as the light image, plus one the light image
+# cannot run: a photograph whose sheet is DARKER than what it lies on. The
+# brightness detector must fail on it and segmentation must rescue it, or this
+# image has no reason to exist.
+RUN set -e; \
+    magick -size 600x850 xc:white -fill '#111111' \
+      -draw "rectangle 100,150 500,172" -draw "rectangle 100,260 430,282" \
+      -draw "rectangle 100,370 470,392" \
+      -background '#8b8b8b' -rotate 0.6 -bordercolor '#8b8b8b' -border 20 \
+      /tmp/smoke.jpg; \
+    a4norm -o /tmp/smoke.pdf /tmp/smoke.jpg; \
+    pdfinfo /tmp/smoke.pdf | grep -q 'A4'; \
+    a4norm -o /tmp/two.pdf /tmp/smoke.jpg /tmp/smoke.jpg; \
+    test "$(pdfinfo /tmp/two.pdf | awk '/^Pages:/ {print $2}')" = "2"; \
+    magick -size 900x1200 xc:'#d8d8d8' -fill '#3a3a3a' \
+      -draw "rectangle 120,200 780,232" -draw "rectangle 120,320 640,352" \
+      -draw "rectangle 120,440 720,472" \
+      -background white -rotate 3 -bordercolor white -border 140 \
+      /tmp/dark.png; \
+    a4norm --dry-run /tmp/dark.png | grep -q 'found by segmentation'; \
+    a4norm-serve --port 8099 & \
+    SRV=$!; \
+    sleep 3; \
+    python3 -c "import urllib.request,json,sys; \
+d=json.load(urllib.request.urlopen('http://127.0.0.1:8099/health')); \
+sys.exit(0 if d.get('status')=='ok' else 1)"; \
+    kill $SRV; \
+    rm -f /tmp/smoke.jpg /tmp/smoke.pdf /tmp/two.pdf /tmp/dark.png
+
+WORKDIR /work
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["--help"]

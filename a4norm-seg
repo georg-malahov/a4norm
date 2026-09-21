@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""a4norm-seg — write a foreground mask for an image, for a4norm to judge.
+
+    a4norm-seg INPUT.jpg MASK.png
+
+Exists only in the full image. a4norm calls it ONLY when its own brightness
+detector has already failed to find the sheet, so the cost falls on the
+photographs that would otherwise come out wrong, not on every page.
+
+The model is U^2-Net (Apache-2.0), baked into the image at build time and run
+through onnxruntime directly -- no rembg. That is deliberate: rembg drags in
+numba and pymatting for alpha matting we do not use, and it can silently fall
+back to isnet-* or bria-rmbg weights, which are licensed for NON-COMMERCIAL use
+only. One file, one model, no fallbacks, nothing to download at runtime.
+
+The mask answers "what stands out here", not "where is the sheet". Telling
+those apart is a4norm's job, not this script's.
+"""
+import os
+import sys
+
+SIDE = 320                      # what U^2-Net was trained at
+MEAN = (0.485, 0.456, 0.406)
+STD = (0.229, 0.224, 0.225)
+
+
+def model_path():
+    for p in (os.environ.get("A4NORM_MODEL"),
+              "/opt/a4norm/models/u2net.onnx",
+              os.path.expanduser("~/.rembg/models/u2net/u2net.onnx"),
+              os.path.expanduser("~/.u2net/u2net.onnx")):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.exit("usage: a4norm-seg INPUT MASK.png")
+    src, dst = argv[1], argv[2]
+    if not os.path.exists(src):
+        sys.exit(f"a4norm-seg: no such file: {src}")
+    weights = model_path()
+    if not weights:
+        sys.exit("a4norm-seg: model not found (set A4NORM_MODEL)")
+
+    os.environ.setdefault("OMP_NUM_THREADS", "2")
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        from PIL import Image
+    except ImportError as exc:
+        sys.exit(f"a4norm-seg: this build has no segmentation support ({exc})")
+
+    img = Image.open(src).convert("RGB")
+    small = img.resize((SIDE, SIDE), Image.BILINEAR)
+    x = np.asarray(small, dtype=np.float32) / 255.0
+    # U^2-Net divides by the image's own maximum before normalising; on a dark
+    # photograph that is not the same as dividing by 255, and skipping it
+    # visibly weakens the mask.
+    peak = x.max()
+    if peak > 0:
+        x = x / peak
+    x = (x - np.array(MEAN, dtype=np.float32)) / np.array(STD, dtype=np.float32)
+    x = x.transpose(2, 0, 1)[None]
+
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 2
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess = ort.InferenceSession(weights, so, providers=["CPUExecutionProvider"])
+    d0 = sess.run(None, {sess.get_inputs()[0].name: x})[0][0, 0]
+
+    lo, hi = float(d0.min()), float(d0.max())
+    d0 = (d0 - lo) / (hi - lo) if hi > lo else np.zeros_like(d0)
+    mask = Image.fromarray((d0 * 255).astype(np.uint8), mode="L")
+    mask.resize(img.size, Image.BILINEAR).save(dst)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -294,7 +294,18 @@ def detect_quad(path, side=400):
         if V[i] >= v_thr and C[i] <= 45:
             mask[i] = 1
     mask = _open4(mask, w, h)
+    return _quad_from_mask(mask, w, h, w0, h0)
 
+
+def _quad_from_mask(mask, w, h, w0, h0):
+    """Largest blob in a binary mask -> sheet quad, or (None, why, share).
+
+    Split out so a segmentation mask can be judged by exactly the same rules as
+    the brightness mask. Every threshold below was tuned against real
+    photographs; giving the model its own looser set would be how a photo of a
+    desk ends up rectified as if it were paper.
+    """
+    n = w * h
     seen = bytearray(n); best = []
     for s0 in range(n):
         if mask[s0] and not seen[s0]:
@@ -341,6 +352,95 @@ def detect_quad(path, side=400):
         return None, "opposite sides differ too much to be one flat sheet", frac
     sx, sy = w0 / w, h0 / h
     return [(p[0] * sx, p[1] * sy) for p in quad], f"{frac:.0%} of the frame", frac
+
+
+# How much of a segmented region must read as paper before a4norm will rectify
+# on it. Measured across every test photograph here: 60-97% for real sheets,
+# 16% for a photo of a desk whose monitor the model picked out. 40 sits in the
+# middle of that gap with room on both sides.
+SEG_PAPER_MIN = 40.0
+
+
+def segment_quad(path, side=400):
+    """The sheet's quad from a segmentation mask, when brightness cannot find it.
+
+    detect_quad assumes the page is the brightest low-chroma thing in frame. A
+    grey till slip on a marble counter, or a white sign on a white wall, break
+    that assumption outright -- measured paper-like area 0-3% where the real
+    figure is 30-45% -- and no threshold fixes it, because the background really
+    is brighter than the paper.
+
+    A segmentation model has no brightness assumption. It answers a different
+    question, though: "what stands out here?", not "where is the sheet?". On a
+    synthetic letter it picked the signature, 0.2% of the frame; on a photo of a
+    desk it happily outlined the clutter. So its answer goes through the SAME
+    acceptance tests as the brightness one, and the 80% fill test does the
+    separating on its own: 82-98% for every real sheet measured, 48% for the
+    desk, 19% for the signature.
+
+    Needs the `a4norm-seg` helper, which only exists in the full image. Without
+    it this returns quietly and nothing changes.
+    """
+    seg = shutil.which("a4norm-seg")
+    if not seg:
+        here = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "a4norm-seg")
+        seg = here if os.access(here, os.X_OK) else None
+    if not seg:
+        return None, "no segmentation helper installed", 0.0
+
+    work = tempfile.mkdtemp(prefix="a4norm-seg-")
+    try:
+        mask_png = os.path.join(work, "mask.png")
+        try:
+            proc = subprocess.run([seg, path, mask_png], capture_output=True,
+                                  text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, f"segmentation did not run ({exc.__class__.__name__})", 0.0
+        if proc.returncode != 0 or not os.path.exists(mask_png):
+            tail = (proc.stderr or "").strip().splitlines()
+            return None, "segmentation failed" + (f": {tail[-1]}" if tail else ""), 0.0
+
+        w0, h0 = dims(path)
+        w = side
+        h = max(1, round(side * h0 / w0))
+        buf = raw_gray(mask_png, w, h)
+        mask = bytearray(1 if v > 128 else 0 for v in buf)
+        mask = _open4(mask, w, h)
+        quad, why, frac = _quad_from_mask(mask, w, h, w0, h0)
+        if quad is None:
+            return None, why, frac
+
+        # Shape is not enough. The model answers "what stands out", and on a
+        # photograph of a desk what stands out is a monitor -- which really is
+        # a bright quadrilateral and sails through every geometric test. So
+        # ask the last question the geometry cannot: does the INSIDE of this
+        # region look like paper? Same bright/low-chroma rule the brightness
+        # detector uses, but measured against the region's own paper level, so
+        # a grey till slip counts as paper and a forest photo on a screen does
+        # not. Measured: 60-97% for every real sheet here, 16% for the desk.
+        rgb = raw_rgb(path, w, h)
+        vals = []
+        for i in range(w * h):
+            if not mask[i]:
+                continue
+            j = i * 3
+            r, g, b = rgb[j], rgb[j + 1], rgb[j + 2]
+            v = r if r > g else g
+            if b > v: v = b
+            m = r if r < g else g
+            if b < m: m = b
+            vals.append((v, v - m))
+        if not vals:
+            return None, "segmented region is empty", frac
+        paper = sorted(v for v, _ in vals)[int(0.95 * (len(vals) - 1))]
+        thr = max(60, int(paper * 0.72))
+        share = sum(1 for v, c in vals if v >= thr and c <= 45) / len(vals)
+        if share * 100 < SEG_PAPER_MIN:
+            return (None, f"the segmented region does not look like paper "
+                    f"({share:.0%} of it, under {SEG_PAPER_MIN:.0f}%)", frac)
+        return quad, why, frac
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def rectify(src, dst, quad, inset_pct):
@@ -655,6 +755,18 @@ def process_page(src, out_png, o, report):
         return fit_photo_page(src, out_png, o, report)
     if o.rectify != "off":
         quad, why, paper_share = detect_quad(src)
+        if quad is None:
+            # Brightness could not find the sheet. Ask the segmentation helper,
+            # if this build has one, and judge its answer by the same rules.
+            # Only here, never on the common path: the model costs a second and
+            # buys nothing when the page is already the brightest thing around.
+            seg_quad, seg_why, seg_share = segment_quad(src)
+            if seg_quad is not None:
+                quad = seg_quad
+                why = f"{seg_why}, found by segmentation after brightness failed ({why})"
+                paper_share = max(paper_share, seg_share)
+            elif "no segmentation helper" not in seg_why:
+                report.append(f"segmentation did not find a sheet either: {seg_why}")
         if quad is None:
             if o.rectify == "on":
                 sys.exit(f"a4norm: --rectify on, but no sheet quad found: {why}")
