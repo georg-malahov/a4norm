@@ -117,6 +117,16 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             return self._fail(411, "Content-Length required")
         if length > o.max_bytes:
+            # Drain first. Answering before reading leaves the client writing
+            # into a closed socket, so it reports a connection error instead of
+            # the 413 — and then nobody knows why the upload "failed".
+            left = min(length, o.max_bytes * 4)
+            while left > 0:
+                chunk = self.rfile.read(min(65536, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+            self.close_connection = True
             return self._fail(413, f"body over {o.max_bytes} bytes")
 
         q = parse_qs(urlparse(self.path).query)
