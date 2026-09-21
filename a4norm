@@ -350,7 +350,48 @@ def rectify(src, dst, quad, inset_pct):
     return W, H
 
 
-def clean_border(path, dst, band_pct, max_share=25.0, side=520):
+# The definition of "printed structure", used by _marks_map below. These are
+# not tuning knobs — they are what the measure MEANS — so they are constants,
+# not flags. The two decisions they feed (--band-structure, --band-dark) are.
+BAND_MARK_DISK = 0.35   # % of the short side: wide enough to swallow a glyph
+                        # stroke, far too small to swallow a binding ring
+BAND_MARK_DELTA = 35    # % darker than its own local background a mark must be
+BAND_MARK_BED = 55      # % of the paper level that background must still keep
+
+
+def _marks_map(path, w, h, paper):
+    """Per-cell density (0-255) of PRINTED marks, on the flood's own grid.
+
+    A mark is a pixel darker than its OWN local background, where the local
+    background is the image closed with a disk wide enough to swallow a glyph
+    stroke but far too small to swallow a desk band or a binding ring. So a
+    uniform thing that leans in from outside the sheet contributes nothing,
+    while text printed on a shaded panel contributes its own coverage.
+
+    The "the background must still be paper-bright" clause is what keeps the
+    ragged rim of a dark binding ring out of the count: a rim sits on a dark
+    bed, a glyph sits on a light one. Without it a real spiral binding measured
+    4.6% structure against 5.1% for a shaded form panel — no gap at all.
+    """
+    disk = max(3, round(min(dims(path)) * BAND_MARK_DISK / 100.0))
+    bed = round(paper * BAND_MARK_BED / 255.0, 1)
+    return subprocess.run(
+        ["magick", str(path), "-colorspace", "gray",
+         "(", "+clone", "-morphology", "Close", f"Disk:{disk}", ")",
+         "(", "-clone", "0", "-clone", "1", "-compose", "Difference",
+         "-composite", "-threshold", f"{BAND_MARK_DELTA}%", ")",
+         "(", "-clone", "1", "-threshold", f"{bed}%", ")",
+         "-delete", "0,1", "-compose", "Multiply", "-composite",
+         "-morphology", "Open", "Octagon:1",
+         "-resize", f"{w}x{h}!", "-depth", "8", "gray:-"],
+        check=True, capture_output=True).stdout
+
+
+SIDES = ("left", "right", "top", "bottom")
+
+
+def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
+                 max_share=25.0, side=520):
     """Erase whatever leans in from outside the sheet, without cropping.
 
     Non-paper pixels that are CONNECTED TO THE FRAME EDGE are desk, shadow or a
@@ -363,6 +404,19 @@ def clean_border(path, dst, band_pct, max_share=25.0, side=520):
     a line of text is just as "dark" as a binding. Connectivity is the property
     that actually separates the two. The flood is depth-capped so a stroke that
     does touch the edge cannot drain the whole page.
+
+    Connectivity alone is still not enough, and that is the second bug this
+    function has had. A printed form carries grey shaded panels, and a panel
+    that reaches the edge of the sheet is BOTH darker than the paper AND touching
+    the border, so it is flooded, repainted, and then guillotined together with
+    the print sitting on it — that is how page 3 of a real four-page job lost its
+    whole left column, every line ending mid-word. So each side of the
+    flood is now judged before it is acted on: a side whose flooded pixels carry
+    printed structure, or are only mildly darker than the paper, is part of the
+    DOCUMENT. Such a side is never cropped, and the flood there is pulled back
+    to a shallow `keep_pct` strip — enough for an edge fringe, far too little to
+    eat a panel. When the two tests disagree the content wins: a slightly dirty
+    edge is a far better failure than amputated text.
     """
     w0, h0 = dims(path)
     w = side
@@ -415,11 +469,47 @@ def clean_border(path, dst, band_pct, max_share=25.0, side=520):
                 j2 = yy * w + xx
                 if not reach[j2] and (V[j2] < v_bad or C[j2] > 45):
                     reach[j2] = 1; q.append((j2, d + 1))
+    if not any(reach):
+        return None, 0.0, {}, {}
+
+    # Judge each side of the flood before acting on it. Every flooded pixel
+    # belongs to the border it is nearest to, and for that group two numbers
+    # are measured: how much printed structure it carries, and how dark it is
+    # compared with the page's own paper level.
+    marks = _marks_map(path, w, h, paper)
+    tot = {k: [0, 0, 0] for k in SIDES}
+    owner = bytearray(n)
+    for i in range(n):
+        if not reach[i]:
+            continue
+        x, y = i % w, i // w
+        dist = (x, w - 1 - x, y, h - 1 - y)
+        k = dist.index(min(dist))
+        owner[i] = k + 1
+        t = tot[SIDES[k]]
+        t[0] += marks[i]; t[1] += 1; t[2] += V[i]
+    verdict = {}
+    for k in SIDES:
+        mk, cnt, vs = tot[k]
+        st = 100.0 * mk / (255.0 * cnt) if cnt else 0.0
+        dk = 100.0 * vs / (cnt * paper) if cnt and paper else 0.0
+        verdict[k] = (st, dk, st > struct_pct or dk > dark_pct, cnt)
+
+    # A side that is part of the document keeps everything past a shallow strip.
+    keep = max(2, int(min(w, h) * keep_pct / 100.0))
+    for i in range(n):
+        k = owner[i]
+        if not k or not verdict[SIDES[k - 1]][2]:
+            continue
+        x, y = i % w, i // w
+        if (x, w - 1 - x, y, h - 1 - y)[k - 1] > keep:
+            reach[i] = 0
+
     share = 100.0 * sum(reach) / n
     if share <= 0.0:
-        return None, 0.0, {}
+        return None, 0.0, {}, verdict
     if share > max_share:
-        return None, share, {}
+        return None, share, {}, verdict
 
     # A binding is a THICK band of border-connected junk, and the flood only
     # partly bites into it: the paper gaps between the spiral rings stop it. So
@@ -429,8 +519,13 @@ def clean_border(path, dst, band_pct, max_share=25.0, side=520):
     # wrong when it ate the first line and the list dashes.
     cov_need = 0.15
     cut = {}
-    for name in ("left", "right", "top", "bottom"):
+    for name in SIDES:
         last = 0
+        if verdict[name][2]:
+            # printed structure, or barely darker than paper: this band is the
+            # document, not something leaning in from outside it. Never cut it.
+            cut[name] = 0
+            continue
         if name in ("left", "right"):
             rng = range(depth) if name == "left" else range(w - 1, w - 1 - depth, -1)
             for k, x in enumerate(rng):
@@ -455,7 +550,7 @@ def clean_border(path, dst, band_pct, max_share=25.0, side=520):
            "-resize", f"{w0}x{h0}!", "-blur", "0x2", ")",
            "-compose", "Over", "-composite", dst)
     os.unlink(mpath)
-    return dst, share, cut
+    return dst, share, cut, verdict
 
 
 # --------------------------------------------------------------- page pipeline
@@ -497,7 +592,81 @@ def rasterize(src, workdir, min_px=2400, tag="s00"):
             if f.startswith(f"{tag}-page") and f.endswith(".png")]
 
 
+def fit_photo_page(src, out_png, o, report):
+    """The photo path: geometry, and nothing else. A single early return.
+
+    The README promises that a frame holding no document is "fitted onto the
+    page as shot", and it was not true: the stages were merely switched off one
+    by one with `not photo` guards further down, and the paper-whitening Screen
+    composite at the very end of the fit carried no guard at all. It threw every
+    pixel above --paper-thr to pure white, which on a real photograph blew 6% of
+    the frame out and dragged the colour balance with it (measured on a photo of
+    a green screen: pure-white pixels 0.37% -> 5.96%, mean blue +4.4/255).
+
+    So the photo path is not the document pipeline with flags off any more, it
+    is this function, which returns before that pipeline begins. The only things
+    that happen to the pixels are the resize onto the page and the JPEG encode
+    the caller does at --photo-dpi / --photo-quality. Nothing can leak in later
+    without being written here on purpose.
+    """
+    iw, ih = dims(src)
+    page_dpi = o.photo_dpi
+    pw = round(210 / MM * page_dpi)
+    ph = round(297 / MM * page_dpi)
+    # In photo mode the PAGE turns, not the picture: rotating a landscape
+    # snapshot to fit a portrait page would stand its content on its side.
+    turned = iw > ih * 1.05 and not o.landscape
+    if o.landscape or turned:
+        pw, ph = ph, pw
+    scale = min(pw / iw, ph / ih)
+    off = (round((pw - iw * scale) / 2), round((ph - ih * scale) / 2))
+    scaled = f"{out_png}.photo-scaled.png"
+    magick(src, "-resize", f"{scale * 100:.4f}%", scaled)
+    magick("-size", f"{pw}x{ph}", "xc:white", scaled,
+           "-geometry", f"{off[0]:+d}{off[1]:+d}", "-composite",
+           "-colorspace", "sRGB", out_png)
+    os.unlink(scaled)
+    if o.gray:
+        report.append("--gray ignored: the photo path does not touch colour")
+    report.append(f"fit: frame (photo, {'landscape page' if turned else 'kept as shot'})"
+                  f"; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
+    report.append(f"page: {pw}x{ph}px @ {page_dpi}dpi (no flat-field, no tone, "
+                  f"no paper-whitening, no sharpen — passthrough)")
+    return out_png, True, page_dpi
+
+
 def process_page(src, out_png, o, report):
+    # 0. document or photo? Decided BEFORE anything touches the pixels, because
+    #    the photo path is a different pipeline, not this one with stages turned
+    #    off. --photo on used to still run the rectify, which is exactly the
+    #    kind of leak the early return exists to make impossible.
+    quad, why, paper_share = None, None, 1.0
+    if o.photo == "on":
+        report.append("--photo on — kept as a photo, not scanned")
+        return fit_photo_page(src, out_png, o, report)
+    if o.rectify != "off":
+        quad, why, paper_share = detect_quad(src)
+        if quad is None:
+            if o.rectify == "on":
+                sys.exit(f"a4norm: --rectify on, but no sheet quad found: {why}")
+            report.append(f"no rectification: {why}")
+            # No sheet quad AND almost no paper-like area means there is no
+            # document in the frame — somebody is just turning photos into a
+            # PDF. Scanner treatment would wreck that: it bleaches the picture,
+            # straightens it by a few degrees off some accidental edge, and
+            # lays it out as if it were a text block. Measured paper-like
+            # area: 9% for a photo of a screen, 40-83% for every real document
+            # and test page here — the threshold sits in a wide gap.
+            if o.photo == "auto" and paper_share * 100 < o.photo_paper:
+                report.append(f"no document in the frame (paper-like area "
+                              f"{paper_share:.0%}, under --photo-paper "
+                              f"{o.photo_paper:.0f}%) — kept as a photo, not "
+                              f"scanned")
+                return fit_photo_page(src, out_png, o, report)
+            report.append(f"paper-like area {paper_share:.0%} >= --photo-paper "
+                          f"{o.photo_paper:.0f}% — treated as a document")
+
+    # ---- from here down it is a document. There is no `photo` flag any more.
     cur = src
     step = 0
     rectified = False
@@ -513,67 +682,59 @@ def process_page(src, out_png, o, report):
     # 1. rectify: warp the sheet's own quadrilateral onto a rectangle. This has
     #    to come first — every later step assumes the page is flat, and a page
     #    shot at an angle is the one thing a rectangular crop can never fix.
-    paper_share = 1.0
-    photo = o.photo == "on"
-    if o.rectify != "off":
-        quad, why, paper_share = detect_quad(src)
-        if quad:
+    if quad:
+        step += 1
+        dst = f"{out_png}.s{step}-rectify.png"
+        W, H = rectify(src, dst, quad, o.rect_inset)
+        cur = dst
+        rectified = True
+        report.append(f"rectified the sheet quad ({why}) -> {W}x{H}")
+        if not o.no_edge_clean:
             step += 1
-            dst = f"{out_png}.s{step}-rectify.png"
-            W, H = rectify(src, dst, quad, o.rect_inset)
-            cur = dst
-            rectified = True
-            report.append(f"rectified the sheet quad ({why}) -> {W}x{H}")
-            if not o.no_edge_clean:
-                step += 1
-                cleaned = f"{out_png}.s{step}-border.png"
-                got, share, cut = clean_border(cur, cleaned, o.edge_band)
-                if got:
-                    cur = got
-                    report.append(f"erased what leaned in from outside the "
-                                  f"sheet ({share:.1f}% of the page)")
-                    pad = round(max(W, H) * 0.004)
-                    l = cut["left"] + pad if cut["left"] else 0
-                    r = cut["right"] + pad if cut["right"] else 0
-                    t = cut["top"] + pad if cut["top"] else 0
-                    b = cut["bottom"] + pad if cut["bottom"] else 0
-                    if (l or r or t or b) and W - l - r > 100 and H - t - b > 100:
-                        stage("binding", "-crop",
-                              f"{W - l - r}x{H - t - b}+{l}+{t}", "+repage")
-                        W, H = W - l - r, H - t - b
-                        report.append(f"cut a solid band of it away: "
-                                      f"L/R/T/B = {l}/{r}/{t}/{b} px")
-                        # the crop exposes a fresh border: whatever the band was
-                        # hiding is now the outermost pixel, so flood once more
-                        step += 1
-                        again = f"{out_png}.s{step}-border2.png"
-                        got2, share2, _ = clean_border(cur, again, o.edge_band)
-                        if got2:
-                            cur = got2
-                            report.append(f"second pass on the new border "
-                                          f"({share2:.1f}%)")
-                elif share:
-                    report.append(f"border cleanup skipped: it would have "
-                                  f"repainted {share:.0f}% of the page")
-        elif o.rectify == "on":
-            sys.exit(f"a4norm: --rectify on, but no sheet quad found: {why}")
-        else:
-            report.append(f"no rectification: {why}")
-            # No sheet quad AND almost no paper-like area means there is no
-            # document in the frame — somebody is just turning photos into a
-            # PDF. Scanner treatment would wreck that: it bleaches the picture,
-            # straightens it by a few degrees off some accidental edge, and
-            # lays it out as if it were a text block. Measured paper-like area:
-            # 9% for a photo of a desk, 40-97% for every real document.
-            if o.photo == "auto" and paper_share * 100 < o.photo_paper:
-                photo = True
-    if photo:
-        report.append(f"no document in the frame (paper-like area "
-                      f"{paper_share:.0%}) — kept as a photo, not scanned")
+            cleaned = f"{out_png}.s{step}-border.png"
+            got, share, cut, verdict = clean_border(
+                cur, cleaned, o.edge_band, o.edge_keep,
+                o.band_structure, o.band_dark)
+            kept = [f"{k} (structure {verdict[k][0]:.1f}%, "
+                    f"brightness {verdict[k][1]:.0f}% of paper)"
+                    for k in SIDES if verdict.get(k) and verdict[k][2]
+                    and verdict[k][3]]
+            if kept:
+                report.append("kept as document, not erased or cut: "
+                              + "; ".join(kept))
+            if got:
+                cur = got
+                report.append(f"erased what leaned in from outside the "
+                              f"sheet ({share:.1f}% of the page)")
+                pad = round(max(W, H) * 0.004)
+                l = cut["left"] + pad if cut["left"] else 0
+                r = cut["right"] + pad if cut["right"] else 0
+                t = cut["top"] + pad if cut["top"] else 0
+                b = cut["bottom"] + pad if cut["bottom"] else 0
+                if (l or r or t or b) and W - l - r > 100 and H - t - b > 100:
+                    stage("binding", "-crop",
+                          f"{W - l - r}x{H - t - b}+{l}+{t}", "+repage")
+                    W, H = W - l - r, H - t - b
+                    report.append(f"cut a solid band of it away: "
+                                  f"L/R/T/B = {l}/{r}/{t}/{b} px")
+                    # the crop exposes a fresh border: whatever the band was
+                    # hiding is now the outermost pixel, so flood once more
+                    step += 1
+                    again = f"{out_png}.s{step}-border2.png"
+                    got2, share2, _, _ = clean_border(
+                        cur, again, o.edge_band, o.edge_keep,
+                        o.band_structure, o.band_dark)
+                    if got2:
+                        cur = got2
+                        report.append(f"second pass on the new border "
+                                      f"({share2:.1f}%)")
+            elif share:
+                report.append(f"border cleanup skipped: it would have "
+                              f"repainted {share:.0f}% of the page")
 
     # 2. rotate to the target orientation
     w0, h0 = dims(cur)
-    if o.rotate == "auto" and not photo:
+    if o.rotate == "auto":
         # A near-square page has no meaningful orientation, so a 1% difference
         # between the sides is noise, not a decision — rotating on it turns a
         # notebook page sideways for no reason.
@@ -590,7 +751,7 @@ def process_page(src, out_png, o, report):
     # 3. cut the photographic border (desk, shadow, sheet edge). Pointless
     #    after a rectify — the quad already ended exactly at the sheet.
     flags, span, shave = {}, {}, {"l": 0, "t": 0}
-    if not o.no_trim and not rectified and not photo:
+    if not o.no_trim and not rectified:
         dl, dr, dt, db, flags = detect_border(cur, o.trim_band / 100.0, o.trim_step)
         iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
         # The detected step IS the sheet boundary, so the span between two
@@ -619,8 +780,7 @@ def process_page(src, out_png, o, report):
     # then its own tint on the ink reads as "coloured ink" and gets preserved,
     # which is how a black biro came out brown. A per-channel estimate white-
     # balances the sheet, so what survives in colour is really coloured.
-    if not photo:
-        stage("flat",
+    stage("flat",
               "(", "+clone",
               "-morphology", "Close", f"Octagon:{o.close}",
               "-resize", f"{o.bg_scale}%", "-blur", "0x6",
@@ -631,7 +791,7 @@ def process_page(src, out_png, o, report):
     #    binarized copy, and on a dim photo the whole sheet falls below the
     #    threshold and reads as one blob, so a real tilt is measured as 0.0deg.
     #    Once the paper is white, the text lines are what the estimator sees.
-    if not o.no_deskew and not rectified and not photo:
+    if not o.no_deskew and not rectified:
         # After a rectify the quad IS the page orientation. Re-measuring it from
         # text baselines then fights it, and on handwriting the estimator has no
         # baselines worth trusting: it read +1.61 deg off an already-flat page.
@@ -669,7 +829,7 @@ def process_page(src, out_png, o, report):
         stage("gray", "-colorspace", "gray", "-colorspace", "sRGB",
               "-type", "TrueColor")
         report.append("grayscale output")
-    elif not o.no_neutralize and not photo:
+    elif not o.no_neutralize:
         flat = cur
         mx = f"{out_png}.chroma.png"
         # Coloured ink = high chroma AND dark. Chroma alone also fires on the
@@ -700,13 +860,12 @@ def process_page(src, out_png, o, report):
         report.append(f"ink neutralized, coloured ink kept on {share:.3f}% of the page")
 
     # 7. tone: paper to white, ink deep — percentile based, not a fixed curve
-    if not photo:
-        stage("tone", "-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%")
+    stage("tone", "-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%")
 
     # 8. erase leftover smooth haze: a soft shadow, a finger, an edge glow.
     #    Bright AND featureless -> paper. Anything with structure (ink, a faint
     #    stamp, a pencil note) has local variance and survives.
-    if not o.no_haze and not photo:
+    if not o.no_haze:
         hz = f"{out_png}.haze.png"
         magick(cur, "-colorspace", "gray",
                "(", "+clone", "-statistic", "StandardDeviation", "7x7",
@@ -720,7 +879,7 @@ def process_page(src, out_png, o, report):
         cur = nxt
 
     # 9. clean the paper to pure white, protecting a 1px ring around the ink
-    if not o.no_flatten_paper and not photo:
+    if not o.no_flatten_paper:
         stage("white",
               "(", "+clone", "-colorspace", "gray",
               "-threshold", f"{o.paper_thr}%",
@@ -729,21 +888,14 @@ def process_page(src, out_png, o, report):
 
     # 10. fit onto A4
     iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
-    page_dpi = o.photo_dpi if photo else o.dpi
+    page_dpi = o.dpi
     pw = round(210 / MM * page_dpi)
     ph = round(297 / MM * page_dpi)
-    turned = photo and iw > ih * 1.05 and not o.landscape
-    if o.landscape or turned:
-        # In photo mode the page turns, not the picture: rotating a landscape
-        # snapshot to fit a portrait page would stand its content on its side.
+    if o.landscape:
         pw, ph = ph, pw
 
     scale, off_x, off_y, mode_used = None, None, None, None
-    if photo:
-        scale = min(pw / iw, ph / ih)
-        mode_used = ("frame (photo, landscape page)" if turned
-                     else "frame (photo, kept as shot)")
-    if scale is None and rectified and o.fit == "auto":
+    if rectified and o.fit == "auto":
         scale = min(pw / iw, ph / ih)
         mode_used = "frame (the rectified quad is the sheet)"
     if scale is None and o.fit in ("auto", "edges"):
@@ -793,7 +945,7 @@ def process_page(src, out_png, o, report):
            "-compose", "Screen", "-composite", page)
     report.append(f"fit: {mode_used}; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
     report.append(f"page: {pw}x{ph}px @ {page_dpi}dpi")
-    return page, photo, page_dpi
+    return page, False, page_dpi
 
 
 def write_pdf(jpegs, out, dpi, label=None):
@@ -997,6 +1149,19 @@ def main():
                    help="%% the detected quad is pulled in before warping")
     g.add_argument("--edge-band", type=float, default=10.0,
                    help="%% of the short side the border flood may reach in")
+    g.add_argument("--edge-keep", type=float, default=1.0,
+                   help="%% of the short side the border flood may reach in on "
+                        "a side judged to be document — a shaded panel of a "
+                        "printed form that happens to touch the sheet edge")
+    g.add_argument("--band-structure", type=float, default=6.0,
+                   help="%% printed-mark density in a flooded border band above "
+                        "which that band is document: never cropped, flooded "
+                        "only as far as --edge-keep")
+    g.add_argument("--band-dark", type=float, default=60.0,
+                   help="%% of the page's own paper level a flooded border band "
+                        "must be darker than to count as something leaning in "
+                        "from outside the sheet; brighter than that it is a "
+                        "shaded part of the document")
     g.add_argument("--no-edge-clean", action="store_true")
     g.add_argument("--close", type=int, default=6,
                    help="ink-removal radius for the background estimate")

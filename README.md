@@ -14,6 +14,10 @@ So the same command also just turns a handful of snapshots into a PDF.
 No OpenCV, no NumPy, no ML, no ghostscript. The tool is stdlib-only Python
 driving ImageMagick and poppler, and the container is 104 MB.
 
+**Try it without installing anything:** [@a4norm_bot](https://t.me/a4norm_bot)
+on Telegram is this tool behind a chat window — send a photo, or a whole album,
+and the A4 PDF comes back. It runs the same container as below.
+
 ```bash
 docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   -o /work/contract.pdf /work/page1.HEIC /work/page2.HEIC /work/page3.HEIC
@@ -105,17 +109,35 @@ before `503`, and a job is killed after 600 s.
    rectifying.
 3. **Or decide there is no document at all.** If no sheet quad was accepted
    *and* the paper-like area is under `--photo-paper` (20%), the frame is a
-   photo, not a page: everything below is skipped and the picture is fitted
-   onto the page as shot, at `--photo-dpi` (200) and `--photo-quality` (82)
-   with 4:2:0 chroma — text needs full chroma and 300 dpi, a snapshot does
-   not. A landscape photo turns the page instead of being rotated. Measured
-   paper-like area: 9% for a photo of a desk, 40–97% for every real document,
-   so the threshold sits in a wide gap. `--photo off` forces the scanner
-   treatment, `--photo on` forces the short path.
+   photo, not a page. This is decided BEFORE anything touches the pixels, and
+   the photo path is a single early return, not this pipeline with stages
+   switched off, so nothing written below can leak onto it. The only things
+   that happen to the picture are the geometric fit onto the page and the JPEG
+   encode at `--photo-dpi` (200) and `--photo-quality` (82) with 4:2:0 chroma —
+   text needs full chroma and 300 dpi, a snapshot does not. No flat-field, no
+   tone, no haze filter, no paper-whitening, no ink neutralisation, no sharpen;
+   `--gray` does not apply either. A landscape photo turns the page instead of
+   being rotated. Measured paper-like area: 9% for a photo of a screen, 40–83%
+   for every real document and test page here, so the threshold sits in a wide
+   gap. `--photo off` forces the scanner treatment, `--photo on` forces the
+   short path — and, being a real early return now, no longer rectifies on the
+   way.
 4. **Erase what leans in from outside the sheet** — non-paper *connected to the
    frame edge* is desk, shadow or binding; sheet content cannot reach the border.
    It is flooded from the border and repainted in the page's own paper tone, and
-   a thick band of it (a binding) is cropped away.
+   a thick band of it (a binding) is cropped away. Connectivity alone is not
+   enough, though: a printed form's grey shaded panel that reaches the edge of
+   the sheet is *also* darker than the paper and *also* touching the border, so
+   it used to be flooded and then guillotined together with the print sitting on
+   it. Each side of the flood is therefore judged before it is acted on. A side
+   whose flooded pixels carry printed marks (above `--band-structure`, 6%) or
+   are only mildly darker than the paper (brighter than `--band-dark`, 60% of
+   the page's own paper level) is part of the DOCUMENT: it is never cropped, and
+   the flood there is pulled back to a shallow `--edge-keep` strip (1% of the
+   short side). Measured: a real spiral binding 41% of paper / 4.6% structure, a
+   synthetic one 26% / 2.8%, a shaded form panel 73–77% / 5.1–8.6%. When the two
+   tests disagree the content wins — a slightly dirty edge is a far better
+   failure than amputated text.
 5. **Flat-field** — divide by a smoothed background estimate, in colour, which
    both evens the light and white-balances the paper.
 6. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
@@ -140,6 +162,9 @@ flag; `--help` lists them.
 |---|---|
 | a strip of desk or shadow left along an edge | `--trim-shave 2`, or `--edge-band 15` after a rectify |
 | a real part of the page got cut off | `--no-trim`, or `--trim-step 12` |
+| a form's shaded panel got erased, or its left column cut off | it was judged desk — `--band-dark 75`, or `--band-structure 3` |
+| a shaded panel survived but its outermost few mm went white | `--edge-keep 0.5` |
+| a binding or a dark desk band stayed after a rectify | it was judged document — `--band-dark 45`, or `--band-structure 10` |
 | the page was shot at an angle and stayed a trapezoid | the quad was refused — `--rectify on` fails loudly and says why |
 | rectification fired on something that is not a sheet | `--rectify off` |
 | text too small or too large on the page | `--fit frame`, or `--fit content --margins L,R,T` |
@@ -150,6 +175,7 @@ flag; `--help` lists them.
 | a near-square page came out sideways | `--rotate 0` |
 | file too big | `--dpi 200`, `--quality 80`, `--gray` |
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
+| a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
 | a document was treated as a photo and left untouched | `--photo off`, or lower `--photo-paper` |
 
 ## Speed
@@ -182,6 +208,12 @@ startup instead of being trusted.
 - Pages are processed independently, so the scale can differ by a few tenths of
   a percent between pages of one document.
 - The haze filter can erase a genuinely smooth light-grey fill (`--no-haze`).
+- **The photo decision is only consulted when no sheet quad was accepted.** A
+  snapshot whose subject happens to look like a sheet — a whiteboard, a lit
+  screen, a bright rectangular panel — is rectified and scanned however small
+  its paper-like area is, and `--photo-paper` never gets a vote. That is the
+  remaining way a real photograph can take the document path; `--photo on`
+  settles it.
 - **Document-or-photo is decided on how much of the frame looks like paper**, so
   the two undecidable cases go the wrong way: a photo that is mostly a bright
   neutral surface (a white wall, snow) can still be treated as a document, and a
