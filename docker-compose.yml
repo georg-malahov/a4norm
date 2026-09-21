@@ -1,0 +1,25 @@
+# a4norm as an HTTP service.
+#
+#   docker compose up -d
+#   curl -X POST http://localhost:8080/scan -F p1=@page1.jpg -F p2=@page2.jpg -o doc.pdf
+services:
+  a4norm:
+    build: .
+    image: ghcr.io/georg-malahov/a4norm:latest
+    command: ["serve", "--port", "8080", "--max-concurrency", "1"]
+    ports:
+      - "8080:8080"
+    # A 12 MP photo peaks a few hundred MB in ImageMagick; give it room or the
+    # resize steps start spilling to disk.
+    mem_limit: 2g
+    # It needs nothing from the network and writes only to its own tmpfs.
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
