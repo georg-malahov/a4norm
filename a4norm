@@ -302,12 +302,12 @@ def detect_quad(path, side=400):
             if len(comp) > len(best):
                 best = comp
     if not best:
-        return None, "no bright low-chroma region found"
+        return None, "no bright low-chroma region found", 0.0
     frac = len(best) / n
     if frac > 0.90:
-        return None, f"the sheet already fills the frame ({frac:.0%})"
+        return None, f"the sheet already fills the frame ({frac:.0%})", frac
     if frac < 0.15:
-        return None, f"the brightest region is too small to be the sheet ({frac:.0%})"
+        return None, f"the brightest region is too small to be the sheet ({frac:.0%})", frac
 
     pts = [(i % w, i // w) for i in best]
     tl = min(pts, key=lambda p: p[0] + p[1])
@@ -316,22 +316,22 @@ def detect_quad(path, side=400):
     bl = min(pts, key=lambda p: p[0] - p[1])
     quad = [tl, tr, br, bl]
     if len(set(quad)) < 4:
-        return None, "corners collapsed"
+        return None, "corners collapsed", frac
     qa = _shoelace(quad)
     if qa <= 0 or len(best) / qa < 0.80:
-        return None, "the bright region is not shaped like a quadrilateral"
+        return None, "the bright region is not shaped like a quadrilateral", frac
     for i in range(4):
         a = _angle(quad[(i - 1) % 4], quad[i], quad[(i + 1) % 4])
         if not 45 <= a <= 135:
-            return None, f"corner angle {a:.0f}° is not a sheet corner"
+            return None, f"corner angle {a:.0f}° is not a sheet corner", frac
     d = lambda a, b: math.hypot(a[0]-b[0], a[1]-b[1])
     top, bot = d(tl, tr), d(bl, br)
     lef, rig = d(tl, bl), d(tr, br)
     if max(top, bot) / max(1e-6, min(top, bot)) > 1.8 or \
        max(lef, rig) / max(1e-6, min(lef, rig)) > 1.8:
-        return None, "opposite sides differ too much to be one flat sheet"
+        return None, "opposite sides differ too much to be one flat sheet", frac
     sx, sy = w0 / w, h0 / h
-    return [(p[0] * sx, p[1] * sy) for p in quad], f"{frac:.0%} of the frame"
+    return [(p[0] * sx, p[1] * sy) for p in quad], f"{frac:.0%} of the frame", frac
 
 
 def rectify(src, dst, quad, inset_pct):
@@ -513,8 +513,10 @@ def process_page(src, out_png, o, report):
     # 1. rectify: warp the sheet's own quadrilateral onto a rectangle. This has
     #    to come first — every later step assumes the page is flat, and a page
     #    shot at an angle is the one thing a rectangular crop can never fix.
+    paper_share = 1.0
+    photo = o.photo == "on"
     if o.rectify != "off":
-        quad, why = detect_quad(src)
+        quad, why, paper_share = detect_quad(src)
         if quad:
             step += 1
             dst = f"{out_png}.s{step}-rectify.png"
@@ -557,10 +559,21 @@ def process_page(src, out_png, o, report):
             sys.exit(f"a4norm: --rectify on, but no sheet quad found: {why}")
         else:
             report.append(f"no rectification: {why}")
+            # No sheet quad AND almost no paper-like area means there is no
+            # document in the frame — somebody is just turning photos into a
+            # PDF. Scanner treatment would wreck that: it bleaches the picture,
+            # straightens it by a few degrees off some accidental edge, and
+            # lays it out as if it were a text block. Measured paper-like area:
+            # 9% for a photo of a desk, 40-97% for every real document.
+            if o.photo == "auto" and paper_share * 100 < o.photo_paper:
+                photo = True
+    if photo:
+        report.append(f"no document in the frame (paper-like area "
+                      f"{paper_share:.0%}) — kept as a photo, not scanned")
 
     # 2. rotate to the target orientation
     w0, h0 = dims(cur)
-    if o.rotate == "auto":
+    if o.rotate == "auto" and not photo:
         # A near-square page has no meaningful orientation, so a 1% difference
         # between the sides is noise, not a decision — rotating on it turns a
         # notebook page sideways for no reason.
@@ -570,14 +583,14 @@ def process_page(src, out_png, o, report):
         if (o.landscape and portrait_img) or (not o.landscape and landscape_img):
             stage("rot", "-rotate", "90")
             report.append("rotated 90°")
-    elif o.rotate != "0":
+    elif o.rotate not in ("auto", "0"):
         stage("rot", "-rotate", o.rotate)
         report.append(f"rotated {o.rotate}°")
 
     # 3. cut the photographic border (desk, shadow, sheet edge). Pointless
     #    after a rectify — the quad already ended exactly at the sheet.
     flags, span, shave = {}, {}, {"l": 0, "t": 0}
-    if not o.no_trim and not rectified:
+    if not o.no_trim and not rectified and not photo:
         dl, dr, dt, db, flags = detect_border(cur, o.trim_band / 100.0, o.trim_step)
         iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
         # The detected step IS the sheet boundary, so the span between two
@@ -606,18 +619,19 @@ def process_page(src, out_png, o, report):
     # then its own tint on the ink reads as "coloured ink" and gets preserved,
     # which is how a black biro came out brown. A per-channel estimate white-
     # balances the sheet, so what survives in colour is really coloured.
-    stage("flat",
-          "(", "+clone",
-          "-morphology", "Close", f"Octagon:{o.close}",
-          "-resize", f"{o.bg_scale}%", "-blur", "0x6",
-          "-resize", f"{iw}x{ih}!", ")",
-          "-compose", op_divide(), "-composite")
+    if not photo:
+        stage("flat",
+              "(", "+clone",
+              "-morphology", "Close", f"Octagon:{o.close}",
+              "-resize", f"{o.bg_scale}%", "-blur", "0x6",
+              "-resize", f"{iw}x{ih}!", ")",
+              "-compose", op_divide(), "-composite")
 
     # 5. deskew — AFTER the flat-field on purpose. The angle is measured on a
     #    binarized copy, and on a dim photo the whole sheet falls below the
     #    threshold and reads as one blob, so a real tilt is measured as 0.0deg.
     #    Once the paper is white, the text lines are what the estimator sees.
-    if not o.no_deskew and not rectified:
+    if not o.no_deskew and not rectified and not photo:
         # After a rectify the quad IS the page orientation. Re-measuring it from
         # text baselines then fights it, and on handwriting the estimator has no
         # baselines worth trusting: it read +1.61 deg off an already-flat page.
@@ -655,7 +669,7 @@ def process_page(src, out_png, o, report):
         stage("gray", "-colorspace", "gray", "-colorspace", "sRGB",
               "-type", "TrueColor")
         report.append("grayscale output")
-    elif not o.no_neutralize:
+    elif not o.no_neutralize and not photo:
         flat = cur
         mx = f"{out_png}.chroma.png"
         # Coloured ink = high chroma AND dark. Chroma alone also fires on the
@@ -686,12 +700,13 @@ def process_page(src, out_png, o, report):
         report.append(f"ink neutralized, coloured ink kept on {share:.3f}% of the page")
 
     # 7. tone: paper to white, ink deep — percentile based, not a fixed curve
-    stage("tone", "-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%")
+    if not photo:
+        stage("tone", "-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%")
 
     # 8. erase leftover smooth haze: a soft shadow, a finger, an edge glow.
     #    Bright AND featureless -> paper. Anything with structure (ink, a faint
     #    stamp, a pencil note) has local variance and survives.
-    if not o.no_haze:
+    if not o.no_haze and not photo:
         hz = f"{out_png}.haze.png"
         magick(cur, "-colorspace", "gray",
                "(", "+clone", "-statistic", "StandardDeviation", "7x7",
@@ -705,7 +720,7 @@ def process_page(src, out_png, o, report):
         cur = nxt
 
     # 9. clean the paper to pure white, protecting a 1px ring around the ink
-    if not o.no_flatten_paper:
+    if not o.no_flatten_paper and not photo:
         stage("white",
               "(", "+clone", "-colorspace", "gray",
               "-threshold", f"{o.paper_thr}%",
@@ -714,13 +729,21 @@ def process_page(src, out_png, o, report):
 
     # 10. fit onto A4
     iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
-    pw = round(210 / MM * o.dpi)
-    ph = round(297 / MM * o.dpi)
-    if o.landscape:
+    page_dpi = o.photo_dpi if photo else o.dpi
+    pw = round(210 / MM * page_dpi)
+    ph = round(297 / MM * page_dpi)
+    turned = photo and iw > ih * 1.05 and not o.landscape
+    if o.landscape or turned:
+        # In photo mode the page turns, not the picture: rotating a landscape
+        # snapshot to fit a portrait page would stand its content on its side.
         pw, ph = ph, pw
 
     scale, off_x, off_y, mode_used = None, None, None, None
-    if rectified and o.fit == "auto":
+    if photo:
+        scale = min(pw / iw, ph / ih)
+        mode_used = ("frame (photo, landscape page)" if turned
+                     else "frame (photo, kept as shot)")
+    if scale is None and rectified and o.fit == "auto":
         scale = min(pw / iw, ph / ih)
         mode_used = "frame (the rectified quad is the sheet)"
     if scale is None and o.fit in ("auto", "edges"):
@@ -769,11 +792,12 @@ def process_page(src, out_png, o, report):
            "-morphology", "Erode", "Octagon:1", ")",
            "-compose", "Screen", "-composite", page)
     report.append(f"fit: {mode_used}; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
-    report.append(f"page: {pw}x{ph}px @ {o.dpi}dpi")
-    return page
+    report.append(f"page: {pw}x{ph}px @ {page_dpi}dpi")
+    return page, photo, page_dpi
 
 
 def write_pdf(jpegs, out, dpi, label=None):
+    """`dpi` is one number, or one per page."""
     """Write a JPEG-per-page PDF by hand.
 
     ImageMagick can do this, but only where its PDF coder exists: on Alpine (and
@@ -794,13 +818,14 @@ def write_pdf(jpegs, out, dpi, label=None):
     add(b"<< /Type /Catalog /Pages 2 0 R >>")
     add(b"")  # placeholder for /Pages, filled once the kids are known
 
-    for jp in jpegs:
+    for page_i, jp in enumerate(jpegs):
+        page_dpi = dpi[page_i] if isinstance(dpi, (list, tuple)) else dpi
         data = open(jp, "rb").read()
         w, h = (int(x) for x in fmt(jp, "%w %h").split())
         chans = fmt(jp, "%[channels]").lower()
         space = b"/DeviceGray" if "gray" in chans else b"/DeviceRGB"
-        pw = w * 72.0 / dpi
-        ph = h * 72.0 / dpi
+        pw = w * 72.0 / page_dpi
+        ph = h * 72.0 / page_dpi
         img_id = add(b"<< /Type /XObject /Subtype /Image /Width " + str(w).encode() +
                      b" /Height " + str(h).encode() + b" /ColorSpace " + space +
                      b" /BitsPerComponent 8 /Filter /DCTDecode /Length " +
@@ -867,8 +892,9 @@ def build(sources, out, o):
             rasters = rasterize(src, wd, tag=f"s{si:02d}")
             for r in rasters:
                 rep = []
-                page = process_page(r, os.path.join(wd, f"out-{n:03d}.png"), o, rep)
-                pages.append(page)
+                page, is_photo, page_dpi = process_page(
+                    r, os.path.join(wd, f"out-{n:03d}.png"), o, rep)
+                pages.append((page, is_photo, page_dpi))
                 n += 1
                 print(f"  page {n}:")
                 for line in rep:
@@ -878,27 +904,35 @@ def build(sources, out, o):
             print("  (dry run — nothing written)")
             return None
 
+        # Text wants full chroma; a snapshot does not, and 4:2:0 at a lower
+        # quality is the difference between a 2.4 MB page and a third of that
+        # with nothing visible lost.
+        def encode(src_png, dst, is_photo, extra=()):
+            q = o.photo_quality if is_photo else o.quality
+            sub = "2x2" if is_photo else "1x1"
+            magick(src_png, "-quality", str(q),
+                   "-sampling-factor", sub, "-strip", *extra, dst)
+
         if o.format == "pdf":
-            jpegs = []
-            for i, page in enumerate(pages):
+            jpegs, dpis = [], []
+            for i, (page, is_photo, page_dpi) in enumerate(pages):
                 jp = os.path.join(wd, f"jp-{i:03d}.jpg")
-                magick(page, "-quality", str(o.quality),
-                       "-sampling-factor", "1x1", "-strip", jp)
+                encode(page, jp, is_photo)
                 jpegs.append(jp)
-            write_pdf(jpegs, out, o.dpi)
+                dpis.append(page_dpi)
+            write_pdf(jpegs, out, dpis)
             written = [out]
         else:
             stem, ext = os.path.splitext(out)
             ext = ext or ".jpg"
             written = []
-            for i, page in enumerate(pages):
+            for i, (page, is_photo, page_dpi) in enumerate(pages):
                 dst = out if len(pages) == 1 else f"{stem}-{i + 1}{ext}"
-                magick(page, "-quality", str(o.quality),
-                       "-sampling-factor", "1x1", "-strip",
-                       "-density", str(o.dpi), "-units", "PixelsPerInch", dst)
+                encode(page, dst, is_photo,
+                       ("-density", str(page_dpi), "-units", "PixelsPerInch"))
                 written.append(dst)
         if o.preview:
-            magick(pages[0], "-resize", "900x",
+            magick(pages[0][0], "-resize", "900x",
                    os.path.splitext(out)[0] + "-preview.png")
     return written
 
@@ -919,6 +953,11 @@ def main():
                    help="one document per input instead of one combined document")
     p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--quality", type=int, default=88, help="JPEG quality")
+    p.add_argument("--photo-quality", type=int, default=82,
+                   help="JPEG quality for a page that holds no document")
+    p.add_argument("--photo-dpi", type=int, default=200,
+                   help="raster resolution for a page that holds no document; "
+                        "300 dpi is for text, a snapshot does not need it")
     p.add_argument("--gray", action="store_true", help="grayscale output")
     p.add_argument("--landscape", action="store_true", help="A4 landscape")
     p.add_argument("--rotate", default="auto",
@@ -926,6 +965,11 @@ def main():
     p.add_argument("--rectify", default="auto", choices=["auto", "on", "off"],
                    help="warp the sheet's quadrilateral flat before anything "
                         "else; auto = only when a convincing quad is found")
+    p.add_argument("--photo", default="auto", choices=["auto", "on", "off"],
+                   help="what to do with a frame that holds no document: auto "
+                        "detects it and keeps the picture as it is (no "
+                        "flat-field, no deskew, no tone), on forces that, off "
+                        "always applies the scanner treatment")
     p.add_argument("--fit", default="auto",
                    choices=["auto", "edges", "content", "frame"],
                    help="how to derive the scale onto A4")
@@ -946,6 +990,9 @@ def main():
     g.add_argument("--trim-shave", type=float, default=1.0,
                    help="%% of the short side shaved inside a detected edge, to "
                         "drop the edge shadow (does not affect the A4 scale)")
+    g.add_argument("--photo-paper", type=float, default=20.0,
+                   help="%% paper-like area below which a frame counts as a "
+                        "photo rather than a document")
     g.add_argument("--rect-inset", type=float, default=0.8,
                    help="%% the detected quad is pulled in before warping")
     g.add_argument("--edge-band", type=float, default=10.0,

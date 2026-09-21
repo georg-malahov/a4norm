@@ -7,6 +7,10 @@ blue signature or a red stamp stays coloured, and the page comes out as an exact
 A4 PDF of a few hundred kilobytes. Several photos combine into one multi-page
 document, because a paper document is rarely one page.
 
+A frame that holds no document is recognised as such and left alone: the
+picture is fitted onto the page as shot, without any of the scanner treatment.
+So the same command also just turns a handful of snapshots into a PDF.
+
 No OpenCV, no NumPy, no ML, no ghostscript. The tool is stdlib-only Python
 driving ImageMagick and poppler, and the container is 104 MB.
 
@@ -97,22 +101,31 @@ before `503`, and a job is killed after 600 s.
    opposite sides within 1.8×); otherwise the reason is printed and the rest of
    the pipeline carries on, because rectifying on a wrong quad is worse than not
    rectifying.
-3. **Erase what leans in from outside the sheet** — non-paper *connected to the
+3. **Or decide there is no document at all.** If no sheet quad was accepted
+   *and* the paper-like area is under `--photo-paper` (20%), the frame is a
+   photo, not a page: everything below is skipped and the picture is fitted
+   onto the page as shot, at `--photo-dpi` (200) and `--photo-quality` (82)
+   with 4:2:0 chroma — text needs full chroma and 300 dpi, a snapshot does
+   not. A landscape photo turns the page instead of being rotated. Measured
+   paper-like area: 9% for a photo of a desk, 40–97% for every real document,
+   so the threshold sits in a wide gap. `--photo off` forces the scanner
+   treatment, `--photo on` forces the short path.
+4. **Erase what leans in from outside the sheet** — non-paper *connected to the
    frame edge* is desk, shadow or binding; sheet content cannot reach the border.
    It is flooded from the border and repainted in the page's own paper tone, and
    a thick band of it (a binding) is cropped away.
-4. **Flat-field** — divide by a smoothed background estimate, in colour, which
+5. **Flat-field** — divide by a smoothed background estimate, in colour, which
    both evens the light and white-balances the paper.
-5. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
+6. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
    binarizes into one blob and a real tilt measures as 0.0°). Skipped after a
    rectify, which already set the orientation.
-6. **Neutralize the ink** — a photo tints black print warm. Everything goes
+7. **Neutralize the ink** — a photo tints black print warm. Everything goes
    neutral except pixels that are both high-chroma and dark: real coloured ink,
    any hue.
-7. **Tone** by histogram percentiles, then erase bright featureless haze (a soft
+8. **Tone** by histogram percentiles, then erase bright featureless haze (a soft
    shadow or a finger goes; anything with structure survives), then clean the
    paper to pure white with a 1 px guard ring around every glyph.
-8. **Fit to A4** — from the real sheet edges when two opposite ones are visible
+9. **Fit to A4** — from the real sheet edges when two opposite ones are visible
    (exact px-per-mm, no assumption about the layout), otherwise from the ink
    block and standard margins, otherwise the frame.
 
@@ -134,6 +147,8 @@ flag; `--help` lists them.
 | a handwritten page came out tilted | `--no-deskew` — the estimator reads text baselines, handwriting has none worth trusting |
 | a near-square page came out sideways | `--rotate 0` |
 | file too big | `--dpi 200`, `--quality 80`, `--gray` |
+| an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
+| a document was treated as a photo and left untouched | `--photo off`, or lower `--photo-paper` |
 
 ## Speed
 
@@ -165,6 +180,12 @@ startup instead of being trusted.
 - Pages are processed independently, so the scale can differ by a few tenths of
   a percent between pages of one document.
 - The haze filter can erase a genuinely smooth light-grey fill (`--no-haze`).
+- **Document-or-photo is decided on how much of the frame looks like paper**, so
+  the two undecidable cases go the wrong way: a photo that is mostly a bright
+  neutral surface (a white wall, snow) can still be treated as a document, and a
+  document shot so small that it covers under 20% of the frame is kept as a
+  photo — which is the safer of the two, since there is not enough resolution to
+  scan it well anyway. `--photo on|off` settles it either way.
 
 ## Verify the result
 
