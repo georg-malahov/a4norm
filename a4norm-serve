@@ -20,6 +20,8 @@ whatever else runs on the box.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import shutil
@@ -209,7 +211,31 @@ class Handler(BaseHTTPRequestHandler):
             open(p, "wb").write(blob)
             paths.append(p)
 
-        if ctype.lower().startswith("multipart/"):
+        if "json" in ctype.lower():
+            # A JSON array of base64 images. This exists because automation
+            # platforms cannot build a multipart body with a NUMBER OF PARTS
+            # decided at runtime — n8n, for one, fixes its form fields at design
+            # time — so "the user sent five photos" has no natural multipart
+            # shape there. One JSON array does.
+            try:
+                payload = json.loads(body.decode("utf-8", "replace"))
+            except ValueError:
+                return paths
+            items = payload.get("images") or payload.get("images_b64") or []
+            if isinstance(items, str):
+                items = [items]
+            for entry in items:
+                if isinstance(entry, dict):
+                    entry = entry.get("data") or entry.get("b64") or ""
+                if not isinstance(entry, str):
+                    continue
+                if entry.startswith("data:") and "," in entry:
+                    entry = entry.split(",", 1)[1]
+                try:
+                    put(base64.b64decode(entry, validate=False))
+                except (binascii.Error, ValueError):
+                    continue
+        elif ctype.lower().startswith("multipart/"):
             # email.parser handles the boundary properly; the cgi module that
             # used to do this was removed in Python 3.13.
             msg = BytesParser(policy=email_policy).parsebytes(

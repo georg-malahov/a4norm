@@ -75,8 +75,10 @@ docker run --rm -p 8080:8080 ghcr.io/georg-malahov/a4norm:latest serve
 | `POST /scan?format=jpg` | a single image → `image/jpeg` |
 
 Send images as `multipart/form-data` (any field names, repeat for several pages,
-page order = part order) or, for one image, as a raw body with an image content
-type. Any `a4norm` flag can be passed as a query parameter (`?dpi=200&gray=1`,
+page order = part order), as a raw body with an image content type for one
+image, or as JSON — `{"images": ["<base64>", "<base64>"]}` — which is the shape
+to use from an automation platform, where the number of multipart fields is
+fixed at design time and "the user sent five photos" has no natural form. Any `a4norm` flag can be passed as a query parameter (`?dpi=200&gray=1`,
 underscores allowed: `?paper_thr=85`). The response carries `X-Pages` and
 `X-Seconds`.
 
