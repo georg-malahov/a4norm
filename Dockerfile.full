@@ -16,10 +16,11 @@ FROM debian:trixie-slim
 # with that one unset this Debian build settles on ONE thread no matter how many
 # cores or how high OMP_NUM_THREADS is. That was the single most expensive thing
 # about the service: the same closing took 19.9 s single-threaded and 11.1 s
-# with this line, on the same two cores. Raising the service's CPU limit
-# therefore means raising BOTH of these -- measured, four CPUs with these at 2
-# is exactly as fast as two CPUs. The output does not depend on either: the
-# same photo gives byte-identical bytes at 1, 2, 4 and 8 threads.
+# with this line, on the same two cores. Raising the service's CPU limit means
+# raising BOTH of these together -- four CPUs with the pool still at 2 measured
+# exactly as fast as two CPUs, and at 4 it buys 17%, no more, because about
+# two thirds of a page does not thread at all. The output does not depend on
+# either: the same photo gives byte-identical bytes at 1, 2, 4 and 8 threads.
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
