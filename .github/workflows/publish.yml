@@ -12,7 +12,63 @@ permissions:
   packages: write
 
 jobs:
+  # The public examples through the image that is about to be pushed, before
+  # anything is pushed. `image` and `deploy` both wait for it, so a change that
+  # breaks the landing-page demo (examples/notebook-photo.jpg) never reaches
+  # GHCR or production. Both flavours: production runs :full, users pull
+  # :latest, and the two ImageMagick builds differ enough to need their own
+  # goldens (see tests/regression.py). amd64 only -- the output is the same
+  # on arm64 (README, Determinism), and emulating it would cost minutes.
+  test:
+    name: Regression test (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: light
+            dockerfile: Dockerfile
+          - flavor: full
+            dockerfile: Dockerfile.full
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity-check the scripts
+        run: |
+          python3 -m py_compile a4norm a4norm-serve a4norm-seg tests/regression.py
+          sh -n entrypoint.sh
+          sh -n tests/run-in-docker.sh
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Cached under its own scope, which the `image` job reads first: the
+      # amd64 layers it pushes are then the very layers tested here.
+      - name: Build the image under test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          tags: a4norm:test
+          cache-from: |
+            type=gha,scope=test-${{ matrix.flavor }}
+            type=gha,scope=${{ matrix.flavor }}
+          cache-to: type=gha,scope=test-${{ matrix.flavor }}
+
+      - name: Run the examples through it
+        run: tests/run-in-docker.sh a4norm:test --flavor ${{ matrix.flavor }} --artifacts regression-out
+
+      - name: Keep the PDFs and renders of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-${{ matrix.flavor }}
+          path: regression-out/
+          if-no-files-found: ignore
+
   image:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -69,12 +125,16 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.flavor }}
+          cache-from: |
+            type=gha,scope=test-${{ matrix.flavor }}
+            type=gha,scope=${{ matrix.flavor }}
           cache-to: type=gha,mode=max,scope=${{ matrix.flavor }}
 
   deploy:
     name: Deploy to gmlabs
-    needs: image
+    # `test` is already upstream of `image`; named here too so the gate is
+    # visible where it matters.
+    needs: [test, image]
     runs-on: gmlabs
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     permissions:

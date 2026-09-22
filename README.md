@@ -45,6 +45,17 @@ real people. What it protects is stated in the commit messages that changed
 behaviour, with the numbers each decision turned on, so a change can be argued
 about even by someone who cannot run it.
 
+The two public examples ARE under test, in CI, on every push and pull
+request, inside both images before either is pushed: `tests/regression.py`
+checks what a4norm reports (the notebook's quad is rectified, its left side
+is judged a binding and cut while the other three are kept, the page turns
+and the picture does not) and what the page looks like (exact A4, not blank,
+lines run across, the blue signature still blue, the pencil still grey),
+plus a tolerant comparison with a low-resolution golden render. Deploy waits
+for it. Run it locally with `tests/run-in-docker.sh`; when a change is meant
+to alter the pages, refresh the goldens with `--update-goldens` in each image
+and look at them before committing.
+
 ## Run it
 
 **Container** (nothing to install):
