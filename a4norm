@@ -444,7 +444,7 @@ def segment_quad(path, side=400):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def rectify(src, dst, quad, inset_pct, cap=None):
+def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False):
     """Warp the quad onto a rectangle whose sides average the quad's own.
 
     `cap` is the page the result will be laid onto. Rectifying to more pixels
@@ -458,6 +458,12 @@ def rectify(src, dst, quad, inset_pct, cap=None):
     W = max(50, round((d(tl, tr) + d(bl, br)) / 2))
     H = max(50, round((d(tl, bl) + d(tr, br)) / 2))
     if cap:
+        # The page turns to match a wide sheet, so cap against the page in THAT
+        # orientation. Capping a landscape quad against a portrait page shaves
+        # it to 2480 px wide and the fit then blows it back up to 3508 -- a
+        # soft page produced by throwing detail away and inventing it again.
+        if cap_turns and (W > H) != (cap[0] > cap[1]):
+            cap = (cap[1], cap[0])
         k = min(1.0, cap[0] / W, cap[1] / H)
         if k < 1.0:
             W, H = max(50, round(W * k)), max(50, round(H * k))
@@ -539,7 +545,7 @@ SIDES = ("left", "right", "top", "bottom")
 
 
 def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
-                 max_share=25.0, side=520):
+                 bed_pct=50.0, dark_struct_pct=15.0, max_share=25.0, side=520):
     """Erase whatever leans in from outside the sheet, without cropping.
 
     Non-paper pixels that are CONNECTED TO THE FRAME EDGE are desk, shadow or a
@@ -641,7 +647,26 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
         mk, cnt, vs = tot[k]
         st = 100.0 * mk / (255.0 * cnt) if cnt else 0.0
         dk = 100.0 * vs / (cnt * paper) if cnt and paper else 0.0
-        verdict[k] = (st, dk, st > struct_pct or dk > dark_pct, cnt)
+        # A DARK band has to show more print before it counts as document.
+        # A binding ring carries a bright specular glint, and the dark rim
+        # around that glint reads as a mark on a paper-bright bed, so a spiral
+        # binding does register structure -- that is how a notebook page came
+        # back with a column of black squares down its margin, on a band
+        # measuring 11.3% structure at 45% of the paper level. But darkness
+        # alone cannot decide it either: the top band of a real form is just as
+        # dark (40%) and is nothing but print (35.8%), and cutting it took the
+        # form's header line and its title with it. Only the two together
+        # separate the cases, so below `bed_pct` of the paper level the
+        # structure bar rises from `struct_pct` to `dark_struct_pct`.
+        #
+        # Be clear about how thin this is: the gap is fitted to exactly two
+        # measured pages, 11.3% against 35.8%, with the bar set between them.
+        # A binding photographed so its rings read above the bar will survive,
+        # and a sparse header on a dark band -- a single short line, a page
+        # number -- could still be cut. The shape of the rule is right; its
+        # number is a guess until more pages have been measured.
+        bar = struct_pct if dk > bed_pct else dark_struct_pct
+        verdict[k] = (st, dk, st > bar or dk > dark_pct, cnt)
 
     # A side that is part of the document keeps everything past a shallow strip.
     keep = max(2, int(min(w, h) * keep_pct / 100.0))
@@ -865,7 +890,8 @@ def process_page(src, out_png, o, report):
             cap = (round(210 / MM * o.dpi), round(297 / MM * o.dpi))
             if o.landscape:
                 cap = (cap[1], cap[0])
-        W, H = rectify(src, dst, quad, o.rect_inset, cap=cap)
+        W, H = rectify(src, dst, quad, o.rect_inset, cap=cap,
+                       cap_turns=(o.rotate == "auto" and not o.landscape))
         cur = dst
         rectified = True
         report.append(f"rectified the sheet quad ({why}) -> {W}x{H}")
@@ -874,7 +900,8 @@ def process_page(src, out_png, o, report):
             cleaned = f"{out_png}.s{step}-border.png"
             got, share, cut, verdict = clean_border(
                 cur, cleaned, o.edge_band, o.edge_keep,
-                o.band_structure, o.band_dark)
+                o.band_structure, o.band_dark, o.band_bed,
+                o.band_dark_structure)
             kept = [f"{k} (structure {verdict[k][0]:.1f}%, "
                     f"brightness {verdict[k][1]:.0f}% of paper)"
                     for k in SIDES if verdict.get(k) and verdict[k][2]
@@ -903,7 +930,8 @@ def process_page(src, out_png, o, report):
                     again = f"{out_png}.s{step}-border2.png"
                     got2, share2, _, _ = clean_border(
                         cur, again, o.edge_band, o.edge_keep,
-                        o.band_structure, o.band_dark)
+                        o.band_structure, o.band_dark, o.band_bed,
+                        o.band_dark_structure)
                     if got2:
                         cur = got2
                         report.append(f"second pass on the new border "
@@ -912,19 +940,15 @@ def process_page(src, out_png, o, report):
                 report.append(f"border cleanup skipped: it would have "
                               f"repainted {share:.0f}% of the page")
 
-    # 2. rotate to the target orientation
-    w0, h0 = dims(cur)
-    if o.rotate == "auto":
-        # A near-square page has no meaningful orientation, so a 1% difference
-        # between the sides is noise, not a decision — rotating on it turns a
-        # notebook page sideways for no reason.
-        tol = 1.0 + o.rotate_tol / 100.0
-        landscape_img = w0 > h0 * tol
-        portrait_img = h0 > w0 * tol
-        if (o.landscape and portrait_img) or (not o.landscape and landscape_img):
-            stage("rot", "-rotate", "90")
-            report.append("rotated 90°")
-    elif o.rotate not in ("auto", "0"):
+    # 2. rotate, but only when asked to. `--rotate auto` turns nothing: the
+    #    PAGE follows the picture at the fit step below, exactly as it already
+    #    does in photo mode. Turning the pixels instead assumes a wide frame
+    #    means a sideways sheet, and it usually does not -- a square notebook
+    #    page shot in a wide frame is wide because of the FRAME, and standing
+    #    its lines on end makes it unreadable. A portrait sheet genuinely
+    #    photographed sideways stays sideways, which the reader fixes with one
+    #    keypress; unreadable text is not fixable at all.
+    if o.rotate not in ("auto", "0"):
         stage("rot", "-rotate", o.rotate)
         report.append(f"rotated {o.rotate}°")
 
@@ -1103,7 +1127,11 @@ def process_page(src, out_png, o, report):
     page_dpi = o.dpi
     pw = round(210 / MM * page_dpi)
     ph = round(297 / MM * page_dpi)
-    if o.landscape:
+    # The page turns, not the picture -- the rule photo mode has always used.
+    # A near-square page has no meaningful orientation, so a few percent
+    # between the sides is noise, not a decision.
+    turned = iw > ih * (1.0 + o.rotate_tol / 100.0) and not o.landscape
+    if o.landscape or turned:
         pw, ph = ph, pw
 
     scale, off_x, off_y, mode_used = None, None, None, None
@@ -1386,6 +1414,13 @@ def main():
                    help="%% printed-mark density in a flooded border band above "
                         "which that band is document: never cropped, flooded "
                         "only as far as --edge-keep")
+    g.add_argument("--band-bed", type=float, default=50.0,
+                   help="%% of the paper level a band must still keep for its "
+                        "printed structure to count as document; below it the "
+                        "band is something lying OVER the sheet")
+    g.add_argument("--band-dark-structure", type=float, default=15.0,
+                   help="%% printed structure a band BELOW --band-bed must "
+                        "carry to count as document instead of a binding")
     g.add_argument("--band-dark", type=float, default=60.0,
                    help="%% of the page's own paper level a flooded border band "
                         "must be darker than to count as something leaning in "
