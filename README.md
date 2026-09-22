@@ -200,6 +200,19 @@ change what this image may be used for.
    synthetic one 26% / 2.8%, a shaded form panel 73–77% / 5.1–8.6%. When the two
    tests disagree the content wins — a slightly dirty edge is a far better
    failure than amputated text.
+
+   A dark band has to show more print than a bright one, because a binding ring
+   carries a bright specular glint and the dark rim around it reads as a mark on
+   a paper-bright bed. A notebook page came back with a column of black squares
+   down its margin on exactly that: 11.3% structure at 45% of the paper level,
+   kept by a test meant for a shaded panel at 59–78%. Darkness alone cannot
+   decide it either — a real form's top band measured just as dark (40%) and was
+   nothing but print (35.8%), and cutting it took the form's header and title
+   with it. So below `--band-bed` (50% of the paper level) the structure bar
+   rises from `--band-structure` to `--band-dark-structure` (15%). The gap is
+   fitted to those two measured pages with the bar set between them: a binding
+   whose rings read above 15% will survive, and a sparse header on a dark band
+   could still be cut.
 5. **Flat-field** — divide by a smoothed background estimate, in colour, which
    both evens the light and white-balances the paper. The estimate is built on
    a point-sampled copy with the kernel scaled to match, because it is squeezed
@@ -214,7 +227,15 @@ change what this image may be used for.
 8. **Tone** by histogram percentiles, then erase bright featureless haze (a soft
    shadow or a finger goes; anything with structure survives), then clean the
    paper to pure white with a 1 px guard ring around every glyph.
-9. **Fit to A4** — from the real sheet edges when two opposite ones are visible
+9. **Fit to A4** — the PAGE turns, never the picture. A wide result is laid on
+   a landscape A4; `--rotate auto` rotates nothing at all. Turning the pixels
+   instead assumes a wide frame means a sideways sheet, and it usually does not:
+   a square notebook page shot in a wide frame is wide because of the FRAME, and
+   standing its lines on end makes it unreadable. A portrait sheet genuinely
+   photographed sideways stays sideways, which the reader fixes with one
+   keypress. `--rotate 90/180/270` still turns the picture, and the page follows
+   it; `--landscape` forces a landscape page whatever the shape. Scale comes
+   from the real sheet edges when two opposite ones are visible
    (exact px-per-mm, no assumption about the layout). Otherwise the frame, which
    at least fills the page. The ink-block fit, which infers the scale from an
    assumed text width, is used only when NO sheet edge was found at all — that
@@ -244,7 +265,9 @@ flag; `--help` lists them.
 | a coloured stamp came out grey | `--chroma 5`, or `--chroma-grow 10` |
 | black print stayed brown or blue-ish | `--chroma 10`, or `--gray` |
 | a handwritten page came out tilted | `--no-deskew` — the estimator reads text baselines, handwriting has none worth trusting |
-| a near-square page came out sideways | `--rotate 0` |
+| a wide page landed on a landscape sheet and you wanted portrait | `--rotate 90` — it turns the picture, and the page follows |
+| a spiral binding survived as dark marks in the margin | `--band-dark-structure 40`, or `--band-bed 70` |
+| a header or a page number on a dark band got cut | `--band-dark-structure 5`, or `--band-bed 20` |
 | file too big | `--dpi 200`, `--quality 80`, `--gray` |
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
 | a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
