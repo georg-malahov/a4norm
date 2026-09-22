@@ -201,7 +201,10 @@ change what this image may be used for.
    tests disagree the content wins — a slightly dirty edge is a far better
    failure than amputated text.
 5. **Flat-field** — divide by a smoothed background estimate, in colour, which
-   both evens the light and white-balances the paper.
+   both evens the light and white-balances the paper. The estimate is built on
+   a point-sampled copy with the kernel scaled to match, because it is squeezed
+   to 6% and blurred there anyway: six times cheaper, and within RMSE 0.01 of
+   the full-resolution estimate.
 6. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
    binarizes into one blob and a real tilt measures as 0.0°). Skipped after a
    rectify, which already set the orientation.
@@ -251,16 +254,70 @@ flag; `--help` lists them.
 
 ## Speed
 
-Per page, measured: ~30 s for a 12 MP phone photo on an M-series Mac, ~11–17 s
-for a smaller one, ~98 s for the same 12 MP photo on a 4-core x86 VPS. Roughly
-half of it is ImageMagick on full-resolution pixels; the two pure-Python passes
-(quad detection, border flood) run on 400 and 520 px grids and cost under 3 s
-together.
+Per page, measured in the 2-CPU x86 container the service actually runs in:
+
+| input | before | after |
+|---|---|---|
+| 12 MP phone photo of a form | 105 s | **32 s** |
+| 12 MP photo, pencil on white | 152 s | **36 s** |
+| 5 MP photo of a printed form | 66 s | **24 s** |
+| supermarket receipt (needs the model) | 45 s | **18 s** |
+| 1.2 MP notebook page | 34 s | **18 s** |
+| eight-photo set, total | 545 s | **190 s** |
+
+The two halves of that are independent, and only one of them is code:
+
+| | 12 MP + 5 MP + receipt + notebook page |
+|---|---|
+| before | 249 s |
+| `MAGICK_THREAD_LIMIT` alone | 193 s |
+| script alone | 129 s |
+| both | 94 s |
+
+Raising the service's CPU limit past two buys nothing on its own (196 s on four
+CPUs) — `OMP_NUM_THREADS` caps the pool, so both variables move together.
+
+The thread limit is one line in `Dockerfile.full`, and the note there explains
+why ImageMagick was running single-threaded on two cores. The script side was
+almost entirely *fewer passes over full-resolution pixels*, not cleverer maths:
+
+- every intermediate PNG is written with `png:compression-level=0`. They are
+  thrown away one stage later, and compressing them was **27%** of the whole
+  run — one line, and the output PDF is byte-for-byte identical either way.
+- ink neutralisation went from six processes to one, tone/haze/whitening from
+  four to one, and the resize and the A4 layout from two to one. Each of those
+  handoffs was a full-resolution PNG written and read back; `mpr:` registers
+  keep the page in memory instead.
+- the background estimate is built on a point-sampled copy with the kernel
+  scaled to match. It gets squeezed to 6% and blurred there regardless, so
+  six times the work bought RMSE 0.01.
+- the perspective warp never renders more pixels than one page holds. The fit
+  was scaling them straight back down.
+- `-auto-orient` is skipped when the EXIF already says `TopLeft`, instead of
+  rewriting a 12 MP photo to apply nothing.
+
+The two pure-Python passes (quad detection, border flood) run on 400 and 520 px
+grids and are untouched by all of this.
+
+Nothing here is free: against the old pipeline the pages differ by RMSE
+0.003–0.032, worst on faint pencil, and the ink-colour mask keeps 8.67% of a
+biro-covered page instead of 9.02%. Two cheaper-looking ideas were measured and
+**rejected** because they cost real content: the haze mask at half resolution
+(it erased printed rules and digits) and the whole chroma mask at a third (it
+dropped 42% of the coloured-ink area).
 
 ## Determinism
 
 The same input gives the same bytes out on macOS/arm64, Linux/arm64 and
-Linux/amd64 — verified by SHA-256 on a 12 MP HEIC. That is not free:
+Linux/amd64 — verified by SHA-256 on a 12 MP HEIC, and the thread count does
+not enter into it either (identical at 1, 2, 4 and 8). **Within one image.**
+The two images do not agree with each other: Alpine builds ImageMagick with
+HDRI and Debian does not, so the `:full` image clamps intermediate values the
+`:latest` image keeps, and the same photo comes out a few least-significant
+bits apart. Verified both ways — the light image gives the same SHA-256 on
+arm64 and amd64, so it is the build and not the architecture. Nothing visible
+rides on it; it is only worth knowing before diffing one image against the
+other. That is not free either:
 ImageMagick 7.1.1 and 7.1.2 swap the meaning of the `Divide_Dst` / `Divide_Src`
 compose aliases, so a flat-field written with either name silently inverts on
 the wrong build and the page comes out blank and speckled with a perfectly
