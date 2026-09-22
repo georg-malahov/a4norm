@@ -25,14 +25,25 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   -o /work/contract.pdf /work/page1.HEIC /work/page2.HEIC /work/page3.HEIC
 ```
 
-A synthetic test page lives in `examples/sample-photo.jpg` — a generated letter,
-degraded to look photographed (warm cast, uneven light, a tilt, a desk border),
-with no real data in it. A one-line smoke test:
+Two test images live in `examples/`, and neither carries anybody's data.
+`sample-photo.jpg` is a generated letter, degraded to look photographed (warm
+cast, uneven light, a tilt, a desk border). `notebook-photo.jpg` is a real
+phone shot of a handwritten to-do list on a spiral notebook, at an angle on a
+wooden desk — the case that exercises the harder half of the pipeline: a quad
+that is nearly square, faint pencil, and a binding whose rings sit inside the
+page's own margin. A one-line smoke test:
 
 ```bash
 docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   --preview /work/examples/sample-photo.jpg
 ```
+
+The regression corpus is larger than this — 26 pages covering receipts, forms,
+multi-page PDFs and sheets darker than their background — and it is
+deliberately **not** in this repository: those are real documents belonging to
+real people. What it protects is stated in the commit messages that changed
+behaviour, with the numbers each decision turned on, so a change can be argued
+about even by someone who cannot run it.
 
 ## Run it
 
