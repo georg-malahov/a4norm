@@ -212,18 +212,22 @@ change what this image may be used for.
    tests disagree the content wins — a slightly dirty edge is a far better
    failure than amputated text.
 
-   A dark band has to show more print than a bright one, because a binding ring
-   carries a bright specular glint and the dark rim around it reads as a mark on
-   a paper-bright bed. A notebook page came back with a column of black squares
-   down its margin on exactly that: 11.3% structure at 45% of the paper level,
-   kept by a test meant for a shaded panel at 59–78%. Darkness alone cannot
-   decide it either — a real form's top band measured just as dark (40%) and was
-   nothing but print (35.8%), and cutting it took the form's header and title
-   with it. So below `--band-bed` (50% of the paper level) the structure bar
-   rises from `--band-structure` to `--band-dark-structure` (15%). The gap is
-   fitted to those two measured pages with the bar set between them: a binding
-   whose rings read above 15% will survive, and a sparse header on a dark band
-   could still be cut.
+   A binding still gets through that, because a ring carries a bright specular
+   glint and the dark rim around it reads as a mark on a paper-bright bed. A
+   notebook page came back with a column of black squares down its margin on
+   exactly that — and there is no bar to put it under: the rings measured 11.3%
+   structure on one photograph and 18.2% on a sharper one of the same notebook,
+   where the BOTTOM edge, which is handwriting and must be kept, measured 18.5%.
+   Darkness does not settle it either; a real form's top band is just as dark
+   (40% of the paper level) and is nothing but print.
+
+   So the PATTERN decides. A spiral binding is a row of equal blobs at an equal
+   pitch, and nothing a printer puts on a page is: measured across the corpus, a
+   binding's ring and gap lengths vary by 0.06–0.26 over 17–34 rings covering
+   half the side, while every printed edge that had to be kept reads 0.41 and up
+   or has one or two blobs and no pitch at all. The test only overrides a
+   DOCUMENT verdict, and only for a band darker than `--band-dark`, so it can
+   take a side away from the content but never give one to it.
 5. **Flat-field** — divide by a smoothed background estimate, in colour, which
    both evens the light and white-balances the paper. The estimate is built on
    a point-sampled copy with the kernel scaled to match, because it is squeezed
@@ -277,8 +281,8 @@ flag; `--help` lists them.
 | black print stayed brown or blue-ish | `--chroma 10`, or `--gray` |
 | a handwritten page came out tilted | `--no-deskew` — the estimator reads text baselines, handwriting has none worth trusting |
 | a wide page landed on a landscape sheet and you wanted portrait | `--rotate 90` — it turns the picture, and the page follows |
-| a spiral binding survived as dark marks in the margin | `--band-dark-structure 40`, or `--band-bed 70` |
-| a header or a page number on a dark band got cut | `--band-dark-structure 5`, or `--band-bed 20` |
+| a spiral binding survived as dark marks in the margin | its rings were not regular enough to be recognised — `--band-dark 45` to judge the band on darkness alone |
+| a regular row of printed marks at one edge got cut as a binding | `--band-dark 75`, or `--edge-keep 8` to keep the band |
 | file too big | `--dpi 200`, `--quality 80`, `--gray` |
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
 | a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
