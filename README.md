@@ -285,13 +285,24 @@ draws from:
 | 4 | 3 | 80 s |
 | 4 | 4 | 76 s |
 
-Twice the cores buys 1.21x, which puts the serial fraction at about 65%. A
-12 MP page spends **28% of its wall clock outside ImageMagick entirely** — the
-two pure-Python passes — and inside the rest sit 19 process launches, the JPEG
-and PNG codecs and a histogram, none of which thread. So the service stays at
-two CPUs on a 4-core host running nineteen other things: 17% off a 32-second
-page is not worth a scan taking the whole box while n8n is trying to answer the
-same user. Both numbers are one line each if that trade ever changes.
+Twice the cores buys 1.21x. An earlier note here blamed that on a 65% serial
+fraction and named the two pure-Python passes and the process launches as the
+cause. Both were wrong, and the numbers are worth keeping because they are the
+ones that stop anyone optimising the wrong end of this:
+
+| | share of a 12 MP page |
+|---|---|
+| pure Python (quad detection, border flood) | **2%** |
+| the 19 `magick` launches (2 ms each) | 0.4% |
+| everything else: ImageMagick on pixels | ~98% |
+
+And most of those pixels do thread: measured 1t→4t on an idle machine, the
+marks map gets 3.3x, the flat-field 2.0x, the output resize 1.8x, the warp
+1.6x. So the 1.21x is mostly the host, not Amdahl — four cores shared with
+nineteen other services are not four free cores. The service stays at two
+CPUs for that reason: 17% off a 32-second page is not worth a scan taking the
+whole box while n8n is trying to answer the same user. Both numbers are one
+line each if that trade ever changes.
 
 The thread limit is one line in `Dockerfile.full`, and the note there explains
 why ImageMagick was running single-threaded on two cores. The script side was
@@ -312,15 +323,31 @@ almost entirely *fewer passes over full-resolution pixels*, not cleverer maths:
 - `-auto-orient` is skipped when the EXIF already says `TopLeft`, instead of
   rewriting a 12 MP photo to apply nothing.
 
+- the border marks map grows its disk by iterating a diamond and a square
+  instead of convolving a dense one. Byte-identical output, every border
+  decision unchanged, and 1.9x on builds without a vectorised dense path —
+  though only 1.3x on the one the service runs, which is why the service saw
+  almost none of it.
+
 The two pure-Python passes (quad detection, border flood) run on 400 and 520 px
-grids and are untouched by all of this.
+grids and are untouched by all of this — correctly, as the table above shows.
 
 Nothing here is free: against the old pipeline the pages differ by RMSE
 0.003–0.032, worst on faint pencil, and the ink-colour mask keeps 8.67% of a
-biro-covered page instead of 9.02%. Two cheaper-looking ideas were measured and
-**rejected** because they cost real content: the haze mask at half resolution
-(it erased printed rules and digits) and the whole chroma mask at a third (it
-dropped 42% of the coloured-ink area).
+biro-covered page instead of 9.02%.
+
+### Measured and rejected
+
+Kept here because each one looks like an obvious win until it is measured, and
+three of the four cost real content:
+
+| idea | what it bought | why not |
+|---|---|---|
+| haze mask at half resolution | 0.3 s | erased printed rules and digits |
+| whole chroma mask at a third | 0.8 s | dropped 42% of the coloured-ink area |
+| marks map on a downscaled copy | 1.4 s | a document edge reading 35.5% structure read 0.0% and was guillotined — at every filter and every factor, down to 1/√2 |
+| marks map with the erode half dropped | 1.5 s | leaves the whole spiral binding standing on the page |
+| tone curve from a sampled histogram | 13 ms/page | `-contrast-stretch` costs 1–30 ms on a normal page. The 850 ms that made this look worthwhile was ONE pathological page out of 21; the replacement is slower on most of them |
 
 ## Determinism
 
