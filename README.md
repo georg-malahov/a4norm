@@ -274,8 +274,24 @@ The two halves of that are independent, and only one of them is code:
 | script alone | 129 s |
 | both | 94 s |
 
-Raising the service's CPU limit past two buys nothing on its own (196 s on four
-CPUs) — `OMP_NUM_THREADS` caps the pool, so both variables move together.
+More cores do help, but far less than their count suggests — and only if both
+variables move together, because `OMP_NUM_THREADS` caps the pool ImageMagick
+draws from:
+
+| service CPUs | thread pool | same four photos |
+|---|---|---|
+| 2 | 2 | 92 s |
+| 4 | 2 | 94 s — the extra CPUs sat idle |
+| 4 | 3 | 80 s |
+| 4 | 4 | 76 s |
+
+Twice the cores buys 1.21x, which puts the serial fraction at about 65%. A
+12 MP page spends **28% of its wall clock outside ImageMagick entirely** — the
+two pure-Python passes — and inside the rest sit 19 process launches, the JPEG
+and PNG codecs and a histogram, none of which thread. So the service stays at
+two CPUs on a 4-core host running nineteen other things: 17% off a 32-second
+page is not worth a scan taking the whole box while n8n is trying to answer the
+same user. Both numbers are one line each if that trade ever changes.
 
 The thread limit is one line in `Dockerfile.full`, and the note there explains
 why ImageMagick was running single-threaded on two cores. The script side was
