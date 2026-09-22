@@ -543,9 +543,63 @@ def _marks_map(path, w, h, paper):
 
 SIDES = ("left", "right", "top", "bottom")
 
+# What makes a spiral binding a spiral binding, as opposed to print that
+# happens to reach the edge of the sheet: it is a row of EQUAL blobs at an
+# EQUAL pitch. Nothing printed is that regular along a whole side. These are
+# what the measure MEANS, not tuning knobs, so they are constants.
+RING_MIN = 6            # rings; fewer is a smudge, not a binding
+RING_COVER = (25, 75)   # % of the side the rings occupy -- fat blobs with
+                        # paper between them, not a solid band and not a
+                        # scatter of specks
+RING_SPREAD = 0.35      # how much ring and gap lengths may vary, as a
+                        # coefficient of variation
+
+
+def _is_binding(prof):
+    """Does this side's flood look like a row of binding rings?
+
+    `prof` is how much of the band each line across the side carries. Measured
+    on real pages: a spiral reads a spread of 0.06-0.26 over 17-34 rings
+    covering half the side, while every printed edge that had to be KEPT reads
+    0.41 and up, or has one or two blobs and no pitch at all. The two
+    populations are nowhere near each other, which is the whole reason to
+    measure the pattern rather than put a bar between two darkness numbers.
+    """
+    if not prof:
+        return False
+    peak = max(prof)
+    if peak <= 0:
+        return False
+    thr = max(1, peak * 0.2)
+    binv = [1 if c >= thr else 0 for c in prof]
+    cover = 100.0 * sum(binv) / len(binv)
+    if not (RING_COVER[0] <= cover <= RING_COVER[1]):
+        return False
+    runs, gaps, cur, prev = [], [], 0, 0
+    for b in binv:
+        if b != prev:
+            (runs if prev else gaps).append(cur)
+            cur = 0
+        cur += 1
+        prev = b
+    (runs if prev else gaps).append(cur)
+    # The first and last gap are the page ending, not a gap between rings.
+    if len(gaps) > 2:
+        gaps = gaps[1:-1]
+    if len(runs) < RING_MIN or len(gaps) < RING_MIN - 1:
+        return False
+
+    def spread(v):
+        m = sum(v) / len(v)
+        if m <= 0:
+            return 99.9
+        return (sum((x - m) ** 2 for x in v) / len(v)) ** 0.5 / m
+
+    return spread(runs) <= RING_SPREAD and spread(gaps) <= RING_SPREAD
+
 
 def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
-                 bed_pct=50.0, dark_struct_pct=15.0, max_share=25.0, side=520):
+                 max_share=25.0, side=520):
     """Erase whatever leans in from outside the sheet, without cropping.
 
     Non-paper pixels that are CONNECTED TO THE FRAME EDGE are desk, shadow or a
@@ -632,6 +686,11 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
     # compared with the page's own paper level.
     marks = _marks_map(path, w, h, paper)
     tot = {k: [0, 0, 0] for k in SIDES}
+    # How much of the band each line ACROSS a side carries -- down the page for
+    # the left and right sides, across it for the top and bottom. This is the
+    # shape `_is_binding` reads, and it costs nothing extra: the loop that owns
+    # every flooded pixel is already here.
+    prof = {k: [0] * (h if k in ("left", "right") else w) for k in SIDES}
     owner = bytearray(n)
     for i in range(n):
         if not reach[i]:
@@ -640,33 +699,32 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
         dist = (x, w - 1 - x, y, h - 1 - y)
         k = dist.index(min(dist))
         owner[i] = k + 1
-        t = tot[SIDES[k]]
+        name = SIDES[k]
+        t = tot[name]
         t[0] += marks[i]; t[1] += 1; t[2] += V[i]
+        prof[name][y if k < 2 else x] += 1
     verdict = {}
     for k in SIDES:
         mk, cnt, vs = tot[k]
         st = 100.0 * mk / (255.0 * cnt) if cnt else 0.0
         dk = 100.0 * vs / (cnt * paper) if cnt and paper else 0.0
-        # A DARK band has to show more print before it counts as document.
         # A binding ring carries a bright specular glint, and the dark rim
         # around that glint reads as a mark on a paper-bright bed, so a spiral
-        # binding does register structure -- that is how a notebook page came
-        # back with a column of black squares down its margin, on a band
-        # measuring 11.3% structure at 45% of the paper level. But darkness
-        # alone cannot decide it either: the top band of a real form is just as
-        # dark (40%) and is nothing but print (35.8%), and cutting it took the
-        # form's header line and its title with it. Only the two together
-        # separate the cases, so below `bed_pct` of the paper level the
-        # structure bar rises from `struct_pct` to `dark_struct_pct`.
+        # binding DOES register printed structure -- 11.3% on one notebook
+        # page, 18.2% on a sharper photograph of the same notebook. There is no
+        # bar to put it under: on that sharper page the BOTTOM edge, which is
+        # handwriting and must be kept, measured 18.5%. Darkness does not
+        # settle it either -- a real form's top band is just as dark (40% of
+        # the paper level) and is nothing but print.
         #
-        # Be clear about how thin this is: the gap is fitted to exactly two
-        # measured pages, 11.3% against 35.8%, with the bar set between them.
-        # A binding photographed so its rings read above the bar will survive,
-        # and a sparse header on a dark band -- a single short line, a page
-        # number -- could still be cut. The shape of the rule is right; its
-        # number is a guess until more pages have been measured.
-        bar = struct_pct if dk > bed_pct else dark_struct_pct
-        verdict[k] = (st, dk, st > bar or dk > dark_pct, cnt)
+        # So the pattern decides. Rings are a row of equal blobs at an equal
+        # pitch, and nothing a printer puts on a page is. The test can only
+        # take a side AWAY from the content, never give one to it, and it is
+        # not consulted for a band the darkness test already cleared.
+        doc = st > struct_pct or dk > dark_pct
+        if doc and dk <= dark_pct and _is_binding(prof[k]):
+            doc = False
+        verdict[k] = (st, dk, doc, cnt)
 
     # A side that is part of the document keeps everything past a shallow strip.
     keep = max(2, int(min(w, h) * keep_pct / 100.0))
@@ -900,8 +958,7 @@ def process_page(src, out_png, o, report):
             cleaned = f"{out_png}.s{step}-border.png"
             got, share, cut, verdict = clean_border(
                 cur, cleaned, o.edge_band, o.edge_keep,
-                o.band_structure, o.band_dark, o.band_bed,
-                o.band_dark_structure)
+                o.band_structure, o.band_dark)
             kept = [f"{k} (structure {verdict[k][0]:.1f}%, "
                     f"brightness {verdict[k][1]:.0f}% of paper)"
                     for k in SIDES if verdict.get(k) and verdict[k][2]
@@ -930,8 +987,7 @@ def process_page(src, out_png, o, report):
                     again = f"{out_png}.s{step}-border2.png"
                     got2, share2, _, _ = clean_border(
                         cur, again, o.edge_band, o.edge_keep,
-                        o.band_structure, o.band_dark, o.band_bed,
-                        o.band_dark_structure)
+                        o.band_structure, o.band_dark)
                     if got2:
                         cur = got2
                         report.append(f"second pass on the new border "
@@ -1414,13 +1470,6 @@ def main():
                    help="%% printed-mark density in a flooded border band above "
                         "which that band is document: never cropped, flooded "
                         "only as far as --edge-keep")
-    g.add_argument("--band-bed", type=float, default=50.0,
-                   help="%% of the paper level a band must still keep for its "
-                        "printed structure to count as document; below it the "
-                        "band is something lying OVER the sheet")
-    g.add_argument("--band-dark-structure", type=float, default=15.0,
-                   help="%% printed structure a band BELOW --band-bed must "
-                        "carry to count as document instead of a binding")
     g.add_argument("--band-dark", type=float, default=60.0,
                    help="%% of the page's own paper level a flooded border band "
                         "must be darker than to count as something leaning in "
