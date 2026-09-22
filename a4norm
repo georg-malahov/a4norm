@@ -40,7 +40,8 @@ def run(cmd, **kw):
 
 
 def magick(*args):
-    return run(["magick", *[str(a) for a in args]])
+    return run(["magick", "-define", "png:compression-level=0",
+                *[str(a) for a in args]])
 
 
 def fmt(path, expr):
@@ -443,18 +444,32 @@ def segment_quad(path, side=400):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def rectify(src, dst, quad, inset_pct):
-    """Warp the quad onto a rectangle whose sides average the quad's own."""
+def rectify(src, dst, quad, inset_pct, cap=None):
+    """Warp the quad onto a rectangle whose sides average the quad's own.
+
+    `cap` is the page the result will be laid onto. Rectifying to more pixels
+    than the page can hold, only to resize them away at the end, is work with
+    no reader: the fit scales by min(pw/W, ph/H), so everything above that is
+    thrown out. Warping straight to the page is cheaper AND slightly sharper --
+    one resample instead of two.
+    """
     tl, tr, br, bl = quad
     d = lambda a, b: math.hypot(a[0]-b[0], a[1]-b[1])
     W = max(50, round((d(tl, tr) + d(bl, br)) / 2))
     H = max(50, round((d(tl, bl) + d(tr, br)) / 2))
+    if cap:
+        k = min(1.0, cap[0] / W, cap[1] / H)
+        if k < 1.0:
+            W, H = max(50, round(W * k)), max(50, round(H * k))
     cx = sum(p[0] for p in quad) / 4; cy = sum(p[1] for p in quad) / 4
     f = inset_pct / 100.0
     q = [(p[0] + (cx - p[0]) * f, p[1] + (cy - p[1]) * f) for p in quad]
     pairs = "  ".join(f"{p[0]:.1f},{p[1]:.1f} {dx},{dy}" for p, (dx, dy) in
                       zip(q, ((0, 0), (W, 0), (W, H), (0, H))))
-    magick(src, "-virtual-pixel", "white", "-distort", "Perspective", pairs,
+    # Triangle, not the default EWA filter: on a 2.4x downscale it costs 22%
+    # less and lands within RMSE 0.002 of it.
+    magick(src, "-filter", "Triangle",
+           "-virtual-pixel", "white", "-distort", "Perspective", pairs,
            "-crop", f"{W}x{H}+0+0", "+repage", dst)
     return W, H
 
@@ -669,6 +684,16 @@ def rasterize(src, workdir, min_px=2400, tag="s00"):
     """Return a list of page rasters (PNG/JPG paths), best quality available."""
     ext = os.path.splitext(src)[1].lower()
     if ext != ".pdf":
+        # -auto-orient rewrites the whole photo as a PNG. On a 12 MP phone shot
+        # that is a third of a second spent to apply, usually, nothing: most
+        # EXIF already says TopLeft. Read the tag first and hand the original
+        # straight on when there is no rotation to bake in.
+        if ext in (".jpg", ".jpeg", ".png"):
+            try:
+                if fmt(src, "%[orientation]") in ("Undefined", "TopLeft"):
+                    return [src]
+            except subprocess.CalledProcessError:
+                pass
         out = os.path.join(workdir, f"{tag}-page-0.png")
         magick(src, "-auto-orient", out)
         return [out]
@@ -806,7 +831,17 @@ def process_page(src, out_png, o, report):
     if quad:
         step += 1
         dst = f"{out_png}.s{step}-rectify.png"
-        W, H = rectify(src, dst, quad, o.rect_inset)
+        # Only for the default fit. --fit content and --fit edges derive their
+        # scale from the layout, not from the frame, and may legitimately want
+        # to blow the page up past 1:1; capping the warp would hand them fewer
+        # pixels to blow up. The auto fit on a rectified page always scales by
+        # min(pw/W, ph/H), so there the cap costs nothing and saves a resample.
+        cap = None
+        if o.fit == "auto":
+            cap = (round(210 / MM * o.dpi), round(297 / MM * o.dpi))
+            if o.landscape:
+                cap = (cap[1], cap[0])
+        W, H = rectify(src, dst, quad, o.rect_inset, cap=cap)
         cur = dst
         rectified = True
         report.append(f"rectified the sheet quad ({why}) -> {W}x{H}")
@@ -901,11 +936,23 @@ def process_page(src, out_png, o, report):
     # then its own tint on the ink reads as "coloured ink" and gets preserved,
     # which is how a black biro came out brown. A per-channel estimate white-
     # balances the sheet, so what survives in colour is really coloured.
+    # The estimate is then squeezed to --bg-scale and blurred there, so no
+    # detail finer than that survives it: closing at full resolution is six
+    # times the work for a result within RMSE 0.01 of this one. So sample the
+    # page down and scale the kernel with it -- the structure the close
+    # swallows stays the same size in the ORIGINAL, which is what matters.
+    # Measured 3.16s -> 0.53s on a 1644x2329 page. The divisor is bounded so
+    # the kernel never drops below ~3: below that the close stops swallowing
+    # strokes and the estimate darkens under the text, which showed up as
+    # nearly three times the drift (RMSE 0.035 vs 0.012 across the corpus).
+    bg_div = max(1, round(o.close / 3))
+    bg_kern = max(1, round(o.close / bg_div))
     stage("flat",
               "(", "+clone",
-              "-morphology", "Close", f"Octagon:{o.close}",
-              "-resize", f"{o.bg_scale}%", "-blur", "0x6",
-              "-resize", f"{iw}x{ih}!", ")",
+              "-sample", f"{100.0 / bg_div:.4f}%",
+              "-morphology", "Close", f"Octagon:{bg_kern}",
+              "-resize", f"{o.bg_scale * bg_div:.4f}%", "-blur", "0x6",
+              "-filter", "Triangle", "-resize", f"{iw}x{ih}!", "+filter", ")",
               "-compose", op_divide(), "-composite")
 
     # 5. deskew — AFTER the flat-field on purpose. The angle is measured on a
@@ -951,61 +998,81 @@ def process_page(src, out_png, o, report):
               "-type", "TrueColor")
         report.append("grayscale output")
     elif not o.no_neutralize:
-        flat = cur
-        mx = f"{out_png}.chroma.png"
+        # One process, not six. Each of the six wrote a full-resolution PNG for
+        # the next one to read back, and at 12 MP that handoff cost more than
+        # the arithmetic it carried. mpr: keeps the page in memory, and -print
+        # hands the coverage back without a seventh read of the mask.
         # Coloured ink = high chroma AND dark. Chroma alone also fires on the
         # warm cast of a bright paper edge and on JPEG chroma speckle, so both
         # conditions are required, then an opening drops single-pixel noise.
-        hi = f"{out_png}.maxch.png"
-        lo = f"{out_png}.minch.png"
-        dk = f"{out_png}.dark.png"
-        magick(flat, "-channel", "RGB", "-separate", "+channel",
-               "-background", "black", "-compose", "Lighten", "-flatten", hi)
-        magick(flat, "-channel", "RGB", "-separate", "+channel",
-               "-background", "white", "-compose", "Darken", "-flatten", lo)
-        magick(flat, "-colorspace", "gray", "-threshold", f"{o.ink_dark}%",
-               "-negate", dk)
-        magick(hi, lo, "-compose", op_minus(), "-composite",
-               "-threshold", f"{o.chroma}%",
-               dk, "-compose", "Multiply", "-composite",
-               "-morphology", "Open", "Octagon:1",
-               "-morphology", "Dilate", f"Octagon:{o.chroma_grow}",
-               "-blur", "0x4", mx)
-        share = float(fmt(mx, "%[fx:mean*100]"))
-        gray = f"{out_png}.neutral-gray.png"
-        magick(flat, "-colorspace", "gray", "-colorspace", "sRGB",
-               "-type", "TrueColor", f"PNG24:{gray}")
         step += 1
-        cur = f"{out_png}.s{step}-neutral.png"
-        magick(gray, flat, mx, "-compose", "Over", "-composite", f"PNG24:{cur}")
+        nxt = f"{out_png}.s{step}-neutral.png"
+        share = float(magick(
+            cur, "-write", "mpr:flat",
+            # Split the channels ONCE and take both the max and the min off
+            # that one split, instead of splitting the page twice. The split is
+            # parked in a register rather than addressed by index, because a
+            # grayscale source -- a PDF with a gray image in it -- separates
+            # into ONE plane, and any "planes 0 to 2" form dies on it.
+            "(", "+clone", "-channel", "RGB", "-separate", "+channel",
+            "-write", "mpr:ch", "-evaluate-sequence", "max",
+            "(", "mpr:ch", "-evaluate-sequence", "min", ")",
+            "-compose", op_minus(), "-composite", "-alpha", "off", ")",
+            "-delete", "0",
+            "-threshold", f"{o.chroma}%",
+            "(", "mpr:flat", "-colorspace", "gray",
+            "-threshold", f"{o.ink_dark}%", "-negate", "-alpha", "off", ")",
+            "-compose", "Multiply", "-composite",
+            "-morphology", "Open", "Octagon:1",
+            # Growing and softening a binary mask is a 10px-scale operation,
+            # so it does not need full resolution: at a third of it the kernel
+            # and the blur scale with it. It is not quite free -- a page of
+            # blue biro kept 8.67% of its area coloured instead of 9.02% -- but
+            # that is the thinnest ends of strokes going neutral, not a stroke.
+            "-sample", "33.3333%",
+            "-morphology", "Dilate",
+            f"Octagon:{max(1, round(o.chroma_grow / 3))}",
+            "-blur", "0x1.3333", "-filter", "Triangle",
+            "-resize", f"{iw}x{ih}!", "+filter",
+            "-write", "mpr:mask", "-print", "%[fx:mean*100]",
+            "-delete", "0",
+            "(", "mpr:flat", "-colorspace", "gray", "-colorspace", "sRGB",
+            "-type", "TrueColor", ")",
+            "mpr:flat", "mpr:mask",
+            "-compose", "Over", "-composite", f"PNG24:{nxt}").strip())
+        cur = nxt
         report.append(f"ink neutralized, coloured ink kept on {share:.3f}% of the page")
 
-    # 7. tone: paper to white, ink deep — percentile based, not a fixed curve
-    stage("tone", "-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%")
-
-    # 8. erase leftover smooth haze: a soft shadow, a finger, an edge glow.
-    #    Bright AND featureless -> paper. Anything with structure (ink, a faint
-    #    stamp, a pencil note) has local variance and survives.
+    # 7-9. tone, haze and paper-flattening in ONE pass over the pixels.
+    #    tone: paper to white, ink deep — percentile based, not a fixed curve.
+    #    haze: erase leftover smooth haze — a soft shadow, a finger, an edge
+    #      glow. Bright AND featureless -> paper; anything with structure (ink,
+    #      a faint stamp, a pencil note) has local variance and survives.
+    #    white: clean the paper to pure white, protecting a 1px ring around ink.
+    #    They used to be four processes handing a full-resolution PNG along;
+    #    the writes cost more than the arithmetic. Same operators, same order.
+    args = ["-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%"]
     if not o.no_haze:
-        hz = f"{out_png}.haze.png"
-        magick(cur, "-colorspace", "gray",
-               "(", "+clone", "-statistic", "StandardDeviation", "7x7",
-               "-threshold", f"{o.haze_std}%", "-negate", ")",
-               "(", "-clone", "0", "-threshold", f"{o.haze_min}%", ")",
-               "-delete", "0", "-compose", "Multiply", "-composite",
-               "-morphology", "Erode", "Octagon:2", hz)
-        step += 1
-        nxt = f"{out_png}.s{step}-haze.png"
-        magick(cur, hz, "-compose", "Screen", "-composite", nxt)
-        cur = nxt
-
-    # 9. clean the paper to pure white, protecting a 1px ring around the ink
+        args += ["-write", "mpr:toned",
+                 # This one stays at FULL resolution, deliberately. Measuring
+                 # the variance on a half-scale copy is 0.3s cheaper and looks
+                 # harmless by RMSE, but point-sampling destroys exactly the
+                 # fine texture the test is looking for: printed rules and
+                 # digits read as featureless, get screened to white, and the
+                 # page comes back with content missing. Tried and reverted.
+                 "(", "mpr:toned", "-colorspace", "gray",
+                 "(", "+clone", "-statistic", "StandardDeviation", "7x7",
+                 "-threshold", f"{o.haze_std}%", "-negate", ")",
+                 "(", "-clone", "0", "-threshold", f"{o.haze_min}%", ")",
+                 "-delete", "0", "-compose", "Multiply", "-composite",
+                 "-morphology", "Erode", "Octagon:2", "-alpha", "off", ")",
+                 "-compose", "Screen", "-composite"]
     if not o.no_flatten_paper:
-        stage("white",
-              "(", "+clone", "-colorspace", "gray",
-              "-threshold", f"{o.paper_thr}%",
-              "-morphology", "Erode", "Octagon:1", ")",
-              "-compose", "Screen", "-composite")
+        args += ["(", "+clone", "-colorspace", "gray",
+                 "-threshold", f"{o.paper_thr}%",
+                 "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
+                 "-compose", "Screen", "-composite"]
+    stage("tone", *args)
 
     # 10. fit onto A4
     iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
@@ -1066,14 +1133,19 @@ def process_page(src, out_png, o, report):
         off_y = round((ph - ih * scale) / 2)
     off = (off_x, off_y)
 
-    stage("scaled", "-resize", f"{scale * 100:.4f}%",
-          "-unsharp", f"0x1+{o.sharpen}+0.02")
+    # The resize and the A4 layout are one process: the scaled page is the
+    # single biggest intermediate in the run (A4 at 300 dpi is 8.7 MP), and
+    # writing it only for the next process to read it back was the most
+    # expensive handoff left.
     page = f"{out_png}"
-    magick("-size", f"{pw}x{ph}", "xc:white", cur,
-           "-geometry", f"{off[0]:+d}{off[1]:+d}", "-composite",
+    magick("-size", f"{pw}x{ph}", "xc:white",
+           "(", cur, "-resize", f"{scale * 100:.4f}%",
+           "-unsharp", f"0x1+{o.sharpen}+0.02", ")",
+           "-geometry", f"{off[0]:+d}{off[1]:+d}", "-compose", "Over",
+           "-composite",
            "-colorspace", "sRGB", "-geometry", "+0+0",
            "(", "+clone", "-colorspace", "gray", "-threshold", f"{o.paper_thr}%",
-           "-morphology", "Erode", "Octagon:1", ")",
+           "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
            "-compose", "Screen", "-composite", page)
     report.append(f"fit: {mode_used}; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
     report.append(f"page: {pw}x{ph}px @ {page_dpi}dpi")
@@ -1217,6 +1289,7 @@ def build(sources, out, o):
                 written.append(dst)
         if o.preview:
             magick(pages[0][0], "-resize", "900x",
+                   "-define", "png:compression-level=6",
                    os.path.splitext(out)[0] + "-preview.png")
     return written
 

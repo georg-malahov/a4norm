@@ -10,11 +10,22 @@
 # outright or re-fetch 176 MB after every restart.
 FROM debian:trixie-slim
 
+# BOTH thread variables, and both set to the service's CPU budget. They are not
+# redundant: OMP_NUM_THREADS is what onnxruntime reads AND it caps the OpenMP
+# pool ImageMagick draws from, but ImageMagick also needs its own variable, and
+# with that one unset this Debian build settles on ONE thread no matter how many
+# cores or how high OMP_NUM_THREADS is. That was the single most expensive thing
+# about the service: the same closing took 19.9 s single-threaded and 11.1 s
+# with this line, on the same two cores. Raising the service's CPU limit
+# therefore means raising BOTH of these -- measured, four CPUs with these at 2
+# is exactly as fast as two CPUs. The output does not depend on either: the
+# same photo gives byte-identical bytes at 1, 2, 4 and 8 threads.
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     A4NORM_MODEL=/opt/a4norm/models/u2net.onnx \
-    OMP_NUM_THREADS=2
+    OMP_NUM_THREADS=2 \
+    MAGICK_THREAD_LIMIT=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-numpy python3-pil \
