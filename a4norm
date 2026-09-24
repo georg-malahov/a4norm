@@ -76,7 +76,7 @@ def smooth(v, k=5):
 
 def profiles(path, side=420):
     """Per-row and per-column mean brightness over the central 60% of the frame."""
-    w0, h0 = (int(x) for x in fmt(path, "%w %h").split())
+    w0, h0 = dims(path)
     w = side
     h = max(1, round(side * h0 / w0))
     buf = raw_gray(path, w, h)
@@ -224,6 +224,14 @@ def raw_rgb(path, w, h):
         check=True, capture_output=True).stdout
 
 
+def _value_chroma(buf):
+    """Per-pixel value (max channel) and chroma (max - min) of RGB bytes."""
+    r, g, b = buf[0::3], buf[1::3], buf[2::3]
+    V = bytearray(map(max, r, g, b))
+    C = bytearray(v - m for v, m in zip(V, map(min, r, g, b)))
+    return V, C
+
+
 def dims(path):
     return tuple(int(x) for x in fmt(path, "%w %h").split())
 
@@ -270,17 +278,7 @@ def _vc(path, side=400):
     w0, h0 = dims(path)
     w = side
     h = max(1, round(side * h0 / w0))
-    buf = raw_rgb(path, w, h)
-    n = w * h
-    V = bytearray(n); C = bytearray(n)
-    for i in range(n):
-        j = i * 3
-        r, g, b = buf[j], buf[j+1], buf[j+2]
-        v = r if r > g else g
-        if b > v: v = b
-        m = r if r < g else g
-        if b < m: m = b
-        V[i] = v; C[i] = v - m
+    V, C = _value_chroma(raw_rgb(path, w, h))
     return V, C, w, h, w0, h0
 
 
@@ -477,18 +475,8 @@ def segment_quad(path, side=400):
         # detector uses, but measured against the region's own paper level, so
         # a grey till slip counts as paper and a forest photo on a screen does
         # not. Measured: 60-97% for every real sheet here, 16% for the desk.
-        rgb = raw_rgb(path, w, h)
-        vals = []
-        for i in range(w * h):
-            if not mask[i]:
-                continue
-            j = i * 3
-            r, g, b = rgb[j], rgb[j + 1], rgb[j + 2]
-            v = r if r > g else g
-            if b > v: v = b
-            m = r if r < g else g
-            if b < m: m = b
-            vals.append((v, v - m))
+        V, C = _value_chroma(raw_rgb(path, w, h))
+        vals = [(V[i], C[i]) for i in range(w * h) if mask[i]]
         if not vals:
             return None, "segmented region is empty", frac
         paper = sorted(v for v, _ in vals)[int(0.95 * (len(vals) - 1))]
@@ -985,14 +973,7 @@ def _dark_cells(path, side):
         w, h = side, max(1, round(side * h0 / w0))
     else:
         w, h = max(1, round(side * w0 / h0)), side
-    buf = raw_rgb(path, w, h)
-    n = w * h
-    V = bytearray(n)
-    for i in range(n):
-        j = i * 3
-        r, g, b = buf[j], buf[j + 1], buf[j + 2]
-        v = r if r > g else g
-        V[i] = b if b > v else v
+    V, _ = _value_chroma(raw_rgb(path, w, h))
     c = PHOTO_CELL
     cw, ch = w // c, h // c
     if cw < 4 or ch < 4:
@@ -1790,15 +1771,7 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
     h = max(1, round(side * h0 / w0))
     buf = raw_rgb(path, w, h)
     n = w * h
-    V = bytearray(n); C = bytearray(n)
-    for i in range(n):
-        j = i * 3
-        r, g, b = buf[j], buf[j+1], buf[j+2]
-        v = r if r > g else g
-        if b > v: v = b
-        m = r if r < g else g
-        if b < m: m = b
-        V[i] = v; C[i] = v - m
+    V, C = _value_chroma(buf)
     paper = sorted(V)[int(0.90 * (n - 1))]
     v_bad = int(paper * 0.88)   # the desk fades into a gradient at the
                                 # sheet edge; catching only its darkest
@@ -1986,13 +1959,8 @@ def erase_fingers(path, dst, axis, side=520):
     h = max(1, round(side * h0 / w0))
     buf = raw_rgb(path, w, h)
     n = w * h
-    V = bytearray(n); C = bytearray(n); skin = bytearray(n)
-    for i in range(n):
-        j = i * 3
-        r, g, b = buf[j], buf[j + 1], buf[j + 2]
-        v = max(r, g, b)
-        V[i] = v
-        C[i] = v - min(r, g, b)
+    V, C = _value_chroma(buf)
+    skin = bytearray(n)
     # "Saturated" is relative to the pages themselves: under warm light a
     # whole page reads red-led and past the absolute limit, and a flood that
     # took it for skin repainted 36% of a spread, a third of the text with it.
@@ -3313,9 +3281,8 @@ def process_page(src, out_png, o, report):
     return page, False, dpi
 
 
-def write_pdf(jpegs, out, dpi, label=None):
-    """`dpi` is one number, or one per page."""
-    """Write a JPEG-per-page PDF by hand.
+def write_pdf(jpegs, out, dpi):
+    """Write a JPEG-per-page PDF by hand. `dpi` is one number, or one per page.
 
     ImageMagick can do this, but only where its PDF coder exists: on Alpine (and
     anywhere else that splits the coder out) writing a PDF silently needs
@@ -3338,7 +3305,7 @@ def write_pdf(jpegs, out, dpi, label=None):
     for page_i, jp in enumerate(jpegs):
         page_dpi = dpi[page_i] if isinstance(dpi, (list, tuple)) else dpi
         data = open(jp, "rb").read()
-        w, h = (int(x) for x in fmt(jp, "%w %h").split())
+        w, h = dims(jp)
         chans = fmt(jp, "%[channels]").lower()
         space = b"/DeviceGray" if "gray" in chans else b"/DeviceRGB"
         pw = w * 72.0 / page_dpi
