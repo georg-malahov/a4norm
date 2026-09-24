@@ -1,12 +1,34 @@
 #!/usr/bin/env python3
 """a4norm — photos of paper documents -> one scanner-grade A4 PDF.
 
-Per page: rasterize -> rectify the sheet's quadrilateral and erase whatever
-leans in from outside it -> orient -> trim the photographic border -> flat-field
-the illumination in colour -> deskew -> neutralize the ink cast while keeping
-genuinely coloured ink -> tone by histogram percentiles -> erase bright
-featureless haze -> clean the paper to white -> fit onto A4 -> JPEG in a PDF
-this script writes itself.
+Per page: rasterize -> find what is in the frame (a sheet, an open passport,
+an ID card, or a photo with no document) -> rectify it and erase whatever
+leans in from outside it -> orient -> trim the photographic border ->
+flat-field the illumination in colour -> deskew -> neutralize the ink cast
+while keeping genuinely coloured ink -> tone by histogram percentiles -> erase
+bright featureless haze -> clean the paper to white -> fit onto A4 -> clean
+the open paper -> JPEG in a PDF this script writes itself. An open passport
+and an ID card are colour copies instead: the light is evened, nothing is
+whitened. Cards go front above back on one page, from one photo or two.
+
+The file reads top to bottom in that order, one section per concern:
+
+    shell helpers    magick/fmt/dims, the compose-alias probes
+    analysis         paper masks, sheet quads, blobs, segmentation
+    spreads          two facing pages, the fold, orientation, the face photo
+    cards            ID-1 detection
+    edge finding     documents found by straight edges, not brightness
+    rectify, ...     the warp, the border flood, the binding, fingers
+    input            rasterizing photos and PDFs
+    cards: ...       which side is the front, the card page
+    the photo ...    a frame with no document, passed through
+    finishing        specks on open paper, the face photo laid back
+    the page ...     Job and the stages: process_page() is the map
+    output           the hand-written PDF
+    main             several photos -> one document, the command line
+
+Every threshold carries the measurement it was set from, in the comment
+beside it. The tests are in tests/ (tests/run.sh; see README, Testing).
 
 Several inputs combine into ONE multi-page document; --separate gives one
 document per input. --format jpg writes images instead of a PDF.
@@ -1574,6 +1596,9 @@ def edge_document(src, bright_quad, o, report):
     return None
 
 
+# ------------------------------------ rectify, and what leans in from outside
+
+
 def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False, size=None):
     """Warp the quad onto a rectangle whose sides average the quad's own.
 
@@ -2062,7 +2087,7 @@ def erase_fingers(path, dst, axis, side=520):
     return dst, share
 
 
-# --------------------------------------------------------------- page pipeline
+# ---------------------------------------------------------------------- input
 
 
 def rasterize(src, workdir, min_px=2400, tag="s00"):
@@ -2115,6 +2140,9 @@ CARD_FACE_DARK = 0.30   # share of dark cells in the photo's place
 CARD_FACE_RUN = 0.20    # share of its columns dark top to bottom for half
                         # its height -- hair, face, collar in one run, where
                         # lines of text leave gaps between them
+
+
+# -------------------------------------------- cards: which side, and one page
 
 
 def _place(cells, x0, x1, y0, y1):
@@ -2294,6 +2322,9 @@ def card_page(cards, out_png, o):
     return out_png
 
 
+# ------------------------------------------------------ the photo passthrough
+
+
 def fit_photo_page(src, out_png, o, report):
     """The photo path: geometry, and nothing else. A single early return.
 
@@ -2356,6 +2387,9 @@ SPECK_LINE = 4          # a mark this many times longer than wide is a line
 SPECK_INK = 96          # % brightness under which a pixel is a mark at all:
                         # the paper is pure white by now, so a light-grey
                         # fleck at 90-95% is plainly visible on it
+
+
+# ----------------------------------- finishing: open paper and the face photo
 
 
 def clean_specks(page, dpi):
@@ -2529,6 +2563,9 @@ def photo_patch(keep, scale, off, o, out_png):
     x = off[0] + round(bx * scale)
     y = off[1] + round(by * scale)
     return [patch, "-geometry", f"{x:+d}{y:+d}", "-compose", "Over", "-composite"]
+
+
+# ---------------------------------------------------------- the page pipeline
 
 
 class Job:
@@ -3279,6 +3316,9 @@ def process_page(src, out_png, o, report):
     # 5. fit onto A4
     page, dpi = lay_out(job, rectified, flags, span, shave, keep, copy)
     return page, False, dpi
+
+
+# --------------------------------------------------------------------- output
 
 
 def write_pdf(jpegs, out, dpi):
