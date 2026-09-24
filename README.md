@@ -16,6 +16,10 @@ driving ImageMagick and poppler, and the container is 104 MB. A second image,
 `:full`, adds one segmentation model for the photographs the brightness rule
 cannot solve — see **Two images** below. The light image is unchanged by it.
 
+**Product page:** [malahov.io/a4norm](https://malahov.io/a4norm) — what it does,
+with before/after examples. The two photos there are public examples here
+too (`examples/landing-*.webp`), under the same tests.
+
 **Try it without installing anything:** [@a4norm_bot](https://t.me/a4norm_bot)
 on Telegram is this tool behind a chat window — send a photo, or a whole album,
 and the A4 PDF comes back. It runs the same container as below.
