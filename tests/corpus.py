@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Run a4norm over the LOCAL photo corpus in tests/corpus/.
+
+The public examples in examples/ are what CI can see. Real documents -- a
+passport, a record book, a bank card -- carry personal data and must never be
+committed, so they live in tests/corpus/, which is in .gitignore and
+.dockerignore, and exist only on the machines that run this. The runner and
+the format are public; the photos and their expectations are not.
+
+    tests/corpus/
+        cases.json            what each photo must come out as (see below)
+        <photo>.jpg ...       the photos, named for what makes them hard
+        out/                  written by this script: PDFs, renders, reports,
+                              and sheet.png -- every input next to its page
+
+cases.json is a list of objects:
+
+    {"file": "ru-internal-sideways-thumb-dark-desk.jpg",
+     "note": "the photo the spread support was written for",
+     "args": [],                       # extra a4norm flags, optional
+     "expect": {"spread": true,        # a spread was found and joined
+                "face_photo": true,    # a face photo was kept out of the
+                                       # paper treatment, and on the page it
+                                       # sits in the lower-left quarter (as
+                                       # a4norm reports it)
+                "lines_across": true,  # text runs across the page
+                "turn": 90,            # the spread was turned this much
+                "spread_aspect": [1.3, 1.55]},  # long/short of the joined
+                                       # spread: 176x125 mm is 1.41
+     "known_fail": "why"}              # optional: reported, not counted
+
+A case marked known_fail is a photo the tool does not handle YET: it stays in
+the corpus as the next thing to fix, is reported as xfail while it fails, and
+as XPASS (so the mark can be removed) once it passes.
+
+    python3 tests/corpus.py                 # all cases
+    python3 tests/corpus.py --only NAME     # one case (file name, no suffix ok)
+    python3 tests/corpus.py --a4norm PATH   # a different a4norm
+
+Stdlib only, like tests/regression.py, whose report parser and page facts
+this reuses.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+CORPUS = os.path.join(HERE, "corpus")
+OUT = os.path.join(CORPUS, "out")
+
+sys.path.insert(0, HERE)
+import regression as R  # noqa: E402  (parse_report, Page, A4 constants)
+
+
+def load_a4norm(path):
+    """The a4norm under test as a module, for its photo-block detector."""
+    loader = importlib.machinery.SourceFileLoader("a4norm_mod", path)
+    spec = importlib.util.spec_from_loader("a4norm_mod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def check(case, rep, page, render, A):
+    """Failures of one case, as a list of strings."""
+    exp = case.get("expect", {})
+    bad = []
+    lines = rep["lines"]
+    spread = any(l.startswith("spread: two facing pages") for l in lines)
+    if "spread" in exp and spread != exp["spread"]:
+        bad.append(f"spread found: {spread}, expected {exp['spread']}")
+    if "spread_aspect" in exp:
+        # A passport page is 125 x 88 mm, so a joined spread is 176 x 125:
+        # long/short 1.41 whichever way it lies. A page edge fitted inside the
+        # page -- glare, a patterned desk that passed for paper -- cuts a
+        # strip of the document away without failing any other check.
+        lo, hi = exp["spread_aspect"]
+        for l in lines:
+            m = re.search(r"joined at the fold -> (\d+)x(\d+)", l)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                r = max(a, b) / min(a, b)
+                if not lo <= r <= hi:
+                    bad.append(f"spread is {a}x{b}, long/short {r:.2f}; a "
+                               f"passport spread is {lo}-{hi} -- a strip of "
+                               f"it was cut off, or something else was added")
+    if "turn" in exp:
+        got = 0
+        for l in lines:
+            if l.startswith("rotated "):
+                got = int(l.split()[1].rstrip("°"))
+        if got != exp["turn"]:
+            bad.append(f"turned {got}°, expected {exp['turn']}°")
+    if exp.get("lines_across"):
+        # a4norm's own run-length measure, not regression.py's profile
+        # variance: on a passport page the photo and the vertical serial
+        # number swing the column profile as hard as the text swings the rows
+        # (1.22 on a correctly turned spread)
+        across, along = A._ink_runs(render)
+        ratio = across / max(1, along)
+        if ratio < 1.6:
+            bad.append(f"text does not run across the page (ink in runs "
+                       f"across/along {ratio:.2f}, expected >= 1.6)")
+    if "face_photo" in exp:
+        box = None
+        for l in lines:
+            m = re.match(r"face photo at (\d+)x(\d+)\+(\d+)\+(\d+) of (\d+)x(\d+)", l)
+            if m:
+                box = [int(g) for g in m.groups()]
+        if (box is not None) != exp["face_photo"]:
+            bad.append(f"face photo kept apart: {box is not None}, expected "
+                       f"{exp['face_photo']}")
+        if box and exp["face_photo"]:
+            # the box is in the page's own coordinates, upright, before the
+            # fit -- where it sits there is where it sits on the A4
+            bw, bh, bx, by, pw, ph = box
+            cx, cy = (bx + bw / 2) / pw, (by + bh / 2) / ph
+            if not (cx < 0.5 and cy > 0.5):
+                bad.append(f"face photo centred at {cx:.0%} across, {cy:.0%} "
+                           f"down; expected the lower-left quarter (the page "
+                           f"is turned wrong)")
+    if rep["page"] and rep["page"][2] in R.A4_PX:
+        if rep["page"][:2] != R.A4_PX[rep["page"][2]]:
+            bad.append(f"page raster {rep['page']} is not a portrait A4")
+    return bad
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--a4norm", default=os.path.join(ROOT, "a4norm"))
+    ap.add_argument("--only")
+    a = ap.parse_args()
+
+    cases_path = os.path.join(CORPUS, "cases.json")
+    if not os.path.exists(cases_path):
+        print(f"no corpus here ({cases_path} is missing) -- nothing to run")
+        return 0
+    cases = json.load(open(cases_path))
+    os.makedirs(OUT, exist_ok=True)
+    A = load_a4norm(a.a4norm)
+
+    counts = {"ok": 0, "FAIL": 0, "xfail": 0, "XPASS": 0}
+    rows = []
+    for case in cases:
+        name = os.path.splitext(case["file"])[0]
+        if a.only and a.only not in (name, case["file"]):
+            continue
+        src = os.path.join(CORPUS, case["file"])
+        pdf = os.path.join(OUT, name + ".pdf")
+        p = subprocess.run([a.a4norm, *case.get("args", []), "-o", pdf, src],
+                           capture_output=True, text=True)
+        open(os.path.join(OUT, name + ".txt"), "w").write(p.stdout + p.stderr)
+        if p.returncode != 0:
+            bad = [f"a4norm exited {p.returncode}: {p.stderr.strip()}"]
+            render = None
+        else:
+            rep = R.parse_report(p.stdout)
+            base = os.path.join(OUT, name)
+            R.sh("pdftoppm", "-r", str(R.RENDER_DPI), "-png", "-singlefile",
+                 pdf, base)
+            render = base + ".png"
+            bad = check(case, rep, R.Page(render), render, A)
+        known = case.get("known_fail")
+        if bad and known:
+            status = "xfail"
+        elif bad:
+            status = "FAIL"
+        elif known:
+            status = "XPASS"
+        else:
+            status = "ok"
+        counts[status] += 1
+        size = os.path.getsize(pdf) // 1024 if os.path.exists(pdf) else 0
+        print(f"{status:5s} {name}  ({size} KB)")
+        if known and bad:
+            print(f"      known: {known}")
+        for b in bad:
+            print(f"  x {b}")
+        if status == "XPASS":
+            print("      passes now -- drop its known_fail mark")
+        rows.append((src, render))
+
+    # every input beside the page it became, for the eye -- the checks above
+    # are necessary, never sufficient
+    if rows:
+        tiles = []
+        for i, (src, render) in enumerate(rows):
+            t = os.path.join(OUT, f".tile-{i}.png")
+            args = ["magick", "(", src + "[0]", "-auto-orient", "-resize",
+                    "400x400", "-background", "white", "-gravity", "center",
+                    "-extent", "420x420", ")"]
+            if render:
+                args += ["(", render, "-resize", "300x420", "-background",
+                         "white", "-gravity", "center", "-extent", "320x420", ")"]
+            else:
+                args += ["-size", "320x420", "xc:white"]
+            # no caption: -annotate needs a font, and a bare ImageMagick has
+            # none configured. The rows are in the order printed above.
+            args += ["+append", "-bordercolor", "gray70", "-border", "1", t]
+            subprocess.run(args, check=True)
+            tiles.append(t)
+        subprocess.run(["magick", *tiles, "-append",
+                        os.path.join(OUT, "sheet.png")], check=True)
+        for t in tiles:
+            os.unlink(t)
+        print(f"\ncontact sheet: {os.path.join(OUT, 'sheet.png')}")
+    print("  ".join(f"{k} {v}" for k, v in counts.items() if v))
+    return 1 if counts["FAIL"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

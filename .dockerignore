@@ -1,0 +1,3 @@
+# Local test corpus: real document photos, personal data. Never sent anywhere.
+tests/corpus/
+.git/
