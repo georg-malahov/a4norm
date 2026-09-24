@@ -1,3 +1,6 @@
 work/
 __pycache__/
 *.pyc
+
+# Local test corpus: real document photos, personal data. Never committed.
+tests/corpus/
