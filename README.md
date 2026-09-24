@@ -36,7 +36,19 @@ demo photos the product page shows (a notebook next to a laptop, a synthetic
 invoice with a hard shadow over its corner). They are tested too because the
 landing notebook once came out with a band of desk above the page while the
 README's notebook was fine, and nothing noticed: whatever the product page
-shows is now under the same test. A one-line smoke test:
+shows is now under the same test.
+
+| Photo | Page | What it tests |
+|---|---|---|
+| <a href="examples/notebook-photo.jpg"><img src="examples/notebook-photo.jpg" width="220"></a> | <img src="tests/golden/light/notebook-photo.png" width="160"> | [`notebook-photo.jpg`](examples/notebook-photo.jpg) — a sheet shot at an angle, a spiral binding cut away, faint pencil kept grey |
+| <a href="examples/sample-photo.jpg"><img src="examples/sample-photo.jpg" width="220"></a> | <img src="tests/golden/light/sample-photo.png" width="160"> | [`sample-photo.jpg`](examples/sample-photo.jpg) — a synthetic letter: warm cast, uneven light, tilt, desk border; the blue signature stays blue |
+| <a href="examples/landing-notebook.webp"><img src="examples/landing-notebook.webp" width="220"></a> | <img src="tests/golden/light/landing-notebook.png" width="160"> | [`landing-notebook.webp`](examples/landing-notebook.webp) — the product page's demo: the page alone, no desk band above it |
+| <a href="examples/landing-invoice.webp"><img src="examples/landing-invoice.webp" width="220"></a> | <img src="tests/golden/light/landing-invoice.png" width="160"> | [`landing-invoice.webp`](examples/landing-invoice.webp) — a synthetic invoice with a hard shadow over its corner: the corner comes out clean |
+
+The pages are the low-resolution goldens the tests hold each example to
+(`tests/golden/`); see **Testing**.
+
+A one-line smoke test:
 
 ```bash
 docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
