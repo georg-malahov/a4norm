@@ -106,6 +106,11 @@ report is built either way — that is when it is needed.
    sufficient: every bug in this pipeline so far produced a valid A4 PDF and
    a plausible report. Look at the pages.
 
+**Refactoring** has a guard of its own: `tests/snapshot.py save` records the
+SHA-256 of every output and the full report over every public example under
+14 flag sets and your corpus; after the change, `tests/snapshot.py check`
+names every run whose bytes or report moved. A refactor moves none.
+
 What the checks protect, and the numbers each decision turned on, is in the
 commit messages that changed behaviour, so a change can be argued about even
 by someone who cannot run the private corpus.
