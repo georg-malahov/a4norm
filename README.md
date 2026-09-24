@@ -25,13 +25,18 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   -o /work/contract.pdf /work/page1.HEIC /work/page2.HEIC /work/page3.HEIC
 ```
 
-Two test images live in `examples/`, and neither carries anybody's data.
+Four test images live in `examples/`, and none carries anybody's data.
 `sample-photo.jpg` is a generated letter, degraded to look photographed (warm
 cast, uneven light, a tilt, a desk border). `notebook-photo.jpg` is a real
 phone shot of a handwritten to-do list on a spiral notebook, at an angle on a
 wooden desk — the case that exercises the harder half of the pipeline: a quad
 that is nearly square, faint pencil, and a binding whose rings sit inside the
-page's own margin. A one-line smoke test:
+page's own margin. `landing-notebook.webp` and `landing-invoice.webp` are the
+demo photos the product page shows (a notebook next to a laptop, a synthetic
+invoice with a hard shadow over its corner). They are tested too because the
+landing notebook once came out with a band of desk above the page while the
+README's notebook was fine, and nothing noticed: whatever the product page
+shows is now under the same test. A one-line smoke test:
 
 ```bash
 docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
@@ -283,7 +288,11 @@ change what this image may be used for.
    of near-vertical ones is a candidate outline, scored by how much of it is
    actually edge (every side at least 45%). The outline is only believed
    where brightness failed: it found nothing, a scrap inside the outline
-   (30% smaller or more), or the frame itself (70% of it and more).
+   (30% smaller or more), or the frame itself (70% of it and more). A
+   "scrap" whose own outline is edged on three sides of four is no scrap
+   but a sheet, and it is kept unless a fold makes the larger outline a
+   spread: the landing's notebook page (sides 0.40, 1.00, 0.96, 1.00 edge)
+   once lost to an outline around it and the desk above it.
 
    - A card-shaped outline (1.50–1.68) goes to the card path, which still
      lays it out as a card, face or no face.
