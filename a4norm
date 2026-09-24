@@ -1039,7 +1039,8 @@ def _dark_cells(path, side):
     return dark, cw, ch, w, w0
 
 
-def find_photo_block(path, side=400):
+def find_photo_block(path, side=400, area_max=None, fill=None, aspect=None,
+                     area_min=None):
     """Bounding box (x, y, w, h) of a face photo on the page, or None.
 
     Cells of the analysis image that are mostly darker than the paper, joined
@@ -1064,9 +1065,9 @@ def find_photo_block(path, side=400):
         xs = [i % cw for i in comp]; ys = [i // cw for i in comp]
         bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
         share = 100.0 * bw * bh / (cw * ch)
-        if (PHOTO_AREA[0] <= share <= PHOTO_AREA[1]
-                and len(comp) >= PHOTO_FILL * bw * bh
-                and 0.4 <= bw / bh <= 2.5):
+        if ((area_min or PHOTO_AREA[0]) <= share <= (area_max or PHOTO_AREA[1])
+                and len(comp) >= (fill or PHOTO_FILL) * bw * bh
+                and (aspect or (0.4, 2.5))[0] <= bw / bh <= (aspect or (0.4, 2.5))[1]):
             break
     else:
         return None
@@ -1075,6 +1076,13 @@ def find_photo_block(path, side=400):
     s = w0 / w
     return (round(x0 * c * s), round(y0 * c * s),
             round((x1 - x0) * c * s), round((y1 - y0) * c * s))
+
+
+SPREAD_PHOTO_MM = (38, 48)  # a passport photo is 35 x 45 mm; a little
+                        # over, for its frame and for the fit being loose
+SPREAD_PHOTO_DARK = 0.25
+SPREAD_PHOTO_PLACE = (0.03, 0.37, 0.58, 0.98)  # x0, x1, y0, y1 of the
+                        # upright spread: the lower page's left third
 
 
 def spread_turn(path, axis, report):
@@ -1106,6 +1114,42 @@ def spread_turn(path, axis, report):
         return 0
     lines = "across" if cands[0] == 0 else "up and down"
     iw, ih = dims(path)
+    # The photo has a known place: the left third of the LOWER page, once
+    # the pages are stacked the right way up (RU page 3, the ICAO data page).
+    # So each candidate turn is tried on a small copy and that place is
+    # measured, as on a card -- a search over the whole spread found a dark
+    # band of shadow or a hologram as often as the face.
+    scored = []
+    for turn in cands:
+        if (axis == "h") == (turn in (0, 180)):
+            continue            # pages side by side after this turn
+        small = f"{path}.turn{turn}.png"
+        magick(path, "-resize", "400x400", "-rotate", str(turn), small)
+        got = _dark_cells(small, 200)
+        os.unlink(small)
+        if got is None:
+            continue
+        d, r = _place(got, *SPREAD_PHOTO_PLACE)
+        scored.append((d, r, turn))
+    # A photo in its place either looks like one on its own (dark, and dark
+    # in unbroken columns, as on a card), or it is simply far darker there
+    # than the other turn's place: a light portrait on a light background
+    # breaks the columns (measured 0.32 dark, 0.00 columns), but the same
+    # place turned half round held 0.02.
+    pick = None
+    if len(scored) == 2:
+        (d1, r1, t1), (d2, r2, t2) = sorted(scored, reverse=True)
+        if d1 >= SPREAD_PHOTO_DARK and d1 >= 3 * d2 + 0.02:
+            pick = t1
+    for d, r, t in scored:
+        if pick is None and d >= CARD_FACE_DARK and r >= CARD_FACE_RUN:
+            pick = t
+    if pick is not None:
+        turn = pick
+        report.append(f"spread: text runs {lines} (ratio {ratio:.2f}); the "
+                      f"face photo is in its place, left on the lower page, "
+                      f"when turned {turn}°")
+        return turn
     box = find_photo_block(path)
     if box:
         cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
@@ -1232,6 +1276,289 @@ def detect_cards(src, vc):
                         for _, a, s in found)
         return quads, f"{why}, {mode} paper mask"
     return None, "; ".join(whys)
+
+
+# ------------------------------------------------------------ edge finding
+#
+# Every detector above finds the document as PAPER: bright, low-chroma, or at
+# least brighter than Otsu's split. That is simply false for a white page on
+# a white desk, a pale card on a white car roof, a pink passport over a light
+# floor -- and for a page whose colour illustrations fall out of every paper
+# mask, leaving a scrap of it. What those photos still have is an EDGE: a
+# long straight step in brightness or in colour where the document ends.
+#
+# So the frame is also read as lines: Canny edges -- of the brightness AND of
+# the saturation, because a lilac card on white paint barely steps in
+# brightness and a white page on grey barely in colour -- then a Hough
+# transform, and every pair of near-horizontal lines with every pair of
+# near-vertical ones is a candidate quadrilateral. A candidate is scored by
+# how much of its outline is actually edge.
+
+EDGE_SIDE = 600         # px, long side of the image the lines are read on
+EDGE_LINES = 16         # strongest lines per direction that are combined
+EDGE_SUPPORT = 0.45     # every side must be edge over this share of it
+EDGE_SHEET = 0.60       # ...and this much, before a quad replaces a sheet
+
+
+def edge_quads(path):
+    """Candidate document quads from straight edges, best first.
+
+    Returns (cands, lines, w, h, w0, h0): cands a list of dicts {quad, score,
+    minsup, share} at the analysis scale (quad tl,tr,br,bl), lines the Hough
+    lines with a support function for any segment of them.
+    """
+    w0, h0 = dims(path)
+    if w0 >= h0:
+        w, h = EDGE_SIDE, max(1, round(EDGE_SIDE * h0 / w0))
+    else:
+        w, h = max(1, round(EDGE_SIDE * w0 / h0)), EDGE_SIDE
+    edge = path + ".edges.png"
+    magick(path + "[0]", "-resize", f"{w}x{h}!", "-write", "mpr:s",
+           "-colorspace", "gray", "-canny", "0x2+10%+30%",
+           "(", "mpr:s", "-colorspace", "HSL", "-channel", "G", "-separate",
+           "+channel", "-canny", "0x2+10%+30%", ")",
+           "-compose", "Lighten", "-composite", edge)
+    thr = max(20, round(min(w, h) * 0.12))
+    out = run(["magick", edge, "-hough-lines", f"15x15+{thr}", "mvg:-"])
+    # a hit is an edge pixel within 2 px of the line: dilate once, look up
+    E = subprocess.run(["magick", edge, "-morphology", "Dilate", "Square:2",
+                        "-depth", "8", "gray:-"],
+                       check=True, capture_output=True).stdout
+    os.unlink(edge)
+    lines = []
+    for l in out.splitlines():
+        m = re.match(r"line ([-\d.]+),([-\d.]+) ([-\d.]+),([-\d.]+)\s+# (\d+)", l)
+        if not m:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in m.groups()[:4])
+        n = math.hypot(x2 - x1, y2 - y1)
+        if n < 1:
+            continue
+        dx, dy = (x2 - x1) / n, (y2 - y1) / n
+        # the line's hits, one sample per px along it, as prefix sums: the
+        # support of any stretch of it is then two lookups
+        span = int(math.hypot(w, h)) + 2
+        pre = [0] * (2 * span + 2)
+        for k in range(-span, span + 1):
+            x, y = round(x1 + dx * k), round(y1 + dy * k)
+            hit = 1 if 0 <= x < w and 0 <= y < h and E[y * w + x] > 128 else 0
+            pre[k + span + 1] = pre[k + span] + hit
+        lines.append({"l": (x1, y1, dx, dy), "cnt": int(m.group(5)),
+                      "pre": pre, "span": span})
+
+    def support(ln, a, b):
+        x1, y1, dx, dy = ln["l"]
+        ta = (a[0] - x1) * dx + (a[1] - y1) * dy
+        tb = (b[0] - x1) * dx + (b[1] - y1) * dy
+        if ta > tb:
+            ta, tb = tb, ta
+        s = ln["span"]
+        i0 = max(0, min(2 * s + 1, round(ta) + s))
+        i1 = max(0, min(2 * s + 1, round(tb) + s + 1))
+        return (ln["pre"][i1] - ln["pre"][i0]) / max(1, i1 - i0)
+
+    horiz = sorted((l for l in lines if abs(l["l"][2]) >= abs(l["l"][3])),
+                   key=lambda l: -l["cnt"])[:EDGE_LINES]
+    vert = sorted((l for l in lines if abs(l["l"][2]) < abs(l["l"][3])),
+                  key=lambda l: -l["cnt"])[:EDGE_LINES]
+    cands = []
+    for i, t in enumerate(horiz):
+        for b in horiz[i + 1:]:
+            for j, le in enumerate(vert):
+                for r in vert[j + 1:]:
+                    q = [_cross(t["l"], le["l"]), _cross(t["l"], r["l"]),
+                         _cross(b["l"], r["l"]), _cross(b["l"], le["l"])]
+                    if None in q:
+                        continue
+                    sides = [(t, 0, 1), (r, 1, 2), (b, 2, 3), (le, 3, 0)]
+                    # order the corners tl,tr,br,bl whichever line is which
+                    cx = sum(p[0] for p in q) / 4
+                    cy = sum(p[1] for p in q) / 4
+                    if any(p[0] < -0.05 * w or p[0] > 1.05 * w or
+                           p[1] < -0.05 * h or p[1] > 1.05 * h for p in q):
+                        continue
+                    area = _shoelace(q)
+                    if area < 0.05 * w * h:
+                        continue
+                    if any(not 50 <= _angle(q[(k - 1) % 4], q[k], q[(k + 1) % 4]) <= 130
+                           for k in range(4)):
+                        continue
+                    sup = [support(ln, q[a], q[c]) for ln, a, c in sides]
+                    if min(sup) < EDGE_SUPPORT:
+                        continue
+                    order = sorted(range(4), key=lambda k: math.atan2(q[k][1] - cy, q[k][0] - cx))
+                    qq = [q[k] for k in order]
+                    k0 = min(range(4), key=lambda k: qq[k][0] + qq[k][1])
+                    qq = qq[k0:] + qq[:k0]
+                    share = area / (w * h)
+                    cands.append({"quad": qq, "minsup": min(sup),
+                                  "score": sum(sup) / 4 * math.sqrt(share),
+                                  "share": share})
+    cands.sort(key=lambda c: -c["score"])
+    return cands, (lines, support), w, h, w0, h0
+
+
+def _quad_sides(q):
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    return (d(q[0], q[1]) + d(q[3], q[2])) / 2, (d(q[0], q[3]) + d(q[1], q[2])) / 2
+
+
+def edge_fold(q, lines, support):
+    """The fold across an edge-found spread: (f1, f2, axis) or None.
+
+    A spread's outline is a sheet's outline; what makes it two pages is a
+    line across the middle, parallel to the short sides -- the fold, and on a
+    Russian passport the red perforation strip right beside it. Among the
+    lines, the one meeting both long sides between 35% and 65% of their
+    length, parallel to the short sides within 12 degrees, and edge along
+    FOLD_SUPPORT of its length or more.
+
+    And it must stand ALONE. A card or a page of print has a line like that
+    under every row of text: measured, 6-14 of them spread over the middle
+    third, against exactly 2 on every real spread -- the two edges of the
+    red strip, within 0.02 of each other. So every strong line has to lie
+    within FOLD_SPREAD of the best one, and there may be no more than three.
+    """
+    wd, ht = _quad_sides(q)
+    tl, tr, br, bl = q
+    if ht >= wd:     # pages stacked: the fold runs across, left to right
+        long_a, long_b, axis = (tl, bl), (tr, br), "v"
+        ref = (tl[0], tl[1], tr[0] - tl[0], tr[1] - tl[1])
+    else:            # side by side: the fold runs down
+        long_a, long_b, axis = (tl, tr), (bl, br), "h"
+        ref = (tl[0], tl[1], bl[0] - tl[0], bl[1] - tl[1])
+    n = math.hypot(ref[2], ref[3])
+    ref = (ref[0], ref[1], ref[2] / n, ref[3] / n)
+    strong = []
+    for ln in lines:
+        l = ln["l"]
+        if _line_angle(l, ref) > 12:
+            continue
+        pts, ts = [], []
+        for P, Q in (long_a, long_b):
+            L = math.hypot(Q[0] - P[0], Q[1] - P[1])
+            side = (P[0], P[1], (Q[0] - P[0]) / L, (Q[1] - P[1]) / L)
+            c = _cross(l, side)
+            if c is None:
+                break
+            t = ((c[0] - P[0]) * side[2] + (c[1] - P[1]) * side[3]) / L
+            if not 0.35 <= t <= 0.65:
+                break
+            pts.append(c); ts.append(t)
+        if len(pts) != 2:
+            continue
+        sup = support(ln, pts[0], pts[1])
+        if sup >= FOLD_SUPPORT:
+            strong.append((sup, sum(ts) / 2, pts[0], pts[1]))
+    if not strong:
+        return None
+    strong.sort(key=lambda x: -x[0])
+    best = strong[0]
+    # "strong" is relative to the best line: the Debian ImageMagick build's
+    # Canny adds five weaker lines at 0.61-0.68 to a spread whose strip edges
+    # measure 1.00, where the Alpine build found only the strip.
+    strong = [x for x in strong if x[0] >= best[0] - FOLD_MARGIN]
+    if len(strong) > 3:
+        return None
+    if any(abs(x[1] - best[1]) > FOLD_SPREAD for x in strong):
+        return None
+    return best[2], best[3], axis
+
+
+FOLD_SUPPORT = 0.6      # share of the fold line that must be edge
+FOLD_MARGIN = 0.25      # a line this much weaker than the best one is not
+                        # a rival for the fold
+FOLD_SPREAD = 0.03      # every strong line within this share of the long
+                        # side of the best one, or it is rows of text
+EDGE_SHEET_ASPECT = (1.25, 1.6)
+EDGE_SHEET_MAX = 0.85   # of the frame: a larger sheet is the trim's job
+EDGE_BRIGHT_FRAME = 0.7 # a brightness quad this much of the frame is the
+                        # frame, not a document
+EDGE_GROWTH = 1.3       # an edge outline must be this much larger than the
+                        # brightness quad it contains to replace it
+
+
+def _inside(p, q, slack):
+    """Is point p inside the convex quad q, grown by `slack` px?"""
+    for i in range(4):
+        a, b = q[i], q[(i + 1) % 4]
+        cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+        if cross < -slack * math.hypot(b[0] - a[0], b[1] - a[1]):
+            return False
+    return True
+
+
+def edge_document(src, bright_quad, o, report):
+    """What the edges say the document is, when brightness said nothing useful.
+
+    Returns ("cards", [quad], why), ("spread", [qa, qb], axis, why),
+    ("sheet", quad, why) or None, quads in full-resolution pixels.
+
+    The edge outline is trusted only where brightness failed: when it found
+    no sheet at all, or a scrap lying inside the outline and much smaller
+    than it (a child's book whose illustrations broke the paper mask). A
+    card-shaped outline goes to the card path, which still wants a face
+    photo on the card or its partner before it lays anything out as a card.
+    """
+    cands, (lines, support), w, h, w0, h0 = edge_quads(src)
+    if not cands:
+        return None
+    best = cands[0]
+    q = best["quad"]
+    sx, sy = w0 / w, h0 / h
+    full = lambda qq: [(p[0] * sx, p[1] * sy) for p in qq]
+    wd, ht = _quad_sides(q)
+    aspect = max(wd, ht) / max(1e-6, min(wd, ht))
+    why = (f"found by its edges: {best['share']:.0%} of the frame, sides "
+           f"{aspect:.2f}:1, outline {best['minsup']:.0%}+ edge")
+    if o.cards != "off" and CARD_ASPECT[0] <= aspect <= CARD_ASPECT[1]:
+        return ("cards", [full(q)], why)
+    only_spread = False
+    if bright_quad is not None:
+        bq = [(p[0] / sx, p[1] / sy) for p in bright_quad]
+        slack = 0.02 * max(w, h)
+        if (all(_inside(p, q, slack) for p in bq)
+                and _shoelace(q) >= EDGE_GROWTH * _shoelace(bq)):
+            why += ", the brightness quad was a scrap inside it"
+        elif ((all(_inside(p, bq, slack) for p in q)
+                and _shoelace(bq) >= EDGE_GROWTH * _shoelace(q))
+                or _shoelace(bq) >= EDGE_BRIGHT_FRAME * w * h):
+            # the other way round: brightness took the pages together with
+            # a light background -- or simply the frame, three quarters of
+            # it and more, which says nothing about where the document is. Only a fold is evidence enough to believe
+            # the outline over it -- a bare rectangle inside a region could
+            # as well be a table printed on the page.
+            why += ", the brightness quad took the background with it"
+            only_spread = True
+        else:
+            return None
+    if o.spread != "off":
+        fold = edge_fold(q, lines, support)
+        if fold:
+            f1, f2, axis = fold
+            tl, tr, br, bl = q
+            qa, qb = (([tl, tr, f2, f1], [f1, f2, br, bl]) if axis == "v"
+                      else ([tl, f1, f2, bl], [f1, tr, br, f2]))
+            ok = True
+            for pq in (qa, qb):
+                pw, ph = _quad_sides(pq)
+                if not 1.15 <= max(pw, ph) / max(1e-6, min(pw, ph)) <= 1.75:
+                    ok = False
+            if ok:
+                return ("spread", [full(qa), full(qb)], axis,
+                        why + ", a fold across the middle")
+    # A sheet nearly filling the frame is what the border trim is for; its
+    # outline hugs the photo's own border, where vignetting and JPEG seams
+    # draw straight lines too (the public letter came out with a strip of
+    # desk across its top).
+    # ...and it must be shaped like a sheet: A4 1.41, Letter 1.29, a
+    # passport page 1.42. A square of railings around a card in a hand
+    # measured 1.05 and cut the card's bottom off.
+    if (not only_spread and best["minsup"] >= EDGE_SHEET
+            and 0.15 <= best["share"] <= EDGE_SHEET_MAX
+            and EDGE_SHEET_ASPECT[0] <= aspect <= EDGE_SHEET_ASPECT[1]):
+        return ("sheet", full(q), why)
+    return None
 
 
 def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False, size=None):
@@ -1762,6 +2089,31 @@ CARD_FACE_RUN = 0.20    # share of its columns dark top to bottom for half
                         # lines of text leave gaps between them
 
 
+def _place(cells, x0, x1, y0, y1):
+    """(dark share, column share) of a place in a dark-cell map.
+
+    The place is given as fractions of the image. Dark share: its cells that
+    are darker than the paper near them. Column share: its columns that are
+    dark top to bottom for half the place's height in one run -- a portrait
+    is (hair, face, collar), lines of text are not (gaps between them).
+    """
+    dark, cw, ch, _, _ = cells
+    xa, xb = int(x0 * cw), max(int(x0 * cw) + 1, int(x1 * cw))
+    ya, yb = int(y0 * ch), max(int(y0 * ch) + 1, int(y1 * ch))
+    cols = range(xa, min(cw, xb))
+    if not cols:
+        return 0.0, 0.0
+    n = sum(dark[cy * cw + cx] for cy in range(ya, min(ch, yb)) for cx in cols)
+    runs = 0
+    for cx in cols:
+        best = cur = 0
+        for cy in range(ya, min(ch, yb)):
+            cur = cur + 1 if dark[cy * cw + cx] else 0
+            best = max(best, cur)
+        runs += best >= 0.5 * (yb - ya)
+    return n / (len(cols) * max(1, min(ch, yb) - ya)), runs / len(cols)
+
+
 def card_face(path):
     """Where a card's face photo is: "left", "right", or None (a back).
 
@@ -1780,22 +2132,8 @@ def card_face(path):
     got = _dark_cells(path, 200)
     if got is None:
         return None
-    dark, cw, ch, _, _ = got
-    ya, yb = int(0.10 * ch), int(0.95 * ch)
-
-    def place(x0, x1):
-        cols = range(int(x0 * cw), int(x1 * cw))
-        cells = [dark[cy * cw + cx] for cy in range(ya, yb) for cx in cols]
-        runs = 0
-        for cx in cols:
-            best = cur = 0
-            for cy in range(ya, yb):
-                cur = cur + 1 if dark[cy * cw + cx] else 0
-                best = max(best, cur)
-            runs += best >= 0.5 * (yb - ya)
-        return sum(cells) / len(cells), runs / len(cols)
-
-    (dl, rl), (dr, rr) = place(0.03, 0.40), place(0.60, 0.97)
+    (dl, rl), (dr, rr) = (_place(got, 0.03, 0.40, 0.10, 0.95),
+                          _place(got, 0.60, 0.97, 0.10, 0.95))
     left = dl >= CARD_FACE_DARK and rl >= CARD_FACE_RUN
     right = dr >= CARD_FACE_DARK and rr >= CARD_FACE_RUN
     if left and right:
@@ -2043,15 +2381,35 @@ def process_page(src, out_png, o, report):
             # A card that is one page of a real spread covers half of it.
             if cquads and spread and len(cquads) == 1:
                 sarea = sum(_shoelace(q) for q in spread[0])
-                if _shoelace(cquads[0]) >= CARD_OF_SPREAD * sarea:
+                # ...and not much larger than it either: a card-shaped
+                # outline around both pages is the open passport itself
+                # (74% of a frame whose spread was 66%), and taking it as a
+                # card cost a whole second run once no face was on it
+                if CARD_OF_SPREAD * sarea <= _shoelace(cquads[0]) <= 1.25 * sarea:
                     spread = None
+            if cquads and spread and len(cquads) == 1:
+                cquads = None
             if cquads and (len(cquads) == 2 or not spread):
                 if spread:
                     report.append(f"two cards, not a spread ({spread[2]})")
                 return (process_cards(src, cquads, cwhy, out_png, o, report),
                         "cards", o.dpi)
+    edge = None
     if o.rectify != "off" and not spread:
         quad, why, paper_share = detect_quad(src, pm=pm)
+        # The document's edges, read as lines -- for what brightness cannot
+        # see: a white page on a white desk, a pale card on white paint, a
+        # page whose colour pictures broke the paper mask into a scrap.
+        if o.edges != "off":
+            edge = edge_document(src, quad, o, report)
+            if edge and edge[0] == "cards":
+                return (process_cards(src, edge[1], edge[2], out_png, o, report),
+                        "cards", o.dpi)
+            if edge and edge[0] == "spread":
+                spread, quad = (edge[1], edge[2], edge[3]), None
+            elif edge and edge[0] == "sheet":
+                quad, why = edge[1], edge[2]
+    if o.rectify != "off" and not spread:
         if quad is None:
             # Brightness could not find the sheet. Ask the segmentation helper,
             # if this build has one, and judge its answer by the same rules.
@@ -2254,7 +2612,51 @@ def process_page(src, out_png, o, report):
     #    toned gently on its own, and laid back over the finished page.
     keep = None
     if not o.no_keep_photo:
-        box = find_photo_block(cur)
+        if spread:
+            # on a spread the photo is only ever on the lower page's left
+            box = None
+            iw_, ih_ = dims(cur)
+            x1_, y0_ = round(iw_ * 0.45), round(ih_ * 0.5)
+            part = f"{out_png}.photo-place.png"
+            magick(cur, "-crop", f"{x1_}x{ih_ - y0_}+0+{y0_}", "+repage", part)
+            # the place is a quarter of the spread, so the photo fills far
+            # more of it than of a page: up to two thirds
+            # In its known place the photo's known shape does the work the
+            # fill test does elsewhere: a light portrait fills only 0.29 of
+            # its box, while the narrow column of print beside it that won
+            # instead is 0.40 wide for its height -- a photo's dark block,
+            # hair to jacket, measured 0.48-1.69. The photo also fills a good
+            # part of its place (a 1% scrap of print won once without a
+            # floor). Three passes, strictest first: a sizeable block with
+            # the ordinary fill; one with a light portrait's loose fill; and
+            # a small one -- a child's face in pieces measured 5%.
+            kw = dict(area_max=65.0, aspect=(0.45, 1.8))
+            got = (find_photo_block(part, area_min=8.0, **kw)
+                   or find_photo_block(part, area_min=8.0, fill=0.25, **kw)
+                   or find_photo_block(part, area_min=3.0, **kw))
+            os.unlink(part)
+            if got:
+                # The dark cells are the hair and the eyes; a light face and
+                # a light collar below them were left to the paper treatment
+                # and came out as white holes. A passport photo's size is
+                # known -- 35 x 45 mm on a 88 x 125 mm page -- so the box is
+                # grown to at least that height, down from the top of what
+                # was found.
+                bx, by, bw, bh = got[0], got[1] + y0_, got[2], got[3]
+                pw_ = round(iw_ * SPREAD_PHOTO_MM[0] / 88.0)
+                ph_ = round(ih_ / 2 * SPREAD_PHOTO_MM[1] / 125.0)
+                # Only downward: where the dark block sits across is where
+                # the photo is (widening it centred slid it onto the print
+                # beside a photo whose hair lay to one side).
+                if bw > 1.25 * pw_:
+                    # the block ran on into the print beside the photo; the
+                    # photo is the leftmost thing in its place
+                    bw = round(1.1 * pw_)
+                if bh < ph_:
+                    bh = min(ph_, ih_ - by)
+                box = (bx, by, bw, bh)
+        else:
+            box = find_photo_block(cur)
         if box:
             keep = (cur, box)
             pw0, ph0 = dims(cur)
@@ -2767,6 +3169,10 @@ def main():
     p.add_argument("--card-size", default="actual", choices=["actual", "fit"],
                    help="cards at their real 85.6x54 mm, or blown up to the "
                         "page width")
+    p.add_argument("--edges", default="auto", choices=["auto", "off"],
+                   help="read the document's edges as lines when brightness "
+                        "cannot find it (a white page on a white desk, a "
+                        "page whose pictures broke the paper mask)")
     p.add_argument("--rectify", default="auto", choices=["auto", "on", "off"],
                    help="warp the sheet's quadrilateral flat before anything "
                         "else; auto = only when a convincing quad is found")

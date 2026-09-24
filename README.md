@@ -266,6 +266,41 @@ change what this image may be used for.
    to the page width). A group of cards needs a face photo on at least one:
    a bright 16:10 rectangle without one — a screen, a sign — is no identity
    card, and its photo goes back through as a document.
+   **When brightness cannot see the document, its edges can** (`--edges`,
+   auto). Every detector above looks for PAPER, and a white page on a white
+   desk, a passport over a light floor or a page whose colour pictures broke
+   the paper mask is not brighter than its surroundings. It still has an
+   edge: a long straight step in brightness or colour where it ends. So the
+   frame is also read as lines — Canny edges of the brightness AND of the
+   saturation (a lilac card on white paint barely steps in brightness), a
+   Hough transform — and every pair of near-horizontal lines with every pair
+   of near-vertical ones is a candidate outline, scored by how much of it is
+   actually edge (every side at least 45%). The outline is only believed
+   where brightness failed: it found nothing, a scrap inside the outline
+   (30% smaller or more), or the frame itself (70% of it and more).
+
+   - A card-shaped outline (1.50–1.68) goes to the card path, which still
+     wants a face photo before it lays anything out as a card.
+   - An outline with a **fold** becomes a spread. The fold is a line across
+     the middle, parallel to the short sides, and it must stand alone: a card
+     or a page of print has one under every row of text (6–14 measured),
+     where a spread has exactly the two edges of its red strip, within 3% of
+     each other. Rivals are counted relative to the best line, because the
+     two ImageMagick builds find different numbers of weak ones.
+   - Otherwise a sheet — only with 60% of its outline edge, 15–85% of the
+     frame (a sheet filling it is the border trim's job: vignetting draws
+     lines too) and shaped like one (1.25–1.6: a square of railings around
+     a card in a hand once cut the card in half).
+
+   A spread's orientation now looks for the face photo **in its place** —
+   the left third of the lower page — on each candidate turn, as on a card,
+   instead of anywhere; the place that is dark with a portrait wins, and a
+   light portrait (dark 0.32 against 0.02 on the other turn) wins on
+   contrast. The photo kept out of the paper treatment is looked for in
+   that place too (shape 0.45–1.8, three passes from strict to loose), and
+   its box is grown to a passport photo's height (45 mm of the page's 125),
+   because the dark cells are the hair and a light chin below them came out
+   white.
 3. **Or decide there is no document at all.** If no sheet quad was accepted
    *and* the paper-like area is under `--photo-paper` (20%), the frame is a
    photo, not a page. This is decided BEFORE anything touches the pixels, and
@@ -398,6 +433,7 @@ flag; `--help` lists them.
 | a card came out upside down | its face photo was not found — it was taken for a back |
 | cards too small to read | `--card-size fit` — each card at the page width |
 | something that is not a card was laid out as one | `--cards off` |
+| the page was cropped to a wrong rectangle "found by its edges" | `--edges off` |
 | a dark picture or logo on a page kept a grey box around it | it was taken for a face photo — `--no-keep-photo` |
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
 | a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
