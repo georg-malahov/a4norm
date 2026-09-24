@@ -3361,110 +3361,124 @@ def default_out(src, o):
     return os.path.join(os.path.dirname(os.path.abspath(src)), base + ext)
 
 
-def build(sources, out, o):
-    """Run every source through the pipeline and emit ONE document.
+def run_sources(sources, wd, o):
+    """Every raster of every source through process_page, in order:
+    [raster, out_png, result, report] per page."""
+    items, n = [], 0
+    for si, src in enumerate(sources):
+        if len(sources) > 1:
+            print(f"  [{si + 1}/{len(sources)}] {os.path.basename(src)}")
+        for r in rasterize(src, wd, tag=f"s{si:02d}"):
+            rep = []
+            out_png = os.path.join(wd, f"out-{n:03d}.png")
+            items.append([r, out_png, process_page(r, out_png, o, rep), rep])
+            n += 1
+    return items
 
-    Several photos of one paper document are the normal case, not the exception:
-    a contract is rarely one page. So the pages of every input, in the order
-    given, land in a single PDF.
+
+def pair_cards(items):
+    """Group the pages: a photo holding ONE card goes with the next photo if
+    that holds one card too -- a card's front and back, shot one after the
+    other. Returns lists of item indices.
+
+    What makes a card is its shape, not a face on it: a bank card, a
+    health-insurance card have none, and a German ID card's pale
+    laser-engraved portrait read as "no face" on both sides of a perfectly
+    shot pair, which then went out as a snapshot and a scanned page. The face
+    only decides which side goes on top and which way up; --cards off is the
+    way out for a 16:10 rectangle that is not a card.
     """
-    with tempfile.TemporaryDirectory(prefix="a4norm-") as wd:
-        # Every raster goes through the pipeline first; cards are only laid
-        # out once all of them are in, because a card's back is usually the
-        # NEXT photograph, not the same one.
-        items, n = [], 0
-        for si, src in enumerate(sources):
-            if len(sources) > 1:
-                print(f"  [{si + 1}/{len(sources)}] {os.path.basename(src)}")
-            rasters = rasterize(src, wd, tag=f"s{si:02d}")
-            for r in rasters:
-                rep = []
-                out_png = os.path.join(wd, f"out-{n:03d}.png")
-                got = process_page(r, out_png, o, rep)
-                items.append([r, out_png, got, rep])
-                n += 1
-
-        # Cards pair up: two in one frame, or one each in two photographs in
-        # a row -- front above back on one page. What makes a card is its
-        # shape, not a face on it: a bank card, a health-insurance card have
-        # none, and a German ID card's pale laser-engraved portrait read as
-        # "no face" on both sides of a perfectly shot pair, which then went
-        # out as a snapshot and a scanned page. The face only decides which
-        # side goes on top and which way up; --cards off is the way out for
-        # a 16:10 rectangle that is not a card.
-        groups, i = [], 0
-        while i < len(items):
-            got = items[i][2]
-            if got[1] == "cards":
-                if (len(got[0]) == 1 and i + 1 < len(items)
-                        and items[i + 1][2][1] == "cards"
-                        and len(items[i + 1][2][0]) == 1):
-                    groups.append([i, i + 1]); i += 2
-                    continue
+    one_card = lambda k: (items[k][2][1] == "cards" and len(items[k][2][0]) == 1)
+    groups, i = [], 0
+    while i < len(items):
+        if one_card(i) and i + 1 < len(items) and one_card(i + 1):
+            groups.append([i, i + 1]); i += 2
+        else:
             groups.append([i]); i += 1
-        pages, pno = [], 0
-        for g in groups:
-            first = items[g[0]]
-            if first[2][1] == "cards":
-                cards = [c for k in g for c in items[k][2][0]]
-                # the front goes on top; with two fronts or none, input order
-                cards.sort(key=lambda c: not c["front"])
-                page = card_page(cards, first[1], o)
-                pno += 1
-                print(f"  page {pno}:")
-                for k in g:
-                    for line in items[k][3]:
-                        print(f"    - {line}")
-                if len(g) > 1:
-                    print(f"    - the cards of photos {g[0] + 1} and {g[1] + 1} "
-                          f"laid out on one page, front above back")
-                print(f"    - page: {round(210 / MM * o.dpi)}x"
-                      f"{round(297 / MM * o.dpi)}px @ {o.dpi}dpi, cards at "
-                      f"{'page width' if o.card_size == 'fit' else 'real size'}")
-                pages.append((page, False, o.dpi))
-                for k in g:
-                    cleanup(items[k][1])
-                continue
+    return groups
+
+
+def assemble(items, groups, o):
+    """One finished page per group, its report printed: [(png, is_photo, dpi)]."""
+    pages = []
+    for pno, g in enumerate(groups, start=1):
+        first = items[g[0]]
+        print(f"  page {pno}:")
+        if first[2][1] != "cards":
             page, is_photo, page_dpi = first[2]
-            pno += 1
-            print(f"  page {pno}:")
             for line in first[3]:
                 print(f"    - {line}")
             pages.append((page, is_photo, page_dpi))
             cleanup(page)
+            continue
+        cards = [c for k in g for c in items[k][2][0]]
+        # the front goes on top; with two fronts or none, input order
+        cards.sort(key=lambda c: not c["front"])
+        page = card_page(cards, first[1], o)
+        for k in g:
+            for line in items[k][3]:
+                print(f"    - {line}")
+        if len(g) > 1:
+            print(f"    - the cards of photos {g[0] + 1} and {g[1] + 1} "
+                  f"laid out on one page, front above back")
+        pw, ph = a4_px(o.dpi)
+        print(f"    - page: {pw}x{ph}px @ {o.dpi}dpi, cards at "
+              f"{'page width' if o.card_size == 'fit' else 'real size'}")
+        pages.append((page, False, o.dpi))
+        for k in g:
+            cleanup(items[k][1])
+    return pages
+
+
+def write_output(pages, out, wd, o):
+    """Encode the pages as one PDF or as JPEG files. Returns the paths."""
+    # Text wants full chroma; a snapshot does not, and 4:2:0 at a lower
+    # quality is the difference between a 2.4 MB page and a third of that
+    # with nothing visible lost.
+    def encode(src_png, dst, is_photo, page_dpi, extra=()):
+        q = o.photo_quality if is_photo else o.quality
+        # a page written below --dpi because the photo held no more detail
+        # has no full-resolution chroma to keep either
+        sub = "2x2" if is_photo or page_dpi < o.dpi else "1x1"
+        magick(src_png, "-quality", str(q),
+               "-sampling-factor", sub, "-strip", *extra, dst)
+
+    if o.format == "pdf":
+        jpegs, dpis = [], []
+        for i, (page, is_photo, page_dpi) in enumerate(pages):
+            jp = os.path.join(wd, f"jp-{i:03d}.jpg")
+            encode(page, jp, is_photo, page_dpi)
+            jpegs.append(jp)
+            dpis.append(page_dpi)
+        write_pdf(jpegs, out, dpis)
+        return [out]
+    stem, ext = os.path.splitext(out)
+    ext = ext or ".jpg"
+    written = []
+    for i, (page, is_photo, page_dpi) in enumerate(pages):
+        dst = out if len(pages) == 1 else f"{stem}-{i + 1}{ext}"
+        encode(page, dst, is_photo, page_dpi,
+               ("-density", str(page_dpi), "-units", "PixelsPerInch"))
+        written.append(dst)
+    return written
+
+
+def build(sources, out, o):
+    """Run every source through the pipeline and emit ONE document.
+
+    Several photos of one paper document are the normal case, not the
+    exception: a contract is rarely one page. So the pages of every input, in
+    the order given, land in a single PDF. Every raster goes through the
+    pipeline first, and cards are laid out only once all of them are in,
+    because a card's back is usually the NEXT photograph, not the same one.
+    """
+    with tempfile.TemporaryDirectory(prefix="a4norm-") as wd:
+        items = run_sources(sources, wd, o)
+        pages = assemble(items, pair_cards(items), o)
         if o.dry_run:
             print("  (dry run — nothing written)")
             return None
-
-        # Text wants full chroma; a snapshot does not, and 4:2:0 at a lower
-        # quality is the difference between a 2.4 MB page and a third of that
-        # with nothing visible lost.
-        def encode(src_png, dst, is_photo, page_dpi, extra=()):
-            q = o.photo_quality if is_photo else o.quality
-            # a page written below --dpi because the photo held no more
-            # detail has no full-resolution chroma to keep either
-            sub = "2x2" if is_photo or page_dpi < o.dpi else "1x1"
-            magick(src_png, "-quality", str(q),
-                   "-sampling-factor", sub, "-strip", *extra, dst)
-
-        if o.format == "pdf":
-            jpegs, dpis = [], []
-            for i, (page, is_photo, page_dpi) in enumerate(pages):
-                jp = os.path.join(wd, f"jp-{i:03d}.jpg")
-                encode(page, jp, is_photo, page_dpi)
-                jpegs.append(jp)
-                dpis.append(page_dpi)
-            write_pdf(jpegs, out, dpis)
-            written = [out]
-        else:
-            stem, ext = os.path.splitext(out)
-            ext = ext or ".jpg"
-            written = []
-            for i, (page, is_photo, page_dpi) in enumerate(pages):
-                dst = out if len(pages) == 1 else f"{stem}-{i + 1}{ext}"
-                encode(page, dst, is_photo, page_dpi,
-                       ("-density", str(page_dpi), "-units", "PixelsPerInch"))
-                written.append(dst)
+        written = write_output(pages, out, wd, o)
         if o.preview:
             magick(pages[0][0], "-resize", "900x",
                    "-define", "png:compression-level=6",
