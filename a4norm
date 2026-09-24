@@ -2136,6 +2136,14 @@ def card_face(path):
                           _place(got, 0.60, 0.97, 0.10, 0.95))
     left = dl >= CARD_FACE_DARK and rl >= CARD_FACE_RUN
     right = dr >= CARD_FACE_DARK and rr >= CARD_FACE_RUN
+    # A pale portrait breaks the columns (a German ID's: 0.41 dark, 0.00 in
+    # columns), but its place is still far darker than the mirror place
+    # (0.06) -- the same contrast rule that turns a spread.
+    if not (left or right):
+        if dl >= SPREAD_PHOTO_DARK and dl >= 3 * dr + 0.02:
+            left = True
+        elif dr >= SPREAD_PHOTO_DARK and dr >= 3 * dl + 0.02:
+            right = True
     if left and right:
         diff = (dl + rl) - (dr + rr)
         return "left" if diff > -0.1 else "right"
@@ -2385,7 +2393,12 @@ def process_page(src, out_png, o, report):
                 # outline around both pages is the open passport itself
                 # (74% of a frame whose spread was 66%), and taking it as a
                 # card cost a whole second run once no face was on it
-                if CARD_OF_SPREAD * sarea <= _shoelace(cquads[0]) <= 1.25 * sarea:
+                # It can only be that when the spread was ONE region cut at a
+                # kink. Two separate paper regions are two pages -- a whole
+                # open passport is card-shaped too (74% of a frame, 1.56:1),
+                # and only the face test used to keep it from becoming one.
+                if (CARD_OF_SPREAD * sarea <= _shoelace(cquads[0]) <= 1.25 * sarea
+                        and "folded in the middle" in spread[2]):
                     spread = None
             if cquads and spread and len(cquads) == 1:
                 cquads = None
@@ -3029,10 +3042,13 @@ def build(sources, out, o):
                 n += 1
 
         # Cards pair up: two in one frame, or one each in two photographs in
-        # a row -- front above back on one page. A group needs a face photo
-        # on at least one of its cards: an identity document has one, and a
-        # bright 16:10 rectangle without one (a screen, a sign) is no card, so
-        # its photograph goes back through as a document.
+        # a row -- front above back on one page. What makes a card is its
+        # shape, not a face on it: a bank card, a health-insurance card have
+        # none, and a German ID card's pale laser-engraved portrait read as
+        # "no face" on both sides of a perfectly shot pair, which then went
+        # out as a snapshot and a scanned page. The face only decides which
+        # side goes on top and which way up; --cards off is the way out for
+        # a 16:10 rectangle that is not a card.
         groups, i = [], 0
         while i < len(items):
             got = items[i][2]
@@ -3048,21 +3064,6 @@ def build(sources, out, o):
             first = items[g[0]]
             if first[2][1] == "cards":
                 cards = [c for k in g for c in items[k][2][0]]
-                if not any(c["front"] for c in cards):
-                    for k in g:
-                        r, out_png, _, rep = items[k]
-                        rep.append("no face photo on any card of this group — "
-                                   "not an identity card, scanned as a document")
-                        o.cards = "off"
-                        items[k][2] = process_page(r, out_png + ".doc.png", o, rep)
-                        o.cards = "auto"
-                        pno += 1
-                        print(f"  page {pno}:")
-                        for line in rep:
-                            print(f"    - {line}")
-                        pages.append(items[k][2])
-                        cleanup(items[k][2][0])
-                    continue
                 # the front goes on top; with two fronts or none, input order
                 cards.sort(key=lambda c: not c["front"])
                 page = card_page(cards, first[1], o)
