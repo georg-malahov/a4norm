@@ -265,15 +265,8 @@ def _angle(a, b, c):
     return math.degrees(math.acos(cos))
 
 
-def detect_quad(path, side=400):
-    """Find the sheet as a quadrilateral, or return (None, reason).
-
-    The sheet is the big bright low-chroma region; a desk is either darker or
-    coloured. Both tests are relative to the image's own paper level, so a dim
-    photo works as well as a bright one. Everything after this is checks: a
-    blob that is not convincingly a four-cornered sheet is refused, because
-    rectifying on a wrong quad is far worse than not rectifying at all.
-    """
+def _vc(path, side=400):
+    """Brightness (max channel) and chroma of a downscaled frame."""
     w0, h0 = dims(path)
     w = side
     h = max(1, round(side * h0 / w0))
@@ -288,26 +281,77 @@ def detect_quad(path, side=400):
         m = r if r < g else g
         if b < m: m = b
         V[i] = v; C[i] = v - m
+    return V, C, w, h, w0, h0
+
+
+def _otsu(V):
+    """Otsu's threshold of a 0-255 histogram: the split darkest-vs-brightest."""
+    hist = [0] * 256
+    for v in V:
+        hist[v] += 1
+    n = len(V)
+    tot = sum(i * c for i, c in enumerate(hist))
+    sb = wb = 0
+    best, thr = -1.0, 128
+    for t in range(256):
+        wb += hist[t]
+        if wb == 0:
+            continue
+        wf = n - wb
+        if wf == 0:
+            break
+        sb += t * hist[t]
+        mb, mf = sb / wb, (tot - sb) / wf
+        var = wb * wf * (mb - mf) ** 2
+        if var > best:
+            best, thr = var, t
+    return thr
+
+
+def paper_mask(path, side=400, vc=None, mode="paper"):
+    """The paper-like pixels of the frame: (mask, w, h, w0, h0).
+
+    `paper`, the sheet detector's own rule: bright AND low-chroma, both
+    relative to the image's own paper level, so a dim photo works as well as
+    a bright one and a desk is either darker or coloured.
+
+    The spread detector tries two looser readings of "paper" when that one
+    finds no spread, because passport pages are not white paper:
+    `tinted` lets chroma up to 100 through -- an international passport's
+    salmon-pink pages measure 60-90 and vanished under the limit of 45 --
+    and `otsu` also drops the brightness bar to the image's own split between
+    dark and bright, for a booklet whose lower half lies in its own shadow.
+    """
+    V, C, w, h, w0, h0 = vc or _vc(path, side)
+    n = w * h
     paper = sorted(V)[int(0.95 * (n - 1))]
-    v_thr = max(60, int(paper * 0.72))
+    if mode == "otsu":
+        v_thr, c_max = _otsu(V) + 1, 100
+    else:
+        v_thr = max(60, int(paper * 0.72))
+        c_max = 45 if mode == "paper" else 100
     mask = bytearray(n)
     for i in range(n):
-        if V[i] >= v_thr and C[i] <= 45:
+        if V[i] >= v_thr and C[i] <= c_max:
             mask[i] = 1
-    mask = _open4(mask, w, h)
+    return _open4(mask, w, h), w, h, w0, h0
+
+
+def detect_quad(path, side=400, pm=None):
+    """Find the sheet as a quadrilateral, or return (None, reason).
+
+    Everything after the mask is checks: a blob that is not convincingly a
+    four-cornered sheet is refused, because rectifying on a wrong quad is far
+    worse than not rectifying at all.
+    """
+    mask, w, h, w0, h0 = pm or paper_mask(path, side)
     return _quad_from_mask(mask, w, h, w0, h0)
 
 
-def _quad_from_mask(mask, w, h, w0, h0):
-    """Largest blob in a binary mask -> sheet quad, or (None, why, share).
-
-    Split out so a segmentation mask can be judged by exactly the same rules as
-    the brightness mask. Every threshold below was tuned against real
-    photographs; giving the model its own looser set would be how a photo of a
-    desk ends up rectified as if it were paper.
-    """
+def _components(mask, w, h):
+    """4-connected blobs of a binary mask, largest first, as index lists."""
     n = w * h
-    seen = bytearray(n); best = []
+    seen = bytearray(n); comps = []
     for s0 in range(n):
         if mask[s0] and not seen[s0]:
             q = collections.deque([s0]); seen[s0] = 1; comp = []
@@ -320,8 +364,22 @@ def _quad_from_mask(mask, w, h, w0, h0):
                         j2 = yy * w + xx
                         if mask[j2] and not seen[j2]:
                             seen[j2] = 1; q.append(j2)
-            if len(comp) > len(best):
-                best = comp
+            comps.append(comp)
+    comps.sort(key=len, reverse=True)
+    return comps
+
+
+def _quad_from_mask(mask, w, h, w0, h0):
+    """Largest blob in a binary mask -> sheet quad, or (None, why, share).
+
+    Split out so a segmentation mask can be judged by exactly the same rules as
+    the brightness mask. Every threshold below was tuned against real
+    photographs; giving the model its own looser set would be how a photo of a
+    desk ends up rectified as if it were paper.
+    """
+    n = w * h
+    comps = _components(mask, w, h)
+    best = comps[0] if comps else []
     if not best:
         return None, "no bright low-chroma region found", 0.0
     frac = len(best) / n
@@ -444,7 +502,604 @@ def segment_quad(path, side=400):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False):
+# ------------------------------------------------------------------ spreads
+#
+# An open booklet -- a passport, a record book -- photographed with both pages
+# showing. It breaks the one-sheet model three ways at once, all measured on a
+# real passport photo:
+#
+# 1. The sheet detector sees TWO sheets. The spine carries a coloured strip (a
+#    passport's red perforation band: chroma 75 against a limit of 45), so the
+#    paper mask falls apart into two blobs of 33% each, and the largest-blob
+#    rule rectified the white page alone and threw the other one away.
+# 2. Even as one blob it is no quadrilateral: the pages curve into the spine,
+#    so the outer edge is a flat "V" at the fold. No single homography flattens
+#    both halves.
+# 3. The hand that holds it open bites into the outer edge.
+#
+# So a spread is found as two facing pages, each fitted on its own, and the
+# fold is where their edges meet.
+
+SPREAD_MIN = 10.0       # % of the frame each page must cover
+SPREAD_BALANCE = 0.6    # smaller page / larger page, as blob areas
+SPREAD_FILL = 0.45      # blob pixels / fitted page quad; holes are the stamp,
+                        # the photo, the ink, and a thumb, a shadow or glare
+                        # can take half a page (measured 47-59%)
+
+
+def _side_points(comp, w, P, Q):
+    """The blob's outermost pixel per step along the side P->Q.
+
+    Outermost along the outward normal, so holes in the page (a stamp, a
+    photo) do not count, and only the middle 80% of the side is used: a
+    rounded booklet corner is not part of either edge.
+    """
+    L = math.hypot(Q[0] - P[0], Q[1] - P[1])
+    if L < 8:
+        return []
+    ux, uy = (Q[0] - P[0]) / L, (Q[1] - P[1]) / L
+    nx, ny = uy, -ux            # outward for tl,tr,br,bl order with y down
+    lo, hi = 0.1 * L, 0.9 * L
+    best = {}
+    for i in comp:
+        x, y = i % w, i // w
+        dx, dy = x - P[0], y - P[1]
+        t = dx * ux + dy * uy
+        if t < lo or t > hi:
+            continue
+        s = dx * nx + dy * ny
+        k = int(t)
+        b = best.get(k)
+        if b is None or s > b[0]:
+            best[k] = (s, x, y)
+    return [(x, y) for _, x, y in best.values()]
+
+
+def _fit_line(pts, trim=True):
+    """Total-least-squares line through `pts`, trimming what bites inward.
+
+    A thumb over the edge, a torn corner, a signature running off the page:
+    each is a run of edge points well inside the true edge. Refitting on the
+    points within 3 MAD of the line drops them in two or three rounds.
+    Returns (cx, cy, dx, dy, res) -- `res` the median distance of the kept
+    points from the line, in px, which says how straight the edge really
+    was -- or None.
+    """
+    pts = list(pts)
+    for _ in range(4 if trim else 1):
+        if len(pts) < 6:
+            return None
+        n = len(pts)
+        cx = sum(p[0] for p in pts) / n
+        cy = sum(p[1] for p in pts) / n
+        sxx = sum((p[0] - cx) ** 2 for p in pts)
+        syy = sum((p[1] - cy) ** 2 for p in pts)
+        sxy = sum((p[0] - cx) * (p[1] - cy) for p in pts)
+        a = 0.5 * math.atan2(2 * sxy, sxx - syy)
+        dx, dy = math.cos(a), math.sin(a)
+        res = [abs(-(p[0] - cx) * dy + (p[1] - cy) * dx) for p in pts]
+        med = sorted(res)[n // 2]
+        lim = max(1.0, 3 * med * 1.4826)
+        kept = [p for p, r in zip(pts, res) if r <= lim]
+        if not trim or len(kept) == n:
+            break
+        pts = kept
+    return (cx, cy, dx, dy, med)
+
+
+def _cross(l1, l2):
+    """Intersection of two lines, or None when they are (nearly) parallel."""
+    x1, y1, a1, b1 = l1[:4]
+    x2, y2, a2, b2 = l2[:4]
+    den = a1 * b2 - b1 * a2
+    if abs(den) < 1e-9:
+        return None
+    t = ((x2 - x1) * b2 - (y2 - y1) * a2) / den
+    return (x1 + t * a1, y1 + t * b1)
+
+
+def _line_angle(l1, l2):
+    """Angle between two lines, 0-90 degrees."""
+    c = abs(l1[2] * l2[2] + l1[3] * l2[3])
+    return math.degrees(math.acos(min(1.0, c)))
+
+
+EDGE_BAND = 1.5         # px at the analysis scale: on the edge
+EDGE_OUT = 3.0          # px: paper this far OUTSIDE a line means it is no edge
+
+
+def _edge_line(pts, P, Q):
+    """The page's true edge among the side's outermost points.
+
+    A finger over the edge only ever takes paper away -- it bites INTO the
+    page -- and on a passport held open it can cover most of a side, far more
+    than any trimming of outliers survives: the plain fit followed the thumb
+    and measured a residual of 10 px. So the edge is chosen as a support
+    line: of the lines through pairs of edge points, the one that the most
+    points lie on, heavily penalised for every point of paper left outside
+    it, since nothing of the page lies beyond its own edge. A thumb's outline
+    is curved and leaves the real edge outside it; a straight run of real
+    edge, however short, wins. The pairs are fixed strides through the
+    points, so the choice is deterministic. Returns the refitted line with
+    its inlier share appended, or None.
+    """
+    L = math.hypot(Q[0] - P[0], Q[1] - P[1])
+    if L < 8 or len(pts) < 12:
+        return None
+    ux, uy = (Q[0] - P[0]) / L, (Q[1] - P[1]) / L
+    nx, ny = uy, -ux
+    pts = sorted(pts, key=lambda p: (p[0] - P[0]) * ux + (p[1] - P[1]) * uy)
+    n = len(pts)
+    best = None
+    for stride in (n // 8, n // 5, n // 3, n // 2):
+        if stride < 3:
+            continue
+        for i in range(0, n - stride, max(1, n // 40)):
+            a, b = pts[i], pts[i + stride]
+            lx, ly = b[0] - a[0], b[1] - a[1]
+            ll = math.hypot(lx, ly)
+            if ll < 1:
+                continue
+            # the line's own normal, turned to point outward like the side's
+            mx, my = ly / ll, -lx / ll
+            if mx * nx + my * ny < 0:
+                mx, my = -mx, -my
+            on = out = 0
+            for p in pts:
+                s = (p[0] - a[0]) * mx + (p[1] - a[1]) * my
+                if abs(s) <= EDGE_BAND:
+                    on += 1
+                elif s > EDGE_OUT:
+                    out += 1
+            score = on - 3 * out
+            if best is None or score > best[0]:
+                best = (score, a, mx, my)
+    if best is None:
+        return None
+    _, a, mx, my = best
+    inl = [p for p in pts
+           if abs((p[0] - a[0]) * mx + (p[1] - a[1]) * my) <= EDGE_BAND]
+    ln = _fit_line(inl, trim=False)
+    if ln is None:
+        return None
+    return ln + (len(inl) / n,)
+
+
+def _page_lines(comp, w):
+    """Four edge lines of one page blob: {"top", "right", "bottom", "left"}.
+
+    Each line is (cx, cy, dx, dy, residual, support): `support` is the share
+    of the side's edge points that lie on it -- low when a hand hid the edge.
+    """
+    pts = [(i % w, i // w) for i in comp]
+    tl = min(pts, key=lambda p: p[0] + p[1])
+    br = max(pts, key=lambda p: p[0] + p[1])
+    tr = max(pts, key=lambda p: p[0] - p[1])
+    bl = min(pts, key=lambda p: p[0] - p[1])
+    lines = {}
+    for name, P, Q in (("top", tl, tr), ("right", tr, br),
+                       ("bottom", br, bl), ("left", bl, tl)):
+        ln = _edge_line(_side_points(comp, w, P, Q), P, Q)
+        if ln is None:
+            return None
+        lines[name] = ln
+    return lines
+
+
+FOLD_ANGLE = 1.5        # degrees an edge must bend by at the fold, or
+FOLD_STEP = 1.0         # % of the page it must step by, to count as a fold
+FOLD_GAIN = 0.6         # two lines must fit the edge this much better than one
+
+
+def _kink(pts, P, Q, short):
+    """Where along the side P->Q its edge bends or steps, as (t, point), or None.
+
+    The side's edge points are split in two at every position in the middle
+    third, a line is fitted to each part, and the split that fits best wins.
+    It counts as a fold only if two lines fit clearly better than one AND the
+    two differ for real -- bent by FOLD_ANGLE degrees, or stepped by FOLD_STEP
+    percent of the page's short side. A flat sheet's edge is one line, and
+    its best split finds two copies of it.
+    """
+    L = math.hypot(Q[0] - P[0], Q[1] - P[1])
+    ux, uy = (Q[0] - P[0]) / L, (Q[1] - P[1]) / L
+    tp = sorted((((p[0] - P[0]) * ux + (p[1] - P[1]) * uy) / L, p) for p in pts)
+    if len(tp) < 30:
+        return None
+    one = _fit_line([p for _, p in tp], trim=False)
+    if one is None:
+        return None
+    best = None
+    for k in range(35, 66, 2):
+        t = k / 100.0
+        a = [p for tt, p in tp if tt < t]
+        b = [p for tt, p in tp if tt >= t]
+        la, lb = _fit_line(a, trim=False), _fit_line(b, trim=False)
+        if la is None or lb is None:
+            continue
+        err = (la[4] * len(a) + lb[4] * len(b)) / len(tp)
+        if best is None or err < best[0]:
+            best = (err, t, la, lb)
+    if best is None:
+        return None
+    err, t, la, lb = best
+    if err > FOLD_GAIN * one[4]:
+        return None
+    X = (P[0] + t * L * ux, P[1] + t * L * uy)
+    # where each half's line crosses the split position, across the side
+    def at(l):
+        c = _cross(l, (X[0], X[1], -uy, ux))
+        return c or X
+    pa, pb = at(la), at(lb)
+    step = math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+    if _line_angle(la, lb) < FOLD_ANGLE and step < FOLD_STEP / 100.0 * short:
+        return None
+    return t, ((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2)
+
+
+def _split_blob(comp, w):
+    """One paper region that is really two pages: split it at the fold.
+
+    A spread with no coloured strip between its pages -- an international
+    passport -- is one blob. Its long edges give the fold away: both bend or
+    step in the middle, where the two pages meet at an angle or the upper one
+    lies narrower in perspective. Returns (comp_a, comp_b) or None.
+    """
+    lines = _page_lines(comp, w)
+    if lines is None:
+        return None
+    tl = _cross(lines["top"], lines["left"]); tr = _cross(lines["top"], lines["right"])
+    br = _cross(lines["bottom"], lines["right"]); bl = _cross(lines["bottom"], lines["left"])
+    if None in (tl, tr, br, bl):
+        return None
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    wd = (d(tl, tr) + d(bl, br)) / 2
+    ht = (d(tl, bl) + d(tr, br)) / 2
+    short = min(wd, ht)
+    # the fold crosses the LONG sides; both are walked the same way round
+    sides = ((tl, bl), (tr, br)) if ht >= wd else ((tl, tr), (bl, br))
+    folds = []
+    for P, Q in sides:
+        # _side_points wants the tl,tr,br,bl winding for its outward normal
+        a, b = (Q, P) if (P, Q) in ((tl, bl), (bl, br)) else (P, Q)
+        k = _kink(_side_points(comp, w, a, b), P, Q, short)
+        if k is None:
+            return None
+        folds.append(k)
+    (t1, f1), (t2, f2) = folds
+    if abs(t1 - t2) > 0.15:
+        return None
+    fx, fy = f2[0] - f1[0], f2[1] - f1[1]
+    a, b = [], []
+    for i in comp:
+        x, y = i % w, i // w
+        (a if fx * (y - f1[1]) - fy * (x - f1[0]) < 0 else b).append(i)
+    return a, b
+
+
+SPREAD_V = 12.0         # degrees: the two pages' edges meet at the fold in a
+                        # shallow "V"; wider than this, and with little
+                        # support, one of them was fitted to a hand
+SPREAD_SUPPORT = 0.35   # share of a side's edge points its line must carry
+
+
+def detect_spread(pm):
+    """Two facing pages of an open booklet, or (None, None, why).
+
+    Returns ([quad_a, quad_b], axis, why): the quads in full-resolution pixels,
+    each tl,tr,br,bl, in reading order across the spine -- left then right
+    when the pages lie side by side ("h"), top then bottom when stacked ("v").
+    """
+    mask, w, h, w0, h0 = pm
+    n = w * h
+    comps = _components(mask, w, h)[:2]
+    if not comps:
+        return None, None, "no paper region"
+    how = "two paper regions"
+    a = len(comps[0]) / n
+    b = len(comps[1]) / n if len(comps) > 1 else 0.0
+    if b * 100 < SPREAD_MIN and a * 100 >= 2 * SPREAD_MIN:
+        halves = _split_blob(comps[0], w)
+        if halves:
+            comps = sorted(halves, key=len, reverse=True)
+            a, b = len(comps[0]) / n, len(comps[1]) / n
+            how = "one paper region folded in the middle"
+    if len(comps) < 2 or b * 100 < SPREAD_MIN:
+        return None, None, (f"the second paper region covers {b:.0%} of the "
+                            f"frame, too little for a facing page")
+    if b / a < SPREAD_BALANCE:
+        return None, None, (f"the two paper regions differ too much in size "
+                            f"({a:.0%} and {b:.0%}) to be facing pages")
+    fits = [_page_lines(c, w) for c in comps]
+    if None in fits:
+        return None, None, "a page edge could not be fitted"
+    cen = [(sum(i % w for i in c) / len(c), sum(i // w for i in c) / len(c))
+           for c in comps]
+    horiz = abs(cen[1][0] - cen[0][0]) >= abs(cen[1][1] - cen[0][1])
+    k = 0 if horiz else 1
+    order = sorted(range(2), key=lambda i: cen[i][k])
+    A, B = (dict(fits[i]) for i in order)
+    cA, cB = (comps[i] for i in order)
+
+    # The edges that meet at the fold come in pairs, one from each page, in
+    # a shallow "V". When a hand hid nearly all of one of them, what was
+    # fitted there is the hand, and it leaves the V: the pair then shares the
+    # edge that has the support.
+    fixed = []
+    for side in (("top", "bottom") if horiz else ("left", "right")):
+        la, lb = A[side], B[side]
+        if _line_angle(la, lb) > SPREAD_V and min(la[5], lb[5]) < SPREAD_SUPPORT:
+            if la[5] < lb[5]:
+                A[side] = lb
+            else:
+                B[side] = la
+            fixed.append(side)
+
+    def fold(end_a, end_b, inner_a, inner_b):
+        """Where the two pages' edges meet at one end of the spine.
+
+        Normally the intersection of the two edge lines: the pages curve into
+        the fold, so their edges form a "V" whose vertex IS the fold. When the
+        booklet lies flat the lines are parallel and the vertex runs off to
+        infinity; then the fold is midway between the two inner corners.
+        """
+        ca = _cross(A[end_a], A[inner_a])
+        cb = _cross(B[end_b], B[inner_b])
+        if ca is None or cb is None:
+            return None
+        mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
+        v = _cross(A[end_a], B[end_b])
+        gap = math.hypot(ca[0] - cb[0], ca[1] - cb[1])
+        if v is None or math.hypot(v[0] - mid[0], v[1] - mid[1]) > \
+                gap / 2 + 0.03 * max(w, h):
+            return mid
+        return v
+
+    if horiz:
+        f1 = fold("top", "top", "right", "left")
+        f2 = fold("bottom", "bottom", "right", "left")
+        if f1 is None or f2 is None:
+            return None, None, "the fold could not be located"
+        qa = [_cross(A["top"], A["left"]), f1, f2, _cross(A["bottom"], A["left"])]
+        qb = [f1, _cross(B["top"], B["right"]), _cross(B["bottom"], B["right"]), f2]
+    else:
+        f1 = fold("left", "left", "bottom", "top")
+        f2 = fold("right", "right", "bottom", "top")
+        if f1 is None or f2 is None:
+            return None, None, "the fold could not be located"
+        qa = [_cross(A["left"], A["top"]), _cross(A["right"], A["top"]), f2, f1]
+        qb = [f1, f2, _cross(B["right"], B["bottom"]), _cross(B["left"], B["bottom"])]
+    quads = [qa, qb]
+    for q, comp in zip(quads, (cA, cB)):
+        if None in q:
+            return None, None, "a page corner could not be located"
+        for i in range(4):
+            ang = _angle(q[(i - 1) % 4], q[i], q[(i + 1) % 4])
+            if not 45 <= ang <= 135:
+                return None, None, f"page corner angle {ang:.0f}° is not a page corner"
+        area = _shoelace(q)
+        fill = len(comp) / area if area > 0 else 0
+        if not SPREAD_FILL <= fill <= 1.1:
+            return None, None, (f"a page region fills {fill:.0%} of its fitted "
+                                f"outline, not a page")
+        d = lambda p, r: math.hypot(p[0] - r[0], p[1] - r[1])
+        if max(d(q[0], q[1]), d(q[3], q[2])) > 1.8 * min(d(q[0], q[1]), d(q[3], q[2])) or \
+           max(d(q[0], q[3]), d(q[1], q[2])) > 1.8 * min(d(q[0], q[3]), d(q[1], q[2])):
+            return None, None, "opposite page edges differ too much to be one flat page"
+    sx, sy = w0 / w, h0 / h
+    quads = [[(p[0] * sx, p[1] * sy) for p in q] for q in quads]
+    why = f"{how}, {a:.0%} + {b:.0%} of the frame"
+    if fixed:
+        why += f"; the {' and '.join(fixed)} edge taken from the facing page"
+    return quads, ("h" if horiz else "v"), why
+
+
+def _ink_runs(path, side=600):
+    """(horizontal, vertical) ink in long runs: which way the lines of text go.
+
+    Text is letters close together along a line and far apart across it, so
+    after bridging the gaps between letters the runs ALONG the lines are long
+    and the runs across them are one letter high. Printed rules and form
+    underlines point the same way as the text they carry. Measured on a
+    passport spread: 0.26 as photographed, 3.79 turned a quarter; 1.74 and 1.40
+    on the two ordinary examples.
+    """
+    w0, h0 = dims(path)
+    if w0 >= h0:
+        w, h = side, max(1, round(side * h0 / w0))
+    else:
+        w, h = max(1, round(side * w0 / h0)), side
+    raw = subprocess.run(
+        ["magick", str(path), "-resize", f"{w}x{h}!", "-colorspace", "gray",
+         "(", "+clone", "-morphology", "Close", "Octagon:3", "-blur", "0x2", ")",
+         "-compose", op_divide(), "-composite", "-threshold", "75%",
+         "-depth", "8", "gray:-"], check=True, capture_output=True).stdout
+    minlen = max(8, round(0.025 * max(w, h)))
+
+    def runs(n_lines, n_len, at, gap=2):
+        tot = 0
+        for a in range(n_lines):
+            cur = hole = 0
+            for b in range(n_len):
+                if raw[at(a, b)] < 128:
+                    cur = cur + hole + 1 if cur else 1
+                    hole = 0
+                elif cur:
+                    hole += 1
+                    if hole > gap:
+                        if cur >= minlen:
+                            tot += cur
+                        cur = hole = 0
+            if cur >= minlen:
+                tot += cur
+        return tot
+
+    return (runs(h, w, lambda y, x: y * w + x),
+            runs(w, h, lambda x, y: y * w + x))
+
+
+# A face photograph on a document: the hair, the eyes, the jacket make a
+# compact block where most of the pixels are well below the paper level, which
+# nothing else on a document does over that area -- a text block is a few
+# percent ink, a stamp is coloured and so bright in its strongest channel.
+PHOTO_CELL = 8          # px of the 400 px analysis image per cell
+PHOTO_DARK = 0.78       # a pixel darker than this share of paper is "not paper"
+PHOTO_CELL_MIN = 0.45   # a cell this dark counts as photograph
+PHOTO_AREA = (1.0, 30.0)  # % of the image the block may cover
+PHOTO_FILL = 0.4        # a photo's dark cells fill this much of its box:
+                        # hair and clothes, with the lighter face between
+                        # (0.44-0.57 measured on passport photos)
+PHOTO_TRIES = 4         # dark blocks tried, largest first
+PHOTO_REACH = 6         # cells: dark things smaller than twice this are
+                        # filled in by the paper-level estimate (a photo is
+                        # 8-12 cells across), larger ones are the light
+
+
+def find_photo_block(path, side=400):
+    """Bounding box (x, y, w, h) of a face photo on the page, or None.
+
+    Cells of the analysis image that are mostly darker than the paper, joined
+    4-connected; the largest such group is a photograph when it is compact
+    (it fills at least half of its own box), of a portrait's proportions and
+    of a photograph's size. The box is then grown a little: the dark cells
+    are the hair, the eyes, the collar, and they reach the top of a portrait
+    but not quite its sides or its bottom (a light jacket). Measured on a
+    passport photo, 15% at the sides and bottom and 5% at the top covers the
+    picture without reaching the printed ornament around it. The page is
+    upright by the time this runs, so "top" means top.
+    """
+    w0, h0 = dims(path)
+    if w0 >= h0:
+        w, h = side, max(1, round(side * h0 / w0))
+    else:
+        w, h = max(1, round(side * w0 / h0)), side
+    buf = raw_rgb(path, w, h)
+    n = w * h
+    V = bytearray(n)
+    for i in range(n):
+        j = i * 3
+        r, g, b = buf[j], buf[j + 1], buf[j + 2]
+        v = r if r > g else g
+        V[i] = b if b > v else v
+    c = PHOTO_CELL
+    cw, ch = w // c, h // c
+    if cw < 4 or ch < 4:
+        return None
+    # "Darker than the paper" means the paper NEAR the cell. A booklet held
+    # open is lit unevenly -- one measured with its lower half in shadow read
+    # half the page as "dark" against the frame's paper level, one block of
+    # 54% of the page. So the paper level is estimated per cell: each cell's
+    # brightest pixels, then a closing on the cell grid -- a max filter, then
+    # a min filter, PHOTO_REACH cells each. The max fills in anything dark and
+    # smaller than that (the photo, the text) from the paper around it; the
+    # min brings back the shape of the light, so a shadow larger than that
+    # stays in the estimate and divides out.
+    top = []
+    for cy in range(ch):
+        for cx in range(cw):
+            vals = sorted(V[y * w + x] for y in range(cy * c, cy * c + c)
+                          for x in range(cx * c, cx * c + c))
+            top.append(vals[int(0.9 * (len(vals) - 1))])
+    r = PHOTO_REACH
+
+    def filt(src, pick):
+        # separable: along the rows, then down the columns
+        tmp = [pick(src[cy * cw + xx]
+                    for xx in range(max(0, cx - r), min(cw, cx + r + 1)))
+               for cy in range(ch) for cx in range(cw)]
+        return [pick(tmp[yy * cw + cx]
+                     for yy in range(max(0, cy - r), min(ch, cy + r + 1)))
+                for cy in range(ch) for cx in range(cw)]
+
+    bg = filt(filt(top, max), min)
+    dark = bytearray(cw * ch)
+    for cy in range(ch):
+        for cx in range(cw):
+            lim = PHOTO_DARK * bg[cy * cw + cx]
+            cnt = 0
+            for y in range(cy * c, cy * c + c):
+                row = y * w
+                for x in range(cx * c, cx * c + c):
+                    if V[row + x] < lim:
+                        cnt += 1
+            if cnt >= PHOTO_CELL_MIN * c * c:
+                dark[cy * cw + cx] = 1
+    # The largest dark block is not always the photo: a shadow along the
+    # spine can be larger. Blocks are taken largest first, and the first one
+    # shaped like a photograph wins.
+    for comp in _components(dark, cw, ch)[:PHOTO_TRIES]:
+        xs = [i % cw for i in comp]; ys = [i // cw for i in comp]
+        bw, bh = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+        share = 100.0 * bw * bh / (cw * ch)
+        if (PHOTO_AREA[0] <= share <= PHOTO_AREA[1]
+                and len(comp) >= PHOTO_FILL * bw * bh
+                and 0.4 <= bw / bh <= 2.5):
+            break
+    else:
+        return None
+    x0 = max(0.0, min(xs) - 0.15 * bw); y0 = max(0.0, min(ys) - 0.05 * bh)
+    x1 = min(cw, max(xs) + 1 + 0.15 * bw); y1 = min(ch, max(ys) + 1 + 0.15 * bh)
+    s = w0 / w
+    return (round(x0 * c * s), round(y0 * c * s),
+            round((x1 - x0) * c * s), round((y1 - y0) * c * s))
+
+
+def spread_turn(path, axis, report):
+    """Degrees to turn a rectified spread so its text reads upright.
+
+    Deterministic, from the page itself, in two steps:
+
+    1. Which way the lines of text run (`_ink_runs`). Text goes across the
+       page; a spread whose lines run up and down is turned a quarter.
+    2. Which of the two remaining ways is up. A document with a face photo
+       carries it on the LEFT of its page -- the Russian passport's page 3,
+       the ICAO data page of every travel document -- so of the two
+       candidates, the one that puts the photograph in the left half wins.
+
+    When the second step has nothing to go on the spread is turned the way
+    that keeps the first page at the top and said so, because a
+    wrong-way-up page is a keypress to fix and a guess presented as a fact is
+    not.
+    """
+    hr, vr = _ink_runs(path)
+    ratio = hr / max(1, vr)
+    if ratio >= 1.6:
+        cands = (0, 180)
+    elif ratio <= 1 / 1.6:
+        cands = (90, 270)
+    else:
+        report.append(f"spread: text direction unclear (runs across/along "
+                      f"{ratio:.2f}) — left as photographed; pass --rotate")
+        return 0
+    lines = "across" if cands[0] == 0 else "up and down"
+    iw, ih = dims(path)
+    box = find_photo_block(path)
+    if box:
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        for turn in cands:
+            # the photo's centre and the frame width after the turn (clockwise)
+            x, W = {0: (cx, iw), 180: (iw - cx, iw),
+                    90: (ih - cy, ih), 270: (cy, ih)}[turn]
+            # Where the spine ends up decides what "its page" is: pages side
+            # by side after the turn are half the width each, stacked pages
+            # are the full width.
+            side_by_side = (axis == "h") == (turn in (0, 180))
+            if side_by_side:
+                W = W / 2
+                x = x % W
+            if x < W / 2:
+                report.append(f"spread: text runs {lines} (ratio {ratio:.2f}); "
+                              f"the photo sits left of its page when turned "
+                              f"{turn}°")
+                return turn
+    turn = cands[0]
+    report.append(f"spread: text runs {lines} (ratio {ratio:.2f}); no face "
+                  f"photo to tell up from down — turned {turn}°, pass "
+                  f"--rotate if it came out upside down")
+    return turn
+
+
+def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False, size=None):
     """Warp the quad onto a rectangle whose sides average the quad's own.
 
     `cap` is the page the result will be laid onto. Rectifying to more pixels
@@ -452,12 +1107,17 @@ def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False):
     no reader: the fit scales by min(pw/W, ph/H), so everything above that is
     thrown out. Warping straight to the page is cheaper AND slightly sharper --
     one resample instead of two.
+
+    `size` forces the rectangle instead: the two pages of a spread are one
+    size in reality, whatever the perspective made of them.
     """
     tl, tr, br, bl = quad
     d = lambda a, b: math.hypot(a[0]-b[0], a[1]-b[1])
     W = max(50, round((d(tl, tr) + d(bl, br)) / 2))
     H = max(50, round((d(tl, bl) + d(tr, br)) / 2))
-    if cap:
+    if size:
+        W, H = size
+    elif cap:
         # The page turns to match a wide sheet, so cap against the page in THAT
         # orientation. Capping a landscape quad against a portrait page shaves
         # it to 2480 px wide and the fit then blows it back up to 3508 -- a
@@ -474,8 +1134,13 @@ def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False):
                       zip(q, ((0, 0), (W, 0), (W, H), (0, H))))
     # Triangle, not the default EWA filter: on a 2.4x downscale it costs 22%
     # less and lands within RMSE 0.002 of it.
+    # The viewport is spelled out: without it the output canvas is the INPUT's
+    # canvas, and a rectangle taller or wider than the photo it came from --
+    # a spread page, a sheet shot from close up -- was silently cut to it.
     magick(src, "-filter", "Triangle",
-           "-virtual-pixel", "white", "-distort", "Perspective", pairs,
+           "-virtual-pixel", "white",
+           "-define", f"distort:viewport={W}x{H}+0+0",
+           "-distort", "Perspective", pairs,
            "-crop", f"{W}x{H}+0+0", "+repage", dst)
     return W, H
 
@@ -784,6 +1449,120 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
     return dst, share, cut, verdict
 
 
+FINGER_CHROMA = 45      # the paper mask's own chroma limit
+FINGER_RED = 30         # skin: red leads both other channels by this much
+FINGER_DEPTH = 15.0     # % of the short side a finger may reach in
+FINGER_OVER = 25        # skin is this much more saturated than the median
+FINGER_MAX = 6.0        # % of the spread; a larger "finger" is the page
+SPINE_BAND = 8.0        # % of the spread width kept clear around the spine
+
+
+def erase_fingers(path, dst, axis, side=520):
+    """Repaint a finger holding the booklet open, in its page's own tone.
+
+    The hand that holds a spread open lies over its OUTER edge, and it is not
+    something `clean_border` can take: a thumb is as bright as the paper, so
+    the side it sits on is judged a shaded part of the document and kept. What
+    gives it away is colour -- skin is red-led and far more saturated than
+    paper (chroma 55-71 against 8-42 on a pink passport page).
+
+    But so is the passport's red perforation strip, to within a few units
+    (198,133,134 against 207,137,132), and the strip runs the whole height of
+    the spine, touching the border at both ends. Colour cannot tell them
+    apart; position can. A booklet is held at its outer edges, and the strip
+    lives on the spine, so the band around the spine is never flooded.
+    """
+    w0, h0 = dims(path)
+    w = side
+    h = max(1, round(side * h0 / w0))
+    buf = raw_rgb(path, w, h)
+    n = w * h
+    V = bytearray(n); C = bytearray(n); skin = bytearray(n)
+    for i in range(n):
+        j = i * 3
+        r, g, b = buf[j], buf[j + 1], buf[j + 2]
+        v = max(r, g, b)
+        V[i] = v
+        C[i] = v - min(r, g, b)
+    # "Saturated" is relative to the pages themselves: under warm light a
+    # whole page reads red-led and past the absolute limit, and a flood that
+    # took it for skin repainted 36% of a spread, a third of the text with it.
+    c_min = max(FINGER_CHROMA, sorted(C)[n // 2] + FINGER_OVER)
+    for i in range(n):
+        j = i * 3
+        r, g, b = buf[j], buf[j + 1], buf[j + 2]
+        if r == V[i] and C[i] > c_min and r - max(g, b) > FINGER_RED:
+            skin[i] = 1
+    paper = sorted(V)[int(0.90 * (n - 1))]
+    for i in range(n):
+        if skin[i] and V[i] < 0.55 * paper:
+            skin[i] = 0
+    if axis == "h":
+        half = w * SPINE_BAND / 200.0
+        spine = lambda x, y: abs(x - w / 2) < half
+    else:
+        half = h * SPINE_BAND / 200.0
+        spine = lambda x, y: abs(y - h / 2) < half
+    depth = max(3, int(min(w, h) * FINGER_DEPTH / 100.0))
+    reach = bytearray(n)
+    q = collections.deque()
+    for x in range(w):
+        for y in (0, h - 1):
+            i = y * w + x
+            if skin[i] and not spine(x, y) and not reach[i]:
+                reach[i] = 1; q.append((i, 0))
+    for y in range(h):
+        for x in (0, w - 1):
+            i = y * w + x
+            if skin[i] and not spine(x, y) and not reach[i]:
+                reach[i] = 1; q.append((i, 0))
+    while q:
+        i, d = q.popleft()
+        if d >= depth:
+            continue
+        x, y = i % w, i // w
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                xx, yy = x + dx, y + dy
+                if 0 <= xx < w and 0 <= yy < h:
+                    j2 = yy * w + xx
+                    if skin[j2] and not reach[j2] and not spine(xx, yy):
+                        reach[j2] = 1; q.append((j2, d + 1))
+    share = 100.0 * sum(reach) / n
+    if share < 0.05 or share > FINGER_MAX:
+        # a finger is a few percent of a spread; far more than that is the
+        # page's own colour, and repainting it would erase the page
+        return None, share
+    # each half of the spread is painted in its OWN paper tone: a pink page
+    # patched with the white page's white would leave a white hole in it
+    tones = []
+    for k in range(2):
+        rs, gs, bs = [], [], []
+        for y in range(h):
+            for x in range(w):
+                inside = (x < w / 2) if axis == "h" else (y < h / 2)
+                i = y * w + x
+                if inside == (k == 0) and not reach[i] and V[i] >= 0.8 * paper:
+                    rs.append(buf[3 * i]); gs.append(buf[3 * i + 1]); bs.append(buf[3 * i + 2])
+        med = lambda v: sorted(v)[len(v) // 2] if v else 255
+        tones.append(f"rgb({med(rs)},{med(gs)},{med(bs)})")
+    if axis == "h":
+        tone_img = ["-size", f"{w0 // 2}x{h0}", f"xc:{tones[0]}",
+                    "-size", f"{w0 - w0 // 2}x{h0}", f"xc:{tones[1]}", "+append"]
+    else:
+        tone_img = ["-size", f"{w0}x{h0 // 2}", f"xc:{tones[0]}",
+                    "-size", f"{w0}x{h0 - h0 // 2}", f"xc:{tones[1]}", "-append"]
+    mpath = dst + ".fingermask.pgm"
+    open(mpath, "wb").write(f"P5\n{w} {h}\n255\n".encode()
+                            + bytes(255 if v else 0 for v in reach))
+    magick(path, "(", *tone_img, ")",
+           "(", mpath, "-morphology", "Dilate", "Disk:2",
+           "-resize", f"{w0}x{h0}!", "-blur", "0x2", ")",
+           "-compose", "Over", "-composite", dst)
+    os.unlink(mpath)
+    return dst, share
+
+
 # --------------------------------------------------------------- page pipeline
 
 
@@ -876,17 +1655,99 @@ def fit_photo_page(src, out_png, o, report):
     return out_png, True, page_dpi
 
 
+# Below this much real detail at the size the page lands, 300 dpi only stores
+# invented pixels. 180 sits between the two public examples as measured: the
+# notebook photo holds 111 dpi (a 200 dpi page loses nothing), the letter 208
+# (kept at 300, where it has something to show).
+LOWRES_DPI = 180.0
+
+
+def photo_patch(keep, scale, off, o, out_png):
+    """ImageMagick args that lay the gently toned face photo over the page.
+
+    The photo keeps its own tones: black at its darkest half percent, white at
+    its own light background (bounded by the page's paper level), so that
+    background meets the white page and the face stays a face. A black-and-white photo is made properly grey, since the
+    page's cast would otherwise tint it. Its edge is feathered over a few
+    pixels so the seam to the treated page does not show.
+    """
+    src, (bx, by, bw, bh) = keep
+    gray = raw_gray(src, 200, max(1, round(200 * dims(src)[1] / dims(src)[0])))
+    paper = sorted(gray)[int(0.90 * (len(gray) - 1))]
+    cw = 120
+    chh = max(1, round(cw * bh / bw))
+    crop = ["-crop", f"{bw}x{bh}+{bx}+{by}", "+repage"]
+    g = subprocess.run(["magick", str(src), *crop, "-colorspace", "gray",
+                        "-resize", f"{cw}x{chh}!", "-depth", "8", "gray:-"],
+                       check=True, capture_output=True).stdout
+    black = sorted(g)[int(0.005 * (len(g) - 1))]
+    rgb = subprocess.run(["magick", str(src), *crop, "-resize", f"{cw}x{chh}!",
+                          "-depth", "8", "rgb:-"],
+                         check=True, capture_output=True).stdout
+    # the MEDIAN chroma: a red ornament the box clips must not make a
+    # black-and-white photo count as a colour one
+    chroma = sorted(max(rgb[j:j + 3]) - min(rgb[j:j + 3])
+                    for j in range(0, len(rgb), 3))[len(rgb) // 6]
+    mono = o.gray or chroma < 12
+    # White goes at the photo's own light background when it has one -- a
+    # passport photo's card sits a few percent under the page's paper, and
+    # leaving it there draws a grey rectangle on a white page -- but never
+    # below 85% of the paper, or a dark photo would be blown out to find it.
+    light = sorted(g)[int(0.85 * (len(g) - 1))]
+    white = min(0.98 * paper, max(0.85 * paper, light))
+    lo = 100.0 * black / 255
+    hi = max(lo + 10, 100.0 * white / 255)
+    pw_, ph_ = max(1, round(bw * scale)), max(1, round(bh * scale))
+    feather = max(2, round(min(pw_, ph_) * 0.015))
+    patch = out_png + ".photo.png"
+    magick(src, *crop, *(["-colorspace", "gray"] if mono else []),
+           "-level", f"{lo:.2f}%,{hi:.2f}%",
+           "-resize", f"{pw_}x{ph_}!",
+           "-unsharp", f"0x1+{o.sharpen}+0.02", "-colorspace", "sRGB",
+           "(", "-size", f"{pw_}x{ph_}", "xc:black", "-fill", "white",
+           "-draw", f"rectangle {2 * feather},{2 * feather} "
+                    f"{pw_ - 1 - 2 * feather},{ph_ - 1 - 2 * feather}",
+           "-blur", f"0x{feather}", ")",
+           "-alpha", "off", "-compose", "CopyOpacity", "-composite", patch)
+    x = off[0] + round(bx * scale)
+    y = off[1] + round(by * scale)
+    return [patch, "-geometry", f"{x:+d}{y:+d}", "-compose", "Over", "-composite"]
+
+
 def process_page(src, out_png, o, report):
     # 0. document or photo? Decided BEFORE anything touches the pixels, because
     #    the photo path is a different pipeline, not this one with stages turned
     #    off. --photo on used to still run the rectify, which is exactly the
     #    kind of leak the early return exists to make impossible.
     quad, why, paper_share = None, None, 1.0
+    spread = None
     if o.photo == "on":
         report.append("--photo on — kept as a photo, not scanned")
         return fit_photo_page(src, out_png, o, report)
     if o.rectify != "off":
-        quad, why, paper_share = detect_quad(src)
+        vc = _vc(src)
+        pm = paper_mask(src, vc=vc)
+        # A spread is tried FIRST: its two pages are also two perfectly good
+        # sheet candidates, and the single-sheet rule would take the larger
+        # one and drop its facing page without a word. The strict reading of
+        # "paper" goes first, so a plain sheet is judged exactly as before;
+        # the looser ones only get a say when it found no spread.
+        if o.spread != "off":
+            whys = []
+            for mode in ("paper", "tinted", "otsu"):
+                cand = pm if mode == "paper" else paper_mask(src, vc=vc, mode=mode)
+                squads, axis, swhy = detect_spread(cand)
+                if squads:
+                    if mode != "paper":
+                        swhy += f", {mode} paper mask"
+                    spread = (squads, axis, swhy)
+                    break
+                whys.append(f"{mode}: {swhy}")
+            if not spread and o.spread == "on":
+                sys.exit("a4norm: --spread on, but no two facing pages found: "
+                         + "; ".join(whys))
+    if o.rectify != "off" and not spread:
+        quad, why, paper_share = detect_quad(src, pm=pm)
         if quad is None:
             # Brightness could not find the sheet. Ask the segmentation helper,
             # if this build has one, and judge its answer by the same rules.
@@ -935,7 +1796,46 @@ def process_page(src, out_png, o, report):
     # 1. rectify: warp the sheet's own quadrilateral onto a rectangle. This has
     #    to come first — every later step assumes the page is flat, and a page
     #    shot at an angle is the one thing a rectangular crop can never fix.
-    if quad:
+    if spread:
+        squads, axis, swhy = spread
+        d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+        # Both pages are warped to ONE size, the mean of what the photo shows:
+        # a booklet's pages are equal, and joining two rectangles of different
+        # sizes along the spine would leave a step in the edge.
+        pw_ = sum((d(q[0], q[1]) + d(q[3], q[2])) / 2 for q in squads) / 2
+        ph_ = sum((d(q[0], q[3]) + d(q[1], q[2])) / 2 for q in squads) / 2
+        sw, sh_ = (2 * pw_, ph_) if axis == "h" else (pw_, 2 * ph_)
+        k = 1.0
+        if o.fit == "auto":
+            # the spread may turn a quarter, so cap it against the page
+            # either way round: long side against long side
+            cap = (round(210 / MM * o.dpi), round(297 / MM * o.dpi))
+            k = min(1.0, max(cap) / max(sw, sh_), min(cap) / min(sw, sh_))
+        W1, H1 = max(50, round(pw_ * k)), max(50, round(ph_ * k))
+        halves = []
+        for idx, q in enumerate(squads):
+            step += 1
+            dst = f"{out_png}.s{step}-page{idx + 1}.png"
+            rectify(src, dst, q, o.rect_inset, size=(W1, H1))
+            halves.append(dst)
+        step += 1
+        dst = f"{out_png}.s{step}-spread.png"
+        magick(*halves, "+append" if axis == "h" else "-append", dst)
+        cur = dst
+        rectified = True
+        W, H = dims(cur)
+        report.append(f"spread: two facing pages ({swhy}), each rectified "
+                      f"to {W1}x{H1} and joined at the fold -> {W}x{H}")
+        step += 1
+        got, share = erase_fingers(cur, f"{out_png}.s{step}-fingers.png", axis)
+        if got:
+            cur = got
+            report.append(f"erased a finger at the outer edge ({share:.1f}% "
+                          f"of the spread)")
+        elif share > FINGER_MAX:
+            report.append(f"finger erase skipped: what looked like skin was "
+                          f"{share:.0f}% of the spread — the pages' own colour")
+    elif quad:
         step += 1
         dst = f"{out_png}.s{step}-rectify.png"
         # Only for the default fit. --fit content and --fit edges derive their
@@ -953,6 +1853,7 @@ def process_page(src, out_png, o, report):
         cur = dst
         rectified = True
         report.append(f"rectified the sheet quad ({why}) -> {W}x{H}")
+    if rectified:
         if not o.no_edge_clean:
             step += 1
             cleaned = f"{out_png}.s{step}-border.png"
@@ -1004,9 +1905,16 @@ def process_page(src, out_png, o, report):
     #    its lines on end makes it unreadable. A portrait sheet genuinely
     #    photographed sideways stays sideways, which the reader fixes with one
     #    keypress; unreadable text is not fixable at all.
+    #    A spread is the exception, because there the evidence is on the page:
+    #    which way its lines of text run, and which side its photo is on.
     if o.rotate not in ("auto", "0"):
         stage("rot", "-rotate", o.rotate)
         report.append(f"rotated {o.rotate}°")
+    elif spread and o.rotate == "auto":
+        turn = spread_turn(cur, spread[1], report)
+        if turn:
+            stage("rot", "-rotate", str(turn))
+            report.append(f"rotated {turn}°")
 
     # 3. cut the photographic border (desk, shadow, sheet edge). Pointless
     #    after a rectify — the quad already ended exactly at the sheet.
@@ -1032,6 +1940,23 @@ def process_page(src, out_png, o, report):
             "border cut L/R/T/B = %d/%d/%d/%d px (edge + %d px shave; edges: %s)"
             % (cut["l"], cut["r"], cut["t"], cut["b"], sh,
                ",".join(k for k, v in flags.items() if v) or "none"))
+
+    # 4a. a face photo on the page is found BEFORE the flat-field touches it.
+    #    Everything from here on is built to turn light smooth areas into white
+    #    paper, and a face is a light smooth area: the background estimate
+    #    follows it, the division lifts it to white, the haze and paper screens
+    #    finish the job. What came out of a passport was a face with white
+    #    holes for cheeks. So the photo is cut out of the page as it is now,
+    #    toned gently on its own, and laid back over the finished page.
+    keep = None
+    if not o.no_keep_photo:
+        box = find_photo_block(cur)
+        if box:
+            keep = (cur, box)
+            pw0, ph0 = dims(cur)
+            report.append(f"face photo at {box[2]}x{box[3]}+{box[0]}+{box[1]} "
+                          f"of {pw0}x{ph0} — toned on its own, not flattened "
+                          f"into the paper")
 
     # 4. flat-field: divide by a smoothed background estimate -> even white paper
     iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
@@ -1093,6 +2018,12 @@ def process_page(src, out_png, o, report):
                     shave["l"] += cl
                     shave["t"] += ct
             report.append(f"deskewed {ang:+.2f}°, edge lean cut {lean}px")
+            if keep:
+                # the photo's box is in the coordinates of the page BEFORE the
+                # turn; laying it back at those would misplace it
+                keep = None
+                report.append("face photo left to the page treatment: the page "
+                              "was deskewed after the photo was cut out")
         else:
             report.append(f"skew {ang:+.2f}° — left as is")
 
@@ -1239,6 +2170,26 @@ def process_page(src, out_png, o, report):
         off_x = round((pw - iw * scale) / 2)
     if off_y is None:
         off_y = round((ph - ih * scale) / 2)
+
+    # A page is only as sharp as the photo it came from. Laid onto A4 at
+    # 300 dpi, a 1280x960 snapshot of a passport spread is blown up 2x: half
+    # the pixels of the page are invented, and they cost the same bytes as
+    # real ones -- 1.6 MB for one page. When the photo holds less than
+    # LOWRES_DPI of detail at the size it lands, the page is written at 200
+    # dpi with 4:2:0 chroma (the phone's own JPEG already threw that colour
+    # resolution away): 577 KB instead, with no visible difference side by
+    # side. An explicit --dpi is always obeyed.
+    lowres = False
+    if not o.dpi_given and scale > o.dpi / LOWRES_DPI and o.dpi > 200:
+        wide = pw > ph
+        pw, ph = round(210 / MM * 200), round(297 / MM * 200)
+        if wide:
+            pw, ph = ph, pw
+        f = pw / (round(297 / MM * o.dpi) if wide else round(210 / MM * o.dpi))
+        scale *= f
+        off_x, off_y = round(off_x * f), round(off_y * f)
+        page_dpi = 200
+        lowres = True
     off = (off_x, off_y)
 
     # The resize and the A4 layout are one process: the scaled page is the
@@ -1246,6 +2197,9 @@ def process_page(src, out_png, o, report):
     # writing it only for the next process to read it back was the most
     # expensive handoff left.
     page = f"{out_png}"
+    over = []
+    if keep:
+        over = photo_patch(keep, scale, off, o, out_png)
     magick("-size", f"{pw}x{ph}", "xc:white",
            "(", cur, "-resize", f"{scale * 100:.4f}%",
            "-unsharp", f"0x1+{o.sharpen}+0.02", ")",
@@ -1254,9 +2208,13 @@ def process_page(src, out_png, o, report):
            "-colorspace", "sRGB", "-geometry", "+0+0",
            "(", "+clone", "-colorspace", "gray", "-threshold", f"{o.paper_thr}%",
            "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
-           "-compose", "Screen", "-composite", page)
+           "-compose", "Screen", "-composite", *over, page)
     report.append(f"fit: {mode_used}; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
     report.append(f"page: {pw}x{ph}px @ {page_dpi}dpi")
+    if lowres:
+        report.append(f"the photo holds about {o.dpi / (scale / f):.0f} dpi of "
+                      f"detail at this size — page written at {page_dpi} dpi, "
+                      f"not {o.dpi} (--dpi forces it)")
     return page, False, page_dpi
 
 
@@ -1371,9 +2329,11 @@ def build(sources, out, o):
         # Text wants full chroma; a snapshot does not, and 4:2:0 at a lower
         # quality is the difference between a 2.4 MB page and a third of that
         # with nothing visible lost.
-        def encode(src_png, dst, is_photo, extra=()):
+        def encode(src_png, dst, is_photo, page_dpi, extra=()):
             q = o.photo_quality if is_photo else o.quality
-            sub = "2x2" if is_photo else "1x1"
+            # a page written below --dpi because the photo held no more
+            # detail has no full-resolution chroma to keep either
+            sub = "2x2" if is_photo or page_dpi < o.dpi else "1x1"
             magick(src_png, "-quality", str(q),
                    "-sampling-factor", sub, "-strip", *extra, dst)
 
@@ -1381,7 +2341,7 @@ def build(sources, out, o):
             jpegs, dpis = [], []
             for i, (page, is_photo, page_dpi) in enumerate(pages):
                 jp = os.path.join(wd, f"jp-{i:03d}.jpg")
-                encode(page, jp, is_photo)
+                encode(page, jp, is_photo, page_dpi)
                 jpegs.append(jp)
                 dpis.append(page_dpi)
             write_pdf(jpegs, out, dpis)
@@ -1392,7 +2352,7 @@ def build(sources, out, o):
             written = []
             for i, (page, is_photo, page_dpi) in enumerate(pages):
                 dst = out if len(pages) == 1 else f"{stem}-{i + 1}{ext}"
-                encode(page, dst, is_photo,
+                encode(page, dst, is_photo, page_dpi,
                        ("-density", str(page_dpi), "-units", "PixelsPerInch"))
                 written.append(dst)
         if o.preview:
@@ -1416,7 +2376,10 @@ def main():
                    help="output format")
     p.add_argument("--separate", action="store_true",
                    help="one document per input instead of one combined document")
-    p.add_argument("--dpi", type=int, default=300)
+    p.add_argument("--dpi", type=int, default=None,
+                   help="page resolution (default 300; a page whose photo "
+                        "holds much less detail is written at 200 unless "
+                        "this is given)")
     p.add_argument("--quality", type=int, default=88, help="JPEG quality")
     p.add_argument("--photo-quality", type=int, default=82,
                    help="JPEG quality for a page that holds no document")
@@ -1427,6 +2390,11 @@ def main():
     p.add_argument("--landscape", action="store_true", help="A4 landscape")
     p.add_argument("--rotate", default="auto",
                    choices=["auto", "0", "90", "180", "270"])
+    p.add_argument("--spread", default="auto", choices=["auto", "on", "off"],
+                   help="an open booklet (a passport) photographed with both "
+                        "pages showing: each page is rectified on its own and "
+                        "the two are joined at the fold; auto = when two "
+                        "facing pages are found")
     p.add_argument("--rectify", default="auto", choices=["auto", "on", "off"],
                    help="warp the sheet's quadrilateral flat before anything "
                         "else; auto = only when a convincing quad is found")
@@ -1509,9 +2477,15 @@ def main():
     g.add_argument("--no-trim", action="store_true")
     g.add_argument("--no-deskew", action="store_true")
     g.add_argument("--no-neutralize", action="store_true")
+    g.add_argument("--no-keep-photo", action="store_true",
+                   help="treat a face photo like the rest of the page instead "
+                        "of toning it on its own (it gets bleached)")
     g.add_argument("--no-flatten-paper", action="store_true",
                    help="keep paper texture instead of cleaning it to white")
     o = p.parse_args()
+    o.dpi_given = o.dpi is not None
+    if o.dpi is None:
+        o.dpi = 300
 
     try:
         o.ml, o.mr, o.mt = (float(x) for x in o.margins.split(","))

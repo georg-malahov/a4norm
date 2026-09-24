@@ -73,9 +73,13 @@ RENDER_DPI = 50
 MAX_MAE = 4.0
 MAX_CHANGED = 3.0  # percent of pixels whose worst channel moved by more than 64
 
-# Exact A4 as a4norm writes it: 2480x3508 px at 300 dpi = 595.20 x 841.92 pt,
-# which is ISO A4 (595.276 x 841.890 pt) to within 0.03 mm.
-A4_PT = (595.20, 841.92)
+# Exact A4 as a4norm writes it, per page resolution: 2480x3508 px at 300 dpi
+# = 595.20 x 841.92 pt, and 1654x2339 px at 200 dpi (the page a photo with
+# little real detail gets) = 595.44 x 842.04 pt. Both are ISO A4 (595.276 x
+# 841.890 pt) to within 0.06 mm.
+A4_PX = {300: (2480, 3508), 200: (1654, 2339)}
+A4_PT = {dpi: (round(w * 72 / dpi, 2), round(h * 72 / dpi, 2))
+         for dpi, (w, h) in A4_PX.items()}
 ISO_A4_PT = (595.276, 841.890)
 
 
@@ -230,10 +234,10 @@ def compare(a_path, b_path):
 # Each check is (description, predicate over (report, page)). The description
 # says what the page must BE; the failure message adds what was measured.
 
-def check_a4_portrait(rep, page):
-    if rep["page"] != (2480, 3508, 300):
+def check_a4_portrait(rep, page, dpi=300):
+    if rep["page"] != (*A4_PX[dpi], dpi):
         raise Fail(f"page raster is {rep['page']}, expected a portrait A4 "
-                   f"2480x3508 @ 300 dpi")
+                   f"{A4_PX[dpi][0]}x{A4_PX[dpi][1]} @ {dpi} dpi")
 
 
 def notebook_checks():
@@ -272,15 +276,17 @@ def notebook_checks():
         if rep["rotated"]:
             raise Fail(f"the picture was rotated ({rep['rotated']}); with "
                        f"--rotate auto only the page may turn")
-        check_a4_portrait(rep, page)
+        # The notebook photo holds ~111 dpi of real detail on the page, under
+        # LOWRES_DPI, so the page is written at 200 dpi, not 300.
+        check_a4_portrait(rep, page, dpi=200)
         mode, scale, ox, oy = rep["fit"]
         if not mode.startswith("frame (the rectified quad is the sheet)"):
             raise Fail(f"fit mode is {mode!r}, expected the rectified frame")
         # a near-square sheet on a portrait page: full width, centred vertically
-        if ox != 0 or not (300 <= oy <= 700):
+        if ox != 0 or not (200 <= oy <= 467):
             raise Fail(f"sheet placed at offset {ox:+d}{oy:+d}; expected it "
                        f"to fill the page width and sit centred vertically "
-                       f"(about +0+480)")
+                       f"(about +0+322 at 200 dpi)")
 
     def lines_across(rep, page):
         ratio = page.line_direction()
@@ -396,9 +402,11 @@ def run_case(name, src, checks, a4norm, update, artifacts, golden_dir):
         pages, box, rot = pdf_facts(pdf)
         if pages != 1:
             failures.append(f"PDF has {pages} pages, expected 1")
-        if [round(x, 2) for x in box] != [0.0, 0.0, *A4_PT] or rot != 0:
+        want = A4_PT.get(report["page"][2] if report["page"] else 300,
+                         A4_PT[300])
+        if [round(x, 2) for x in box] != [0.0, 0.0, *want] or rot != 0:
             failures.append(f"MediaBox is {box} (rotation {rot}), expected "
-                            f"exactly [0 0 {A4_PT[0]} {A4_PT[1]}], unrotated")
+                            f"exactly [0 0 {want[0]} {want[1]}], unrotated")
         short, long_ = sorted(box[2:4])
         if abs(short - ISO_A4_PT[0]) > 0.5 or abs(long_ - ISO_A4_PT[1]) > 0.5:
             failures.append(f"MediaBox {box} is not ISO A4")

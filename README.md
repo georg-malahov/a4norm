@@ -56,6 +56,17 @@ for it. Run it locally with `tests/run-in-docker.sh`; when a change is meant
 to alter the pages, refresh the goldens with `--update-goldens` in each image
 and look at them before committing.
 
+The private corpus has a runner of its own, `tests/corpus.py`, which reads
+`tests/corpus/` — photos plus a `cases.json` of what each must come out as
+(spread found, turned by how much, face photo kept and in the lower left,
+text running across). That directory is in `.gitignore` and `.dockerignore`
+and exists only on the machines that run it; the runner and its format are
+public, the documents are not. A photo the tool cannot handle yet stays in
+the corpus marked `known_fail` with the reason, is reported as `xfail`, and
+flips to `XPASS` the day it starts passing. Every run writes
+`tests/corpus/out/sheet.png`, each input beside the page it became — the
+checks are necessary, never sufficient.
+
 ## Run it
 
 **Container** (nothing to install):
@@ -191,6 +202,35 @@ change what this image may be used for.
    opposite sides within 1.8×); otherwise the reason is printed and the rest of
    the pipeline carries on, because rectifying on a wrong quad is worse than not
    rectifying.
+   **An open booklet is looked for first** — a passport photographed with both
+   pages showing (`--spread`, auto). It breaks the one-sheet model three ways:
+   the red perforation strip at a passport's spine (chroma 75 against the
+   paper limit of 45) splits the paper mask into two sheets, and the larger
+   one used to be rectified alone while its facing page was thrown away; the
+   pages curve into the spine, so the outline is a flat "V" at the fold that
+   no single homography flattens; and the hand holding it open bites into
+   the edge. So two facing pages are found (two paper regions of similar
+   size, or one region whose long edges both bend or step in the middle —
+   an international passport has no strip between its pages), each page edge
+   is fitted as a *support line* — the straight line the most edge points lie
+   on with no paper beyond it, which a thumb's curved outline cannot win —
+   and the fold is where the two pages' edges meet. When a hand hid nearly
+   all of an edge, the facing page's edge is used for both. Each page is
+   warped to one common size and the two are joined at the fold; a finger
+   still lying over the outer edge is repainted in its page's own tone (skin
+   and the red strip are the same colour to within a few units, so the band
+   around the spine is left alone; "saturated" is measured against the pages'
+   own median, because under warm light a whole page reads as skin — one
+   flood repainted 36% of a spread — and a "finger" over 6% of the spread is
+   taken for the page's colour and left alone). Passport pages are not white paper, so
+   when the strict paper mask finds no spread two looser readings get a say:
+   chroma up to 100 (salmon-pink pages) and Otsu's brightness split (a
+   booklet half in its own shadow). Then the spread is **turned upright from
+   the page itself**: which way the text runs (ink in long runs across the
+   lines against along them — 0.26 as photographed, 3.79 turned), and which
+   way is up from where the face photo sits — on the left of its page, on a
+   Russian passport's page 3 and on every ICAO data page. With no photo to go
+   on it says so, and `--rotate` settles it.
 3. **Or decide there is no document at all.** If no sheet quad was accepted
    *and* the paper-like area is under `--photo-paper` (20%), the frame is a
    photo, not a page. This is decided BEFORE anything touches the pixels, and
@@ -239,22 +279,34 @@ change what this image may be used for.
    or has one or two blobs and no pitch at all. The test only overrides a
    DOCUMENT verdict, and only for a band darker than `--band-dark`, so it can
    take a side away from the content but never give one to it.
-5. **Flat-field** — divide by a smoothed background estimate, in colour, which
+5. **Keep a face photo out of the paper treatment.** Everything from here on
+   turns light smooth areas into white paper, and a face is a light smooth
+   area: a passport came back with white holes for cheeks. A photo is a
+   compact block of cells mostly darker than the paper *near them* (the paper
+   level is a closing over the cell grid, so a page half in shadow does not
+   read as one big photo), of a portrait's size and proportions, filling at
+   least 40% of its box — hair and clothes, the lighter face between. It is
+   cut out before the flat-field, toned on its own (black at its darkest, white
+   at its own light background, grey when it is black-and-white) and laid back
+   over the finished page with a feathered edge. `--no-keep-photo` turns it
+   off. Neither public example has one.
+6. **Flat-field** — divide by a smoothed background estimate, in colour, which
    both evens the light and white-balances the paper. The estimate is built on
    a point-sampled copy with the kernel scaled to match, because it is squeezed
    to 6% and blurred there anyway: six times cheaper, and within RMSE 0.01 of
    the full-resolution estimate.
-6. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
+7. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
    binarizes into one blob and a real tilt measures as 0.0°). Skipped after a
    rectify, which already set the orientation.
-7. **Neutralize the ink** — a photo tints black print warm. Everything goes
+8. **Neutralize the ink** — a photo tints black print warm. Everything goes
    neutral except pixels that are both high-chroma and dark: real coloured ink,
    any hue.
-8. **Tone** by histogram percentiles, then erase bright featureless haze (a soft
+9. **Tone** by histogram percentiles, then erase bright featureless haze (a soft
    shadow or a finger goes; anything with structure survives), then clean the
    paper to pure white with a 1 px guard ring around every glyph.
-9. **Fit to A4** — the PAGE turns, never the picture. A wide result is laid on
-   a landscape A4; `--rotate auto` rotates nothing at all. Turning the pixels
+10. **Fit to A4** — the PAGE turns, never the picture. A wide result is laid on
+   a landscape A4; `--rotate auto` rotates nothing at all — except a spread,
+   which is turned from the evidence on its own pages (step 2). Turning the pixels
    instead assumes a wide frame means a sideways sheet, and it usually does not:
    a square notebook page shot in a wide frame is wide because of the FRAME, and
    standing its lines on end makes it unreadable. A portrait sheet genuinely
@@ -269,6 +321,12 @@ change what this image may be used for.
    them when the sheet is plainly inside the frame shrinks a wide worksheet to
    two thirds of the page (measured 2.11 against the frame's 2.69 and the real
    sheet's 3.15 on the same photograph). `--fit content` still forces it.
+
+   A page is only as sharp as the photo it came from: when the photo holds
+   less than 180 dpi of real detail at the size it lands, the page is written
+   at 200 dpi with 4:2:0 chroma instead of 300 — a passport spread from a
+   1280×960 snapshot went from 1.6 MB to 577 KB with no difference visible
+   side by side. The report says so; an explicit `--dpi` is always obeyed.
 
 `--dry-run` prints which path each page took and why. Every parameter above is a
 flag; `--help` lists them.
@@ -295,6 +353,12 @@ flag; `--help` lists them.
 | a spiral binding survived as dark marks in the margin | its rings were not regular enough to be recognised — `--band-dark 45` to judge the band on darkness alone |
 | a regular row of printed marks at one edge got cut as a binding | `--band-dark 75`, or `--edge-keep 8` to keep the band |
 | file too big | `--dpi 200`, `--quality 80`, `--gray` |
+| a small photo came out at 200 dpi and you need 300 | `--dpi 300` — an explicit value is always obeyed |
+| a passport spread was rectified as one page, or only one page of it kept | `--spread on` fails loudly with each paper mask's reason |
+| something that is not a booklet was split in two and joined | `--spread off` |
+| a spread came out upside down | no face photo told up from down — `--rotate 180` |
+| a face photo came out bleached | it was not found — the report has no `face photo at` line |
+| a dark picture or logo on a page kept a grey box around it | it was taken for a face photo — `--no-keep-photo` |
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
 | a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
 | a document was treated as a photo and left untouched | `--photo off`, or lower `--photo-paper` |
@@ -421,6 +485,13 @@ startup instead of being trusted.
 - **Rectification needs the sheet to stand out** — bright and low-chroma against
   a darker or coloured surface. White paper on a white desk does not separate:
   the quad is refused with a reason and the keystone stays.
+- **A spread needs its pages to stand out too.** White pages held over a white
+  desk join the desk in every paper mask, and a passport cover's dark rim is
+  too thin to enclose them; the spread is not found. The same goes for a
+  booklet whose pages are hidden by the hand more than they are shown.
+- **Up from down on a spread comes from the face photo.** Pages without one —
+  a passport's registration pages — are turned so the text runs across, but
+  may come out upside down; the report says when it had nothing to go on.
 - **Flat pages only.** A curved or crumpled page is not unwarped; that needs a
   3D model of the sheet. Shoot it flat.
 - **No OCR.** The output is an image-only PDF. Run it through an OCR tool
