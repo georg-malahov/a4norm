@@ -231,6 +231,41 @@ change what this image may be used for.
    way is up from where the face photo sits — on the left of its page, on a
    Russian passport's page 3 and on every ICAO data page. With no photo to go
    on it says so, and `--rotate` settles it.
+   **An identity card or a driving licence** (`--cards`, auto) is looked for
+   alongside. ISO/IEC 7810 ID-1 — German Personalausweis, Russian and EU
+   driving licences, bank cards — is 85.60 × 53.98 mm, 1.586:1, where A4 is
+   1.414 and a passport page 1.42, and that proportion is what tells a card
+   from a sheet. The same edge fitting finds one or two card-shaped regions
+   (60–120° corners, 1.50–1.68 measured through perspective). Two regions
+   touching along a side are a booklet's pages and are left to the spread
+   detector. A lone card never beats a spread unless it covers 70% of it:
+   a passport page can pass for a card, a card is never two pages.
+
+   A **frame edge is no edge**: where a region runs into the photo's border,
+   that stretch of its outline is dropped. A glare over a card that reached
+   the top of the photo gave it a perfectly straight "top edge" along the
+   frame. For the same reason a support line is penalised 1 per point of
+   paper outside it, not 3: at 3 a glare spur standing above a card beat
+   the card's real edge (24% support against 70%).
+
+   Each card is rectified straight to its **real size** at `--dpi` and turned
+   so its face photo is on the left. There is no search for the photo: it is
+   only ever in the left third of a front, so that place and its mirror are
+   measured. A place holds a photo when its cells are dark against the paper
+   near them AND dark in unbroken columns. Text has gaps between its lines;
+   a portrait runs from hair to collar. Fronts measured 0.38–0.62 dark and
+   0.20–0.60 in columns, backs 0.14 and 0.00. A finger at the edge is
+   repainted first.
+
+   The card is toned as a **colour copy, not a scan**: the tint and the
+   security print are the document. The light is evened, the same factor on
+   every channel, and nothing is whitened. It gets its rounded 3.18 mm
+   corners and a hairline edge so a white card still has one on a white
+   page. Cards are laid out **front above back on one A4**, whether both are
+   in one photo or in two photos in a row (`--card-size fit` blows them up
+   to the page width). A group of cards needs a face photo on at least one:
+   a bright 16:10 rectangle without one — a screen, a sign — is no identity
+   card, and its photo goes back through as a document.
 3. **Or decide there is no document at all.** If no sheet quad was accepted
    *and* the paper-like area is under `--photo-paper` (20%), the frame is a
    photo, not a page. This is decided BEFORE anything touches the pixels, and
@@ -358,6 +393,11 @@ flag; `--help` lists them.
 | something that is not a booklet was split in two and joined | `--spread off` |
 | a spread came out upside down | no face photo told up from down — `--rotate 180` |
 | a face photo came out bleached | it was not found — the report has no `face photo at` line |
+| an ID card came out as a scanned page, not a card | not card-shaped (the report has no `card:` line) or no face photo on it or its partner |
+| a card's front and back landed on two pages | they were not two photos in a row, or one of them was not found as a card |
+| a card came out upside down | its face photo was not found — it was taken for a back |
+| cards too small to read | `--card-size fit` — each card at the page width |
+| something that is not a card was laid out as one | `--cards off` |
 | a dark picture or logo on a page kept a grey box around it | it was taken for a face photo — `--no-keep-photo` |
 | an ordinary photo got bleached and straightened | it was taken for a document — `--photo on` |
 | a photo came out in colour although `--gray` was given | the photo path is a passthrough; `--gray` is a document flag |
@@ -489,6 +529,12 @@ startup instead of being trusted.
   desk join the desk in every paper mask, and a passport cover's dark rim is
   too thin to enclose them; the spread is not found. The same goes for a
   booklet whose pages are hidden by the hand more than they are shown.
+- **A card must stand out from what it lies on.** A licence on a white car
+  roof, on light wood or in a hand over a bright staircase joins the
+  background in every paper mask and is scanned as a document instead.
+  Edge-based finding is the next step for both cards and spreads.
+- **A card's back has no face photo**, so it keeps the orientation it was
+  shot in; shot upside down, it stays upside down.
 - **Up from down on a spread comes from the face photo.** Pages without one —
   a passport's registration pages — are turned so the text runs across, but
   may come out upside down; the report says when it had nothing to go on.

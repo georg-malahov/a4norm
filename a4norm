@@ -527,12 +527,22 @@ SPREAD_FILL = 0.45      # blob pixels / fitted page quad; holes are the stamp,
                         # can take half a page (measured 47-59%)
 
 
-def _side_points(comp, w, P, Q):
+EDGE_FRAME = 8          # px at the analysis scale (2-3% of it): this close to the frame's
+                        # border is the frame, not an edge (the paper mask's
+                        # opening already blanks the outermost pixel)
+
+
+def _side_points(comp, w, P, Q, h=None):
     """The blob's outermost pixel per step along the side P->Q.
 
     Outermost along the outward normal, so holes in the page (a stamp, a
     photo) do not count, and only the middle 80% of the side is used: a
     rounded booklet corner is not part of either edge.
+
+    A pixel on the frame's own border is not an edge at all: the frame cut
+    the region there. A glare above a card that ran up to the top of the
+    photo gave the card a perfectly straight "top edge" along the frame,
+    with nothing outside it to penalise, and it won.
     """
     L = math.hypot(Q[0] - P[0], Q[1] - P[1])
     if L < 8:
@@ -552,7 +562,12 @@ def _side_points(comp, w, P, Q):
         b = best.get(k)
         if b is None or s > b[0]:
             best[k] = (s, x, y)
-    return [(x, y) for _, x, y in best.values()]
+    # Where the region runs into the frame's border its edge is not seen at
+    # all, so that step along the side is dropped whole -- dropping only the
+    # border pixels makes the next ones in, a straight line again, the edge.
+    return [(x, y) for _, x, y in best.values()
+            if not h or (EDGE_FRAME <= x < w - EDGE_FRAME
+                         and EDGE_FRAME <= y < h - EDGE_FRAME)]
 
 
 def _fit_line(pts, trim=True):
@@ -606,6 +621,12 @@ def _line_angle(l1, l2):
 
 EDGE_BAND = 1.5         # px at the analysis scale: on the edge
 EDGE_OUT = 3.0          # px: paper this far OUTSIDE a line means it is no edge
+EDGE_PENALTY = 1.0      # score lost per point outside, against 1 per point on.
+                        # 3 lost a card's top edge to a glare spur standing
+                        # above it (the spur's top won with 24% support over
+                        # the edge's 70%); a thumb's line still loses at 1,
+                        # since the real edge it leaves outside outnumbers
+                        # the thumb's own points
 
 
 def _edge_line(pts, P, Q):
@@ -616,8 +637,8 @@ def _edge_line(pts, P, Q):
     than any trimming of outliers survives: the plain fit followed the thumb
     and measured a residual of 10 px. So the edge is chosen as a support
     line: of the lines through pairs of edge points, the one that the most
-    points lie on, heavily penalised for every point of paper left outside
-    it, since nothing of the page lies beyond its own edge. A thumb's outline
+    points lie on, penalised for every point of paper left outside it, since
+    nothing of the page lies beyond its own edge. A thumb's outline
     is curved and leaves the real edge outside it; a straight run of real
     edge, however short, wins. The pairs are fixed strides through the
     points, so the choice is deterministic. Returns the refitted line with
@@ -651,7 +672,7 @@ def _edge_line(pts, P, Q):
                     on += 1
                 elif s > EDGE_OUT:
                     out += 1
-            score = on - 3 * out
+            score = on - EDGE_PENALTY * out
             if best is None or score > best[0]:
                 best = (score, a, mx, my)
     if best is None:
@@ -665,7 +686,7 @@ def _edge_line(pts, P, Q):
     return ln + (len(inl) / n,)
 
 
-def _page_lines(comp, w):
+def _page_lines(comp, w, h=None):
     """Four edge lines of one page blob: {"top", "right", "bottom", "left"}.
 
     Each line is (cx, cy, dx, dy, residual, support): `support` is the share
@@ -679,7 +700,7 @@ def _page_lines(comp, w):
     lines = {}
     for name, P, Q in (("top", tl, tr), ("right", tr, br),
                        ("bottom", br, bl), ("left", bl, tl)):
-        ln = _edge_line(_side_points(comp, w, P, Q), P, Q)
+        ln = _edge_line(_side_points(comp, w, P, Q, h), P, Q)
         if ln is None:
             return None
         lines[name] = ln
@@ -955,19 +976,10 @@ PHOTO_REACH = 6         # cells: dark things smaller than twice this are
                         # 8-12 cells across), larger ones are the light
 
 
-def find_photo_block(path, side=400):
-    """Bounding box (x, y, w, h) of a face photo on the page, or None.
-
-    Cells of the analysis image that are mostly darker than the paper, joined
-    4-connected; the largest such group is a photograph when it is compact
-    (it fills at least half of its own box), of a portrait's proportions and
-    of a photograph's size. The box is then grown a little: the dark cells
-    are the hair, the eyes, the collar, and they reach the top of a portrait
-    but not quite its sides or its bottom (a light jacket). Measured on a
-    passport photo, 15% at the sides and bottom and 5% at the top covers the
-    picture without reaching the printed ornament around it. The page is
-    upright by the time this runs, so "top" means top.
-    """
+def _dark_cells(path, side):
+    """Cells of a downscaled copy that are mostly darker than the paper NEAR
+    them: (dark, cw, ch, w, w0) or None when the image is too small.
+    Shared by the face-photo search on a page and on a card."""
     w0, h0 = dims(path)
     if w0 >= h0:
         w, h = side, max(1, round(side * h0 / w0))
@@ -1024,6 +1036,27 @@ def find_photo_block(path, side=400):
                         cnt += 1
             if cnt >= PHOTO_CELL_MIN * c * c:
                 dark[cy * cw + cx] = 1
+    return dark, cw, ch, w, w0
+
+
+def find_photo_block(path, side=400):
+    """Bounding box (x, y, w, h) of a face photo on the page, or None.
+
+    Cells of the analysis image that are mostly darker than the paper, joined
+    4-connected; the largest such group is a photograph when it is compact
+    (it fills at least half of its own box), of a portrait's proportions and
+    of a photograph's size. The box is then grown a little: the dark cells
+    are the hair, the eyes, the collar, and they reach the top of a portrait
+    but not quite its sides or its bottom (a light jacket). Measured on a
+    passport photo, 15% at the sides and bottom and 5% at the top covers the
+    picture without reaching the printed ornament around it. The page is
+    upright by the time this runs, so "top" means top.
+    """
+    got = _dark_cells(path, side)
+    if got is None:
+        return None
+    dark, cw, ch, w, w0 = got
+    c = PHOTO_CELL
     # The largest dark block is not always the photo: a shadow along the
     # spine can be larger. Blocks are taken largest first, and the first one
     # shaped like a photograph wins.
@@ -1097,6 +1130,108 @@ def spread_turn(path, axis, report):
                   f"photo to tell up from down — turned {turn}°, pass "
                   f"--rotate if it came out upside down")
     return turn
+
+
+# -------------------------------------------------------------------- cards
+#
+# An identity card, a driving licence, a bank card: ISO/IEC 7810 ID-1, 85.60 x
+# 53.98 mm, corners rounded to 3.18 mm. It is photographed far more often than
+# any sheet, usually both sides, usually in a hand. What makes it a card and
+# not a sheet is its proportion -- 1.586, where A4 is 1.414 and a passport
+# page 1.42 -- and a card is laid out at its real size, front above back, on
+# one A4: the copy an office asks for.
+
+CARD_MM = (85.60, 53.98)
+CARD_RADIUS_MM = 3.18
+CARD_ASPECT = (1.50, 1.68)  # measured long/short of the fitted quad; 1.586
+                            # true, perspective moves it a few percent
+CARD_MIN = 2.0          # % of the frame a card must cover
+CARD_FILL = 0.6         # blob pixels / fitted quad: the face photo, the
+                        # print and the glare are holes in the paper mask
+CARD_OF_SPREAD = 0.7    # a card this much of a "spread's" area is that
+                        # spread -- one card split at a kink, not two pages
+CARD_GAP = 4.0          # % of a card's short side: two card-shaped regions
+                        # closer than this are two pages of one booklet
+
+
+def _card_quad(comp, w, h=None):
+    """The fitted quad of one blob if it is shaped like an ID-1 card, or None.
+
+    Returns (quad, aspect) with the quad as tl,tr,br,bl at analysis scale.
+    A card is rigid and flat, so its corners stay near square in any sane
+    photo (60-120 degrees) and its opposite sides near equal; its corners
+    are rounded, which the support-line fit ignores -- only the middle 80%
+    of each side is fitted, and the lines meet where the square corner
+    would be.
+    """
+    # frame-border pixels are no edge (see _side_points); a card that really
+    # reaches the border keeps them, or it would have a side with no points
+    lines = _page_lines(comp, w, h) or _page_lines(comp, w)
+    if lines is None:
+        return None
+    q = [_cross(lines["top"], lines["left"]), _cross(lines["top"], lines["right"]),
+         _cross(lines["bottom"], lines["right"]), _cross(lines["bottom"], lines["left"])]
+    if None in q:
+        return None
+    for i in range(4):
+        if not 60 <= _angle(q[(i - 1) % 4], q[i], q[(i + 1) % 4]) <= 120:
+            return None
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    top, bot, lef, rig = d(q[0], q[1]), d(q[3], q[2]), d(q[0], q[3]), d(q[1], q[2])
+    if max(top, bot) > 1.35 * min(top, bot) or max(lef, rig) > 1.35 * min(lef, rig):
+        return None
+    area = _shoelace(q)
+    if area <= 0 or not CARD_FILL <= len(comp) / area <= 1.1:
+        return None
+    wd, ht = (top + bot) / 2, (lef + rig) / 2
+    aspect = max(wd, ht) / min(wd, ht)
+    if not CARD_ASPECT[0] <= aspect <= CARD_ASPECT[1]:
+        return None
+    return q, aspect
+
+
+def detect_cards(src, vc):
+    """One or two ID-1 cards in the frame: ([quad, ...], why) or (None, why).
+
+    Every reading of "paper" the spread detector uses is tried in turn -- a
+    card is rarely white: pink, blue-grey, laminated -- and in each the few
+    largest regions are fitted. Two cards must be of a size (a front and a
+    back) and apart: two card-shaped regions touching along a side are the
+    pages of a booklet, which is the spread detector's business.
+    """
+    V, C, w, h, w0, h0 = vc
+    n = w * h
+    whys = []
+    for mode in ("paper", "tinted", "otsu"):
+        mask = paper_mask(src, vc=vc, mode=mode)[0]
+        found = []
+        for comp in _components(mask, w, h)[:4]:
+            share = 100.0 * len(comp) / n
+            if share < CARD_MIN:
+                break
+            got = _card_quad(comp, w, h)
+            if got:
+                found.append((got[0], got[1], share))
+        if not found:
+            whys.append(f"{mode}: no card-shaped region")
+            continue
+        found = found[:2]
+        if len(found) == 2:
+            a1, a2 = _shoelace(found[0][0]), _shoelace(found[1][0])
+            short = math.sqrt(min(a1, a2) / CARD_ASPECT[0])
+            gap = min(math.hypot(p[0] - r[0], p[1] - r[1])
+                      for p in found[0][0] for r in found[1][0])
+            if min(a1, a2) < 0.6 * max(a1, a2):
+                found = found[:1]
+            elif gap < CARD_GAP / 100.0 * short:
+                return None, (f"{mode}: two card-shaped regions touching — "
+                              f"a booklet, not two cards")
+        sx, sy = w0 / w, h0 / h
+        quads = [[(p[0] * sx, p[1] * sy) for p in q] for q, _, _ in found]
+        why = ", ".join(f"{s:.0f}% of the frame, sides {a:.2f}:1"
+                        for _, a, s in found)
+        return quads, f"{why}, {mode} paper mask"
+    return None, "; ".join(whys)
 
 
 def rectify(src, dst, quad, inset_pct, cap=None, cap_turns=False, size=None):
@@ -1460,6 +1595,9 @@ SPINE_BAND = 8.0        # % of the spread width kept clear around the spine
 def erase_fingers(path, dst, axis, side=520):
     """Repaint a finger holding the booklet open, in its page's own tone.
 
+    `axis` is the spread's ("h" pages side by side, "v" stacked), or None for
+    a card: no spine to spare, and one tone for the whole piece.
+
     The hand that holds a spread open lies over its OUTER edge, and it is not
     something `clean_border` can take: a thumb is as bright as the paper, so
     the side it sits on is judged a shaded part of the document and kept. What
@@ -1500,9 +1638,12 @@ def erase_fingers(path, dst, axis, side=520):
     if axis == "h":
         half = w * SPINE_BAND / 200.0
         spine = lambda x, y: abs(x - w / 2) < half
-    else:
+    elif axis == "v":
         half = h * SPINE_BAND / 200.0
         spine = lambda x, y: abs(y - h / 2) < half
+    else:
+        # a card has no spine: one piece, one tone
+        spine = lambda x, y: False
     depth = max(3, int(min(w, h) * FINGER_DEPTH / 100.0))
     reach = bytearray(n)
     q = collections.deque()
@@ -1536,17 +1677,20 @@ def erase_fingers(path, dst, axis, side=520):
     # each half of the spread is painted in its OWN paper tone: a pink page
     # patched with the white page's white would leave a white hole in it
     tones = []
-    for k in range(2):
+    for k in range(2 if axis else 1):
         rs, gs, bs = [], [], []
         for y in range(h):
             for x in range(w):
-                inside = (x < w / 2) if axis == "h" else (y < h / 2)
+                inside = (True if not axis else
+                          (x < w / 2) if axis == "h" else (y < h / 2))
                 i = y * w + x
                 if inside == (k == 0) and not reach[i] and V[i] >= 0.8 * paper:
                     rs.append(buf[3 * i]); gs.append(buf[3 * i + 1]); bs.append(buf[3 * i + 2])
         med = lambda v: sorted(v)[len(v) // 2] if v else 255
         tones.append(f"rgb({med(rs)},{med(gs)},{med(bs)})")
-    if axis == "h":
+    if not axis:
+        tone_img = ["-size", f"{w0}x{h0}", f"xc:{tones[0]}"]
+    elif axis == "h":
         tone_img = ["-size", f"{w0 // 2}x{h0}", f"xc:{tones[0]}",
                     "-size", f"{w0 - w0 // 2}x{h0}", f"xc:{tones[1]}", "+append"]
     else:
@@ -1610,6 +1754,148 @@ def rasterize(src, workdir, min_px=2400, tag="s00"):
     run(["pdftoppm", "-r", str(dpi), "-png", str(src), prefix])
     return [os.path.join(workdir, f) for f in sorted(os.listdir(workdir))
             if f.startswith(f"{tag}-page") and f.endswith(".png")]
+
+
+CARD_FACE_DARK = 0.30   # share of dark cells in the photo's place
+CARD_FACE_RUN = 0.20    # share of its columns dark top to bottom for half
+                        # its height -- hair, face, collar in one run, where
+                        # lines of text leave gaps between them
+
+
+def card_face(path):
+    """Where a card's face photo is: "left", "right", or None (a back).
+
+    A card's front carries the holder's photo in a known place: the left
+    third, most of the height (an ID card, a Russian or EU driving licence).
+    So rather than search, the two places it can be -- as shot, and turned
+    half round -- are measured and compared. A place holds a photo when its
+    cells are dark against the card's paper near them (the same estimate as
+    the page's face search, so a shadow larger than the photo is light, not
+    ink) AND dark in unbroken columns: text has gaps between its lines, a
+    portrait does not. Measured on eight rectified cards: fronts 0.38-0.62
+    dark and 0.20-0.60 in columns on the photo side; backs 0.14-0.15 and 0.00
+    on both sides. A hard shadow over the far side can pass too; then the
+    darker, more columnar side wins, and a tie keeps the card as shot.
+    """
+    got = _dark_cells(path, 200)
+    if got is None:
+        return None
+    dark, cw, ch, _, _ = got
+    ya, yb = int(0.10 * ch), int(0.95 * ch)
+
+    def place(x0, x1):
+        cols = range(int(x0 * cw), int(x1 * cw))
+        cells = [dark[cy * cw + cx] for cy in range(ya, yb) for cx in cols]
+        runs = 0
+        for cx in cols:
+            best = cur = 0
+            for cy in range(ya, yb):
+                cur = cur + 1 if dark[cy * cw + cx] else 0
+                best = max(best, cur)
+            runs += best >= 0.5 * (yb - ya)
+        return sum(cells) / len(cells), runs / len(cols)
+
+    (dl, rl), (dr, rr) = place(0.03, 0.40), place(0.60, 0.97)
+    left = dl >= CARD_FACE_DARK and rl >= CARD_FACE_RUN
+    right = dr >= CARD_FACE_DARK and rr >= CARD_FACE_RUN
+    if left and right:
+        diff = (dl + rl) - (dr + rr)
+        return "left" if diff > -0.1 else "right"
+    return "left" if left else "right" if right else None
+
+
+def process_cards(src, quads, why, out_png, o, report):
+    """Each card in the frame, rectified to its real size and turned upright.
+
+    Returns a list of {"png", "front"}: the card at ID-1 size at --dpi, with
+    rounded corners and a hairline edge, and whether its face photo was
+    found. Laying them out is the caller's job, since a front and its back
+    may come from two photographs.
+    """
+    cw_px = round(CARD_MM[0] / MM * o.dpi)
+    ch_px = round(CARD_MM[1] / MM * o.dpi)
+    radius = CARD_RADIUS_MM / MM * o.dpi
+    cards = []
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    report.append(f"card: {len(quads)} ID-1 card{'s' if len(quads) > 1 else ''} "
+                  f"in the frame ({why})")
+    for k, q in enumerate(quads):
+        wide = (d(q[0], q[1]) + d(q[3], q[2])) >= (d(q[0], q[3]) + d(q[1], q[2]))
+        raw = f"{out_png}.card{k}-rect.png"
+        rectify(src, raw, q, 0.0, size=(cw_px, ch_px) if wide else (ch_px, cw_px))
+        turn = 0 if wide else 90
+        if turn:
+            magick(raw, "-rotate", "90", raw)
+        # fingers hold a card at its edges: repainted before anything is
+        # measured, so a thumb is not read as the face photo either
+        got, share = erase_fingers(raw, raw + ".fingers.png", None)
+        if got:
+            raw = got
+            report.append(f"card {k + 1}: erased a finger at the edge "
+                          f"({share:.1f}% of the card)")
+        side = card_face(raw)
+        if side == "right":
+            turn = (turn + 180) % 360
+            magick(raw, "-rotate", "180", raw)
+        front = side is not None
+        # A colour copy, not a scan: a card's tint and its security print ARE
+        # the document, so nothing is whitened. Only the light is evened --
+        # the brightness divided by a very wide blur of itself, the same
+        # factor on every channel so the colour stays -- then a gentle stretch
+        # and the page's own sharpening.
+        sig = round(cw_px / 5)
+        fixed = f"{out_png}.card{k}.png"
+        mean = float(fmt(raw, "%[fx:mean]")) or 0.5
+        magick(raw, "(", "+clone", "-colorspace", "gray", "-blur", f"0x{sig}", ")",
+               "(", "-clone", "0", "-evaluate", "multiply", f"{mean:.4f}", ")",
+               "-delete", "0", "+swap", "-compose", op_divide(), "-composite",
+               "-contrast-stretch", "0.3%x0.3%",
+               "-unsharp", f"0x1+{o.sharpen}+0.02",
+               # the rounded corners of ID-1, and a hairline so a white card
+               # still has an edge on a white page
+               "(", "-size", f"{cw_px}x{ch_px}", "xc:black", "-fill", "white",
+               "-draw", f"roundrectangle 0,0 {cw_px - 1},{ch_px - 1} "
+                        f"{radius:.1f},{radius:.1f}", ")",
+               "-alpha", "off", "-compose", "CopyOpacity", "-composite",
+               "-background", "white", "-compose", "Over", "-flatten",
+               "-fill", "none", "-stroke", "gray70", "-strokewidth",
+               str(max(1, round(o.dpi / 150))),
+               "-draw", f"roundrectangle 0,0 {cw_px - 1},{ch_px - 1} "
+                        f"{radius:.1f},{radius:.1f}",
+               fixed)
+        report.append(f"card {k + 1}: rectified to {cw_px}x{ch_px} "
+                      f"({CARD_MM[0]:.1f}x{CARD_MM[1]:.2f} mm), turned {turn}°, "
+                      + ("face photo on the left — front" if front else
+                         "no face photo — back"))
+        cards.append({"png": fixed, "front": front})
+    return cards
+
+
+def card_page(cards, out_png, o):
+    """One A4 with a card's front above its back, at their real size.
+
+    `--card-size fit` blows them up to the page width instead (each 180 mm
+    wide), for a copy that has to be read rather than filed.
+    """
+    pw = round(210 / MM * o.dpi)
+    ph = round(297 / MM * o.dpi)
+    gap = round(15 / MM * o.dpi)
+    if o.card_size == "fit":
+        cw_px = round(180 / MM * o.dpi)
+        ch_px = round(cw_px * CARD_MM[1] / CARD_MM[0])
+    else:
+        cw_px = round(CARD_MM[0] / MM * o.dpi)
+        ch_px = round(CARD_MM[1] / MM * o.dpi)
+    total = len(cards) * ch_px + (len(cards) - 1) * gap
+    y = (ph - total) // 2
+    x = (pw - cw_px) // 2
+    args = ["-size", f"{pw}x{ph}", "xc:white"]
+    for c in cards:
+        args += ["(", c["png"], "-resize", f"{cw_px}x{ch_px}!", ")",
+                 "-geometry", f"+{x}+{y}", "-compose", "Over", "-composite"]
+        y += ch_px + gap
+    magick(*args, "-colorspace", "sRGB", out_png)
+    return out_png
 
 
 def fit_photo_page(src, out_png, o, report):
@@ -1746,6 +2032,24 @@ def process_page(src, out_png, o, report):
             if not spread and o.spread == "on":
                 sys.exit("a4norm: --spread on, but no two facing pages found: "
                          + "; ".join(whys))
+        # An ID-1 card. Two separate cards in one frame beat a spread -- two
+        # card-shaped regions TOUCHING are refused as cards already, and left
+        # to the spread -- but a lone card does not: a passport's page can
+        # pass for one, while a lone card never passes for a spread.
+        if o.cards != "off":
+            cquads, cwhy = detect_cards(src, vc)
+            # ...unless the "spread" IS the card: split in two at a kink a
+            # glare put in its edge, its two halves are the card's area.
+            # A card that is one page of a real spread covers half of it.
+            if cquads and spread and len(cquads) == 1:
+                sarea = sum(_shoelace(q) for q in spread[0])
+                if _shoelace(cquads[0]) >= CARD_OF_SPREAD * sarea:
+                    spread = None
+            if cquads and (len(cquads) == 2 or not spread):
+                if spread:
+                    report.append(f"two cards, not a spread ({spread[2]})")
+                return (process_cards(src, cquads, cwhy, out_png, o, report),
+                        "cards", o.dpi)
     if o.rectify != "off" and not spread:
         quad, why, paper_share = detect_quad(src, pm=pm)
         if quad is None:
@@ -2307,21 +2611,81 @@ def build(sources, out, o):
     given, land in a single PDF.
     """
     with tempfile.TemporaryDirectory(prefix="a4norm-") as wd:
-        pages, n = [], 0
+        # Every raster goes through the pipeline first; cards are only laid
+        # out once all of them are in, because a card's back is usually the
+        # NEXT photograph, not the same one.
+        items, n = [], 0
         for si, src in enumerate(sources):
             if len(sources) > 1:
                 print(f"  [{si + 1}/{len(sources)}] {os.path.basename(src)}")
             rasters = rasterize(src, wd, tag=f"s{si:02d}")
             for r in rasters:
                 rep = []
-                page, is_photo, page_dpi = process_page(
-                    r, os.path.join(wd, f"out-{n:03d}.png"), o, rep)
-                pages.append((page, is_photo, page_dpi))
+                out_png = os.path.join(wd, f"out-{n:03d}.png")
+                got = process_page(r, out_png, o, rep)
+                items.append([r, out_png, got, rep])
                 n += 1
-                print(f"  page {n}:")
-                for line in rep:
-                    print(f"    - {line}")
-                cleanup(page)
+
+        # Cards pair up: two in one frame, or one each in two photographs in
+        # a row -- front above back on one page. A group needs a face photo
+        # on at least one of its cards: an identity document has one, and a
+        # bright 16:10 rectangle without one (a screen, a sign) is no card, so
+        # its photograph goes back through as a document.
+        groups, i = [], 0
+        while i < len(items):
+            got = items[i][2]
+            if got[1] == "cards":
+                if (len(got[0]) == 1 and i + 1 < len(items)
+                        and items[i + 1][2][1] == "cards"
+                        and len(items[i + 1][2][0]) == 1):
+                    groups.append([i, i + 1]); i += 2
+                    continue
+            groups.append([i]); i += 1
+        pages, pno = [], 0
+        for g in groups:
+            first = items[g[0]]
+            if first[2][1] == "cards":
+                cards = [c for k in g for c in items[k][2][0]]
+                if not any(c["front"] for c in cards):
+                    for k in g:
+                        r, out_png, _, rep = items[k]
+                        rep.append("no face photo on any card of this group — "
+                                   "not an identity card, scanned as a document")
+                        o.cards = "off"
+                        items[k][2] = process_page(r, out_png + ".doc.png", o, rep)
+                        o.cards = "auto"
+                        pno += 1
+                        print(f"  page {pno}:")
+                        for line in rep:
+                            print(f"    - {line}")
+                        pages.append(items[k][2])
+                        cleanup(items[k][2][0])
+                    continue
+                # the front goes on top; with two fronts or none, input order
+                cards.sort(key=lambda c: not c["front"])
+                page = card_page(cards, first[1], o)
+                pno += 1
+                print(f"  page {pno}:")
+                for k in g:
+                    for line in items[k][3]:
+                        print(f"    - {line}")
+                if len(g) > 1:
+                    print(f"    - the cards of photos {g[0] + 1} and {g[1] + 1} "
+                          f"laid out on one page, front above back")
+                print(f"    - page: {round(210 / MM * o.dpi)}x"
+                      f"{round(297 / MM * o.dpi)}px @ {o.dpi}dpi, cards at "
+                      f"{'page width' if o.card_size == 'fit' else 'real size'}")
+                pages.append((page, False, o.dpi))
+                for k in g:
+                    cleanup(items[k][1])
+                continue
+            page, is_photo, page_dpi = first[2]
+            pno += 1
+            print(f"  page {pno}:")
+            for line in first[3]:
+                print(f"    - {line}")
+            pages.append((page, is_photo, page_dpi))
+            cleanup(page)
         if o.dry_run:
             print("  (dry run — nothing written)")
             return None
@@ -2395,6 +2759,14 @@ def main():
                         "pages showing: each page is rectified on its own and "
                         "the two are joined at the fold; auto = when two "
                         "facing pages are found")
+    p.add_argument("--cards", default="auto", choices=["auto", "off"],
+                   help="an ID card or a driving licence (ISO ID-1): each card "
+                        "rectified to its real size and turned upright, front "
+                        "and back -- from one photo or two in a row -- on one "
+                        "A4, front on top")
+    p.add_argument("--card-size", default="actual", choices=["actual", "fit"],
+                   help="cards at their real 85.6x54 mm, or blown up to the "
+                        "page width")
     p.add_argument("--rectify", default="auto", choices=["auto", "on", "off"],
                    help="warp the sheet's quadrilateral flat before anything "
                         "else; auto = only when a convincing quad is found")
