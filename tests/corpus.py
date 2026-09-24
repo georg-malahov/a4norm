@@ -10,8 +10,9 @@ the format are public; the photos and their expectations are not.
     tests/corpus/
         cases.json            what each photo must come out as (see below)
         <photo>.jpg ...       the photos, named for what makes them hard
-        out/                  written by this script: PDFs, renders, reports,
-                              and sheet.png -- every input next to its page
+    tests/out/corpus/         written by this script: PDFs, renders, reports
+                              and results.json, which tests/report.py turns
+                              into tests/out/report.html
 
 cases.json is a list of objects:
 
@@ -61,7 +62,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORPUS = os.path.join(HERE, "corpus")
-OUT = os.path.join(CORPUS, "out")
+OUT = os.path.join(HERE, "out", "corpus")   # git-ignored, like the corpus
 
 sys.path.insert(0, HERE)
 import regression as R  # noqa: E402  (parse_report, Page, A4 constants)
@@ -264,32 +265,19 @@ def main():
             print(f"  x {b}")
         if status == "XPASS":
             print("      passes now -- drop its known_fail mark")
-        rows.append((src, render))
+        rows.append({
+            "suite": "corpus", "name": name, "inputs": srcs, "input": src,
+            "status": status, "failures": bad, "known": known,
+            "note": case.get("note", ""), "report": p.stdout + p.stderr,
+            "pdf": pdf if os.path.exists(pdf) else None, "render": render,
+        })
 
-    # every input beside the page it became, for the eye -- the checks above
-    # are necessary, never sufficient
-    if rows:
-        tiles = []
-        for i, (src, render) in enumerate(rows):
-            t = os.path.join(OUT, f".tile-{i}.png")
-            args = ["magick", "(", src + "[0]", "-auto-orient", "-resize",
-                    "400x400", "-background", "white", "-gravity", "center",
-                    "-extent", "420x420", ")"]
-            if render:
-                args += ["(", render, "-resize", "300x420", "-background",
-                         "white", "-gravity", "center", "-extent", "320x420", ")"]
-            else:
-                args += ["-size", "320x420", "xc:white"]
-            # no caption: -annotate needs a font, and a bare ImageMagick has
-            # none configured. The rows are in the order printed above.
-            args += ["+append", "-bordercolor", "gray70", "-border", "1", t]
-            subprocess.run(args, check=True)
-            tiles.append(t)
-        subprocess.run(["magick", *tiles, "-append",
-                        os.path.join(OUT, "sheet.png")], check=True)
-        for t in tiles:
-            os.unlink(t)
-        print(f"\ncontact sheet: {os.path.join(OUT, 'sheet.png')}")
+    # Every input beside the page it became, for the eye: the checks above
+    # are necessary, never sufficient. tests/report.py turns this into
+    # tests/out/report.html.
+    if not a.only:
+        with open(os.path.join(OUT, "results.json"), "w") as f:
+            json.dump({"a4norm": a.a4norm, "cases": rows}, f, indent=1)
     print("  ".join(f"{k} {v}" for k, v in counts.items() if v))
     return 1 if counts["FAIL"] else 0
 
