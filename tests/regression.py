@@ -120,7 +120,7 @@ def parse_report(text):
          "rectified": None, "rotated": None, "fit": None, "ink_share": None,
          "document": None}
     for l in lines:
-        m = re.match(r"rectified the sheet quad \((\d+)% of the frame\) -> (\d+)x(\d+)", l)
+        m = re.match(r"rectified the sheet quad \((?:found by its edges: )?(\d+)% of the frame.*\) -> (\d+)x(\d+)", l)
         if m:
             r["rectified"] = tuple(int(x) for x in m.groups())
         if l.startswith("kept as document, not erased or cut: "):
@@ -472,6 +472,30 @@ def landing_invoice_checks():
     ]
 
 
+def white_on_white_checks():
+    def found_by_edges(rep, page):
+        hit = [l for l in rep["lines"] if "found by its edges" in l]
+        if not hit or not rep["rectified"]:
+            raise Fail("the sheet was not found by its edges. This example is "
+                       "a white sheet on a near-white desk: brightness cannot "
+                       "see it, and it exists so that CI runs edge finding in "
+                       "both images. Report:\n    " + "\n    ".join(rep["lines"]))
+        pct, w, h = rep["rectified"]
+        if not (18 <= pct <= 35) or not (1.3 <= h / w <= 1.6):
+            raise Fail(f"edge quad {pct}% of the frame, {w}x{h}: expected the "
+                       f"sheet (25% of the frame, 1.48 tall)")
+
+    def not_blank(rep, page):
+        s = page.ink_share()
+        if not (1.0 <= s <= 15.0):
+            raise Fail(f"{s:.2f}% of the page is ink, expected 1-15%")
+
+    return [
+        ("the sheet is found by its edges, not by brightness", found_by_edges),
+        ("the page is not blank", not_blank),
+    ]
+
+
 # The landing page's own demo photos (malahov.io/products/a4norm). They are
 # NOT the same photos as notebook-photo / sample-photo: the landing notebook
 # lost its page to an edge outline around the page and a band of desk above
@@ -482,6 +506,8 @@ CASES = [
     ("sample-photo", "sample-photo.jpg", sample_checks),
     ("landing-notebook", "landing-notebook.webp", landing_notebook_checks),
     ("landing-invoice", "landing-invoice.webp", landing_invoice_checks),
+    # made by tests/make-white-on-white.sh from the synthetic invoice
+    ("white-on-white", "white-on-white.jpg", white_on_white_checks),
 ]
 
 
