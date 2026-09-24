@@ -1323,8 +1323,16 @@ def edge_map(path, hough=False):
     edge = os.path.join(work, "edges.png")
     magick(path + "[0]", "-resize", f"{w}x{h}!", "-write", "mpr:s",
            "-colorspace", "gray", "-canny", "0x2+10%+30%",
+           # -depth 8 before Canny: on an HDRI build the saturation of a
+           # near-grey photo carries tiny out-of-range values, Canny's
+           # percent thresholds scale with them, and it found almost no
+           # saturation edges (density 0.0003 against 0.012 on a non-HDRI
+           # build, on the same photo). The bot and the browser run non-HDRI
+           # builds, CI and a Mac HDRI ones, so the two took different
+           # decisions. Clamped to 8 bits, both builds agree within 4% on
+           # every photo of the corpus.
            "(", "mpr:s", "-colorspace", "HSL", "-channel", "G", "-separate",
-           "+channel", "-canny", "0x2+10%+30%", ")",
+           "+channel", "-depth", "8", "-canny", "0x2+10%+30%", ")",
            "-compose", "Lighten", "-composite", edge)
     out = None
     if hough:
