@@ -1303,12 +1303,13 @@ EDGE_SUPPORT = 0.45     # every side must be edge over this share of it
 EDGE_SHEET = 0.60       # ...and this much, before a quad replaces a sheet
 
 
-def edge_quads(path):
-    """Candidate document quads from straight edges, best first.
+def edge_map(path, hough=False):
+    """The frame's edges at the analysis scale: (E, w, h, w0, h0, hough).
 
-    Returns (cands, lines, w, h, w0, h0): cands a list of dicts {quad, score,
-    minsup, share} at the analysis scale (quad tl,tr,br,bl), lines the Hough
-    lines with a support function for any segment of them.
+    E is the edge map dilated by one step, as bytes, so that "on an edge"
+    means within 2 px of one; `hough` is ImageMagick's Hough-line MVG when
+    asked for, else None. Edges of the brightness AND of the saturation: a
+    lilac card on white paint barely steps in brightness.
     """
     w0, h0 = dims(path)
     if w0 >= h0:
@@ -1325,13 +1326,90 @@ def edge_quads(path):
            "(", "mpr:s", "-colorspace", "HSL", "-channel", "G", "-separate",
            "+channel", "-canny", "0x2+10%+30%", ")",
            "-compose", "Lighten", "-composite", edge)
-    thr = max(20, round(min(w, h) * 0.12))
-    out = run(["magick", edge, "-hough-lines", f"15x15+{thr}", "mvg:-"])
-    # a hit is an edge pixel within 2 px of the line: dilate once, look up
+    out = None
+    if hough:
+        thr = max(20, round(min(w, h) * 0.12))
+        out = run(["magick", edge, "-hough-lines", f"15x15+{thr}", "mvg:-"])
     E = subprocess.run(["magick", edge, "-morphology", "Dilate", "Square:2",
                         "-depth", "8", "gray:-"],
                        check=True, capture_output=True).stdout
     shutil.rmtree(work, ignore_errors=True)
+    return E, w, h, w0, h0, out
+
+
+def _seg_support(E, w, h):
+    """support(a, b): the share of the straight segment a-b lying on an edge."""
+    def support(a, b):
+        n = max(10, int(math.hypot(b[0] - a[0], b[1] - a[1])))
+        hit = 0
+        for k in range(n):
+            t = (k + 0.5) / n
+            x = round(a[0] + (b[0] - a[0]) * t)
+            y = round(a[1] + (b[1] - a[1]) * t)
+            hit += 1 if 0 <= x < w and 0 <= y < h and E[y * w + x] > 128 else 0
+        return hit / n
+    return support
+
+
+CARD_ALONE = 0.6        # edge support beyond a corner above which the card
+                        # is part of something larger
+CARD_RUN_ON = (0.03, 0.18)  # the stretch past each corner that is looked at,
+                            # as shares of that side's length
+
+
+def card_run_on(q, seg):
+    """How far a card's sides run on past its corners, as edge: the largest
+    support found on the eight stretches beyond the four corners.
+
+    A card is a thing on its own: its edges END at its corners. What else has
+    the ID-1 proportion is usually a piece of something larger -- the upper
+    third of a calendar, a panel of a form, a page of an open passport -- and
+    there at least one straight side carries on past the "corner", because
+    the thing does. Measured: every real card in the corpus 0.00-0.28, a wall
+    calendar 1.00, a passport page in a hand 1.00.
+    """
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    worst = 0.0
+    g0, g1 = CARD_RUN_ON
+    for i in range(4):
+        a, b = q[i], q[(i + 1) % 4]
+        L = d(a, b)
+        if L < 1:
+            continue
+        ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+        worst = max(worst,
+                    seg((a[0] - ux * g0 * L, a[1] - uy * g0 * L),
+                        (a[0] - ux * g1 * L, a[1] - uy * g1 * L)),
+                    seg((b[0] + ux * g0 * L, b[1] + uy * g0 * L),
+                        (b[0] + ux * g1 * L, b[1] + uy * g1 * L)))
+    return worst
+
+
+def cards_alone(src, quads, report):
+    """Keep only the cards that are things on their own (card_run_on)."""
+    E, w, h, w0, h0, _ = edge_map(src)
+    seg = _seg_support(E, w, h)
+    kept = []
+    for q in quads:
+        runs = card_run_on([(x * w / w0, y * h / h0) for x, y in q], seg)
+        if runs >= CARD_ALONE:
+            report.append(f"card-shaped region refused: a side runs on past "
+                          f"its corner ({runs:.0%} edge) — part of something "
+                          f"larger")
+        else:
+            kept.append(q)
+    return kept
+
+
+def edge_quads(path):
+    """Candidate document quads from straight edges, best first.
+
+    Returns (cands, (lines, support, seg_support), w, h, w0, h0): cands a
+    list of dicts {quad, score, minsup, share} at the analysis scale (quad
+    tl,tr,br,bl), lines the Hough lines, support() the edge share of a
+    stretch of one of them, seg_support() of any segment.
+    """
+    E, w, h, w0, h0, out = edge_map(path, hough=True)
     lines = []
     for l in out.splitlines():
         m = re.match(r"line ([-\d.]+),([-\d.]+) ([-\d.]+),([-\d.]+)\s+# (\d+)", l)
@@ -1364,16 +1442,7 @@ def edge_quads(path):
         i1 = max(0, min(2 * s + 1, round(tb) + s + 1))
         return (ln["pre"][i1] - ln["pre"][i0]) / max(1, i1 - i0)
 
-    def seg_support(a, b):
-        """Share of the straight segment a-b that lies on an edge."""
-        n = max(10, int(math.hypot(b[0] - a[0], b[1] - a[1])))
-        hit = 0
-        for k in range(n):
-            t = (k + 0.5) / n
-            x = round(a[0] + (b[0] - a[0]) * t)
-            y = round(a[1] + (b[1] - a[1]) * t)
-            hit += 1 if 0 <= x < w and 0 <= y < h and E[y * w + x] > 128 else 0
-        return hit / n
+    seg_support = _seg_support(E, w, h)
 
     horiz = sorted((l for l in lines if abs(l["l"][2]) >= abs(l["l"][3])),
                    key=lambda l: -l["cnt"])[:EDGE_LINES]
@@ -1529,8 +1598,12 @@ def edge_document(src, bright_quad, o, report):
     aspect = max(wd, ht) / max(1e-6, min(wd, ht))
     why = (f"found by its edges: {best['share']:.0%} of the frame, sides "
            f"{aspect:.2f}:1, outline {best['minsup']:.0%}+ edge")
-    if o.cards != "off" and CARD_ASPECT[0] <= aspect <= CARD_ASPECT[1]:
-        return ("cards", [full(q)], why)
+    if (o.cards != "off" and CARD_ASPECT[0] <= aspect <= CARD_ASPECT[1]):
+        runs = card_run_on(q, seg_support)
+        if runs < CARD_ALONE:
+            return ("cards", [full(q)], why)
+        report.append(f"card-shaped outline refused: a side runs on past its "
+                      f"corner ({runs:.0%} edge) — part of something larger")
     only_spread = False
     edged_sheet = False
     if bright_quad is not None:
@@ -1589,10 +1662,16 @@ def edge_document(src, bright_quad, o, report):
     # ...and it must be shaped like a sheet: A4 1.41, Letter 1.29, a
     # passport page 1.42. A square of railings around a card in a hand
     # measured 1.05 and cut the card's bottom off.
+    # ...and, like a card, a thing on its own: a straight side that carries
+    # on past the corner is a line across something larger, not its border.
     if (not only_spread and best["minsup"] >= EDGE_SHEET
             and 0.15 <= best["share"] <= EDGE_SHEET_MAX
             and EDGE_SHEET_ASPECT[0] <= aspect <= EDGE_SHEET_ASPECT[1]):
-        return ("sheet", full(q), why)
+        runs = card_run_on(q, seg_support)
+        if runs < CARD_ALONE:
+            return ("sheet", full(q), why)
+        report.append(f"edge outline refused as a sheet: a side runs on past "
+                      f"its corner ({runs:.0%} edge)")
     return None
 
 
@@ -2513,6 +2592,10 @@ def clean_specks(page, dpi):
     return share
 
 
+PATCH_MONO = 20         # 95th-percentile chroma under which a kept photo
+                        # is black-and-white and toned as grey
+
+
 def photo_patch(keep, scale, off, o, out_png):
     """ImageMagick args that lay the gently toned face photo over the page.
 
@@ -2535,11 +2618,12 @@ def photo_patch(keep, scale, off, o, out_png):
     rgb = subprocess.run(["magick", str(src), *crop, "-resize", f"{cw}x{chh}!",
                           "-depth", "8", "rgb:-"],
                          check=True, capture_output=True).stdout
-    # the MEDIAN chroma: a red ornament the box clips must not make a
-    # black-and-white photo count as a colour one
+    # Grey only when the patch has no colour at all: its 95th-percentile
+    # chroma under PATCH_MONO. A median said "grey" for a calendar row whose
+    # red day-marker the box took in, and the marker came out black.
     chroma = sorted(max(rgb[j:j + 3]) - min(rgb[j:j + 3])
-                    for j in range(0, len(rgb), 3))[len(rgb) // 6]
-    mono = o.gray or chroma < 12
+                    for j in range(0, len(rgb), 3))[int(0.95 * (len(rgb) // 3 - 1))]
+    mono = o.gray or chroma < PATCH_MONO
     # White goes at the photo's own light background when it has one -- a
     # passport photo's card sits a few percent under the page's paper, and
     # leaving it there draws a grey rectangle on a white page -- but never
@@ -2661,9 +2745,13 @@ def locate(src, o, report):
         if cquads and spread and len(cquads) == 1:
             cquads = None
         if cquads and (len(cquads) == 2 or not spread):
-            if spread:
-                report.append(f"two cards, not a spread ({spread[2]})")
-            return ("cards", cquads, cwhy)
+            # only now, when they would be laid out as cards: a card is a
+            # thing on its own (card_run_on)
+            alone = cards_alone(src, cquads, report)
+            if len(alone) == len(cquads):
+                if spread:
+                    report.append(f"two cards, not a spread ({spread[2]})")
+                return ("cards", cquads, cwhy)
     if spread:
         return ("spread", spread)
 
