@@ -25,8 +25,9 @@ cases.json is a list of objects:
                                        # a4norm reports it)
                 "lines_across": true,  # text runs across the page
                 "turn": 90,            # the spread was turned this much
-                "spread_aspect": [1.3, 1.55]},  # long/short of the joined
+                "spread_aspect": [1.3, 1.55],   # long/short of the joined
                                        # spread: 176x125 mm is 1.41
+                "clean_corners": true},  # no grey left in the page corners
      "known_fail": "why"}              # optional: reported, not counted
 
 A case can also be several photos going into one document -- a card's front
@@ -75,7 +76,7 @@ def load_a4norm(path):
     return mod
 
 
-def check(case, rep, page, render, A):
+def check(case, rep, page, render, A, pdf=None):
     """Failures of one case, as a list of strings."""
     exp = case.get("expect", {})
     bad = []
@@ -106,6 +107,43 @@ def check(case, rep, page, render, A):
         if fronts != exp["fronts"]:
             bad.append(f"{fronts} front(s) with a face photo, expected "
                        f"{exp['fronts']}")
+    if exp.get("clean_corners"):
+        # A white page does not end in grey corners. What a shadow over the
+        # sheet's corner leaves is GRAIN: many small separate grey flecks.
+        # A share of grey pixels cannot tell that from print that reaches a
+        # corner (a footer rule ending there measured 0.5%), a count of
+        # flecks can: small 8-connected grey marks in each corner box.
+        # at 150 dpi: at the 50 dpi of the other checks the flecks are
+        # averaged away, and a page full of grain passes as clean
+        hi = page
+        if pdf:
+            base = os.path.splitext(pdf)[0] + "-150"
+            R.sh("pdftoppm", "-r", "150", "-png", "-singlefile", pdf, base)
+            hi = R.Page(base + ".png")
+            os.unlink(base + ".png")
+        page = hi
+        cw, ch = page.w // 10, page.h // 10
+        for name, x0, y0 in (("top-left", 0, 0), ("top-right", page.w - cw, 0),
+                             ("bottom-left", 0, page.h - ch),
+                             ("bottom-right", page.w - cw, page.h - ch)):
+            grey = {(x, y) for y in range(y0, y0 + ch) for x in range(x0, x0 + cw)
+                    if page.lum[y * page.w + x] < 230}
+            flecks = 0
+            while grey:
+                stack = [grey.pop()]
+                size = 1
+                while stack:
+                    x, y = stack.pop()
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            q = (x + dx, y + dy)
+                            if q in grey:
+                                grey.discard(q); stack.append(q); size += 1
+                if size <= 150:     # 4 mm² at 150 dpi, or less
+                    flecks += 1
+            if flecks > 2:
+                bad.append(f"{name} corner holds {flecks} grey flecks "
+                           f"(expected <= 2): shadow grain left on the paper")
     if "turn" in exp:
         got = 0
         for l in lines:
@@ -183,7 +221,7 @@ def main():
             R.sh("pdftoppm", "-r", str(R.RENDER_DPI), "-png", "-singlefile",
                  pdf, base)
             render = base + ".png"
-            bad = check(case, rep, R.Page(render), render, A)
+            bad = check(case, rep, R.Page(render), render, A, pdf)
             npages = R.pdf_facts(pdf)[0]
             if npages != case.get("expect", {}).get("pages", npages):
                 bad.append(f"{npages} page(s) in the PDF, expected "
