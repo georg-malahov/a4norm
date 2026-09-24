@@ -2563,486 +2563,548 @@ def photo_patch(keep, scale, off, o, out_png):
     return [patch, "-geometry", f"{x:+d}{y:+d}", "-compose", "Over", "-composite"]
 
 
-def process_page(src, out_png, o, report):
-    # 0. document or photo? Decided BEFORE anything touches the pixels, because
-    #    the photo path is a different pipeline, not this one with stages turned
-    #    off. --photo on used to still run the rectify, which is exactly the
-    #    kind of leak the early return exists to make impossible.
-    quad, why, paper_share = None, None, 1.0
-    spread = None
-    if o.photo == "on":
-        report.append("--photo on — kept as a photo, not scanned")
-        return fit_photo_page(src, out_png, o, report)
-    if o.rectify != "off":
-        vc = _vc(src)
-        pm = paper_mask(src, vc=vc)
-        # A spread is tried FIRST: its two pages are also two perfectly good
-        # sheet candidates, and the single-sheet rule would take the larger
-        # one and drop its facing page without a word. The strict reading of
-        # "paper" goes first, so a plain sheet is judged exactly as before;
-        # the looser ones only get a say when it found no spread.
-        if o.spread != "off":
-            whys = []
-            for mode in ("paper", "tinted", "otsu"):
-                cand = pm if mode == "paper" else paper_mask(src, vc=vc, mode=mode)
-                squads, axis, swhy = detect_spread(cand)
-                if squads:
-                    if mode != "paper":
-                        swhy += f", {mode} paper mask"
-                    spread = (squads, axis, swhy)
-                    break
-                whys.append(f"{mode}: {swhy}")
-            if not spread and o.spread == "on":
-                sys.exit("a4norm: --spread on, but no two facing pages found: "
-                         + "; ".join(whys))
-        # An ID-1 card. Two separate cards in one frame beat a spread -- two
-        # card-shaped regions TOUCHING are refused as cards already, and left
-        # to the spread -- but a lone card does not: a passport's page can
-        # pass for one, while a lone card never passes for a spread.
-        if o.cards != "off":
-            cquads, cwhy = detect_cards(src, vc)
-            # ...unless the "spread" IS the card: split in two at a kink a
-            # glare put in its edge, its two halves are the card's area.
-            # A card that is one page of a real spread covers half of it.
-            if cquads and spread and len(cquads) == 1:
-                sarea = sum(_shoelace(q) for q in spread[0])
-                # ...and not much larger than it either: a card-shaped
-                # outline around both pages is the open passport itself
-                # (74% of a frame whose spread was 66%), and taking it as a
-                # card cost a whole second run once no face was on it
-                # It can only be that when the spread was ONE region cut at a
-                # kink. Two separate paper regions are two pages -- a whole
-                # open passport is card-shaped too (74% of a frame, 1.56:1),
-                # and only the face test used to keep it from becoming one.
-                if (CARD_OF_SPREAD * sarea <= _shoelace(cquads[0]) <= 1.25 * sarea
-                        and "folded in the middle" in spread[2]):
-                    spread = None
-            if cquads and spread and len(cquads) == 1:
-                cquads = None
-            if cquads and (len(cquads) == 2 or not spread):
-                if spread:
-                    report.append(f"two cards, not a spread ({spread[2]})")
-                return (process_cards(src, cquads, cwhy, out_png, o, report),
-                        "cards", o.dpi)
-    edge = None
-    if o.rectify != "off" and not spread:
-        quad, why, paper_share = detect_quad(src, pm=pm)
-        # The document's edges, read as lines -- for what brightness cannot
-        # see: a white page on a white desk, a pale card on white paint, a
-        # page whose colour pictures broke the paper mask into a scrap.
-        if o.edges != "off":
-            edge = edge_document(src, quad, o, report)
-            if edge and edge[0] == "cards":
-                return (process_cards(src, edge[1], edge[2], out_png, o, report),
-                        "cards", o.dpi)
-            if edge and edge[0] == "spread":
-                spread, quad = (edge[1], edge[2], edge[3]), None
-            elif edge and edge[0] == "sheet":
-                quad, why = edge[1], edge[2]
-    if o.rectify != "off" and not spread:
-        if quad is None:
-            # Brightness could not find the sheet. Ask the segmentation helper,
-            # if this build has one, and judge its answer by the same rules.
-            # Only here, never on the common path: the model costs a second and
-            # buys nothing when the page is already the brightest thing around.
-            seg_quad, seg_why, seg_share = segment_quad(src)
-            if seg_quad is not None:
-                quad = seg_quad
-                why = f"{seg_why}, found by segmentation after brightness failed ({why})"
-                paper_share = max(paper_share, seg_share)
-            elif "no segmentation helper" not in seg_why:
-                report.append(f"segmentation did not find a sheet either: {seg_why}")
-        if quad is None:
-            if o.rectify == "on":
-                sys.exit(f"a4norm: --rectify on, but no sheet quad found: {why}")
-            report.append(f"no rectification: {why}")
-            # No sheet quad AND almost no paper-like area means there is no
-            # document in the frame — somebody is just turning photos into a
-            # PDF. Scanner treatment would wreck that: it bleaches the picture,
-            # straightens it by a few degrees off some accidental edge, and
-            # lays it out as if it were a text block. Measured paper-like
-            # area: 9% for a photo of a screen, 40-83% for every real document
-            # and test page here — the threshold sits in a wide gap.
-            if o.photo == "auto" and paper_share * 100 < o.photo_paper:
-                report.append(f"no document in the frame (paper-like area "
-                              f"{paper_share:.0%}, under --photo-paper "
-                              f"{o.photo_paper:.0f}%) — kept as a photo, not "
-                              f"scanned")
-                return fit_photo_page(src, out_png, o, report)
-            report.append(f"paper-like area {paper_share:.0%} >= --photo-paper "
-                          f"{o.photo_paper:.0f}% — treated as a document")
+class Job:
+    """One page on its way through the pipeline.
 
-    # ---- from here down it is a document. There is no `photo` flag any more.
-    cur = src
-    step = 0
-    rectified = False
+    `cur` is the page as it stands, `report` what a4norm prints about it.
+    Every stage writes its result next to `out_png` as a numbered
+    intermediate -- `.s3-flat.png` -- which is what makes a bad page
+    debuggable: the step that broke it is on disk.
+    """
 
-    def stage(name, *args, src_override=None):
-        nonlocal cur, step
-        step += 1
-        dst = f"{out_png}.s{step}-{name}.png"
-        magick(src_override or cur, *args, dst)
-        cur = dst
+    def __init__(self, src, out_png, o, report):
+        self.src, self.out_png, self.o, self.report = src, out_png, o, report
+        self.cur = src
+        self.step = 0
+
+    def path(self, name):
+        """The next intermediate's file name."""
+        self.step += 1
+        return f"{self.out_png}.s{self.step}-{name}.png"
+
+    def stage(self, name, *args):
+        """One ImageMagick pass over the current page."""
+        dst = self.path(name)
+        magick(self.cur, *args, dst)
+        self.cur = dst
         return dst
 
-    # 1. rectify: warp the sheet's own quadrilateral onto a rectangle. This has
-    #    to come first — every later step assumes the page is flat, and a page
-    #    shot at an angle is the one thing a rectangular crop can never fix.
+    def say(self, line):
+        self.report.append(line)
+
+
+def locate(src, o, report):
+    """What is in the frame, before anything touches the pixels.
+
+    Returns one of:
+      ("photo",)                    no document: the passthrough
+      ("cards", quads, why)         one or two ID-1 cards
+      ("spread", (quads, axis, why))  an open booklet
+      ("sheet", quad, why)          one sheet's quadrilateral
+      ("frame",)                    a document that fills the frame, or one
+                                    that could not be found: trimmed instead
+    """
+    # Document or photo is decided BEFORE anything touches the pixels,
+    # because the photo path is a different pipeline, not this one with
+    # stages turned off. --photo on used to still run the rectify, which is
+    # exactly the kind of leak the early return exists to make impossible.
+    if o.photo == "on":
+        report.append("--photo on — kept as a photo, not scanned")
+        return ("photo",)
+    if o.rectify == "off":
+        return ("frame",)
+    quad, why, paper_share = None, None, 1.0
+    spread = None
+    vc = _vc(src)
+    pm = paper_mask(src, vc=vc)
+    # A spread is tried FIRST: its two pages are also two perfectly good
+    # sheet candidates, and the single-sheet rule would take the larger one
+    # and drop its facing page without a word. The strict reading of
+    # "paper" goes first, so a plain sheet is judged exactly as before; the
+    # looser ones only get a say when it found no spread.
+    if o.spread != "off":
+        whys = []
+        for mode in ("paper", "tinted", "otsu"):
+            cand = pm if mode == "paper" else paper_mask(src, vc=vc, mode=mode)
+            squads, axis, swhy = detect_spread(cand)
+            if squads:
+                if mode != "paper":
+                    swhy += f", {mode} paper mask"
+                spread = (squads, axis, swhy)
+                break
+            whys.append(f"{mode}: {swhy}")
+        if not spread and o.spread == "on":
+            sys.exit("a4norm: --spread on, but no two facing pages found: "
+                     + "; ".join(whys))
+    # An ID-1 card. Two separate cards in one frame beat a spread -- two
+    # card-shaped regions TOUCHING are refused as cards already, and left to
+    # the spread -- but a lone card does not: a passport's page can pass for
+    # one, while a lone card never passes for a spread.
+    if o.cards != "off":
+        cquads, cwhy = detect_cards(src, vc)
+        # ...unless the "spread" IS the card: a licence split in two at a
+        # kink a glare put in its edge, its halves the card's area. That can
+        # only be when the spread was ONE region cut at a kink: two separate
+        # paper regions are two pages, and a whole open passport is
+        # card-shaped too (74% of a frame, 1.56:1). A card much larger than
+        # the spread is that open passport itself.
+        if cquads and spread and len(cquads) == 1:
+            sarea = sum(_shoelace(q) for q in spread[0])
+            if (CARD_OF_SPREAD * sarea <= _shoelace(cquads[0]) <= 1.25 * sarea
+                    and "folded in the middle" in spread[2]):
+                spread = None
+        if cquads and spread and len(cquads) == 1:
+            cquads = None
+        if cquads and (len(cquads) == 2 or not spread):
+            if spread:
+                report.append(f"two cards, not a spread ({spread[2]})")
+            return ("cards", cquads, cwhy)
     if spread:
-        squads, axis, swhy = spread
-        d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
-        # Both pages are warped to ONE size, the mean of what the photo shows:
-        # a booklet's pages are equal, and joining two rectangles of different
-        # sizes along the spine would leave a step in the edge.
-        pw_ = sum((d(q[0], q[1]) + d(q[3], q[2])) / 2 for q in squads) / 2
-        ph_ = sum((d(q[0], q[3]) + d(q[1], q[2])) / 2 for q in squads) / 2
-        sw, sh_ = (2 * pw_, ph_) if axis == "h" else (pw_, 2 * ph_)
-        k = 1.0
-        if o.fit == "auto":
-            # the spread may turn a quarter, so cap it against the page
-            # either way round: long side against long side
-            cap = (round(210 / MM * o.dpi), round(297 / MM * o.dpi))
-            k = min(1.0, max(cap) / max(sw, sh_), min(cap) / min(sw, sh_))
-        W1, H1 = max(50, round(pw_ * k)), max(50, round(ph_ * k))
-        halves = []
-        for idx, q in enumerate(squads):
-            step += 1
-            dst = f"{out_png}.s{step}-page{idx + 1}.png"
-            rectify(src, dst, q, o.rect_inset, size=(W1, H1))
-            halves.append(dst)
-        step += 1
-        dst = f"{out_png}.s{step}-spread.png"
-        # +repage: the joined image keeps the first page's canvas otherwise,
-        # and a canvas half the image's size shifted the spread by a page
-        # once it was rotated -- the photo-place test then read nothing
-        magick(*halves, "+append" if axis == "h" else "-append", "+repage", dst)
-        cur = dst
-        rectified = True
-        W, H = dims(cur)
-        report.append(f"spread: two facing pages ({swhy}), each rectified "
-                      f"to {W1}x{H1} and joined at the fold -> {W}x{H}")
-        step += 1
-        got, share = erase_fingers(cur, f"{out_png}.s{step}-fingers.png", axis)
-        if got:
-            cur = got
-            report.append(f"erased a finger at the outer edge ({share:.1f}% "
-                          f"of the spread)")
-        elif share > FINGER_MAX:
-            report.append(f"finger erase skipped: what looked like skin was "
-                          f"{share:.0f}% of the spread — the pages' own colour")
-    elif quad:
-        step += 1
-        dst = f"{out_png}.s{step}-rectify.png"
-        # Only for the default fit. --fit content and --fit edges derive their
-        # scale from the layout, not from the frame, and may legitimately want
-        # to blow the page up past 1:1; capping the warp would hand them fewer
-        # pixels to blow up. The auto fit on a rectified page always scales by
-        # min(pw/W, ph/H), so there the cap costs nothing and saves a resample.
-        cap = None
-        if o.fit == "auto":
-            cap = (round(210 / MM * o.dpi), round(297 / MM * o.dpi))
-            if o.landscape:
-                cap = (cap[1], cap[0])
-        W, H = rectify(src, dst, quad, o.rect_inset, cap=cap,
-                       cap_turns=(o.rotate == "auto" and not o.landscape))
-        cur = dst
-        rectified = True
-        report.append(f"rectified the sheet quad ({why}) -> {W}x{H}")
-    if rectified:
-        if not o.no_edge_clean:
-            step += 1
-            cleaned = f"{out_png}.s{step}-border.png"
-            got, share, cut, verdict = clean_border(
-                cur, cleaned, o.edge_band, o.edge_keep,
-                o.band_structure, o.band_dark)
-            kept = [f"{k} (structure {verdict[k][0]:.1f}%, "
-                    f"brightness {verdict[k][1]:.0f}% of paper)"
-                    for k in SIDES if verdict.get(k) and verdict[k][2]
-                    and verdict[k][3]]
-            if kept:
-                report.append("kept as document, not erased or cut: "
-                              + "; ".join(kept))
-            if got:
-                cur = got
-                report.append(f"erased what leaned in from outside the "
-                              f"sheet ({share:.1f}% of the page)")
-                pad = round(max(W, H) * 0.004)
-                l = cut["left"] + pad if cut["left"] else 0
-                r = cut["right"] + pad if cut["right"] else 0
-                t = cut["top"] + pad if cut["top"] else 0
-                b = cut["bottom"] + pad if cut["bottom"] else 0
-                if (l or r or t or b) and W - l - r > 100 and H - t - b > 100:
-                    stage("binding", "-crop",
-                          f"{W - l - r}x{H - t - b}+{l}+{t}", "+repage")
-                    W, H = W - l - r, H - t - b
-                    report.append(f"cut a solid band of it away: "
-                                  f"L/R/T/B = {l}/{r}/{t}/{b} px")
-                    # the crop exposes a fresh border: whatever the band was
-                    # hiding is now the outermost pixel, so flood once more
-                    step += 1
-                    again = f"{out_png}.s{step}-border2.png"
-                    got2, share2, _, _ = clean_border(
-                        cur, again, o.edge_band, o.edge_keep,
-                        o.band_structure, o.band_dark)
-                    if got2:
-                        cur = got2
-                        report.append(f"second pass on the new border "
-                                      f"({share2:.1f}%)")
-            elif share:
-                report.append(f"border cleanup skipped: it would have "
-                              f"repainted {share:.0f}% of the page")
+        return ("spread", spread)
 
-    # 2. rotate, but only when asked to. `--rotate auto` turns nothing: the
-    #    PAGE follows the picture at the fit step below, exactly as it already
-    #    does in photo mode. Turning the pixels instead assumes a wide frame
-    #    means a sideways sheet, and it usually does not -- a square notebook
-    #    page shot in a wide frame is wide because of the FRAME, and standing
-    #    its lines on end makes it unreadable. A portrait sheet genuinely
-    #    photographed sideways stays sideways, which the reader fixes with one
-    #    keypress; unreadable text is not fixable at all.
-    #    A spread is the exception, because there the evidence is on the page:
-    #    which way its lines of text run, and which side its photo is on.
+    quad, why, paper_share = detect_quad(src, pm=pm)
+    # The document's edges, read as lines -- for what brightness cannot see:
+    # a white page on a white desk, a pale card on white paint, a page whose
+    # colour pictures broke the paper mask into a scrap.
+    if o.edges != "off":
+        edge = edge_document(src, quad, o, report)
+        if edge and edge[0] == "cards":
+            return ("cards", edge[1], edge[2])
+        if edge and edge[0] == "spread":
+            return ("spread", (edge[1], edge[2], edge[3]))
+        if edge and edge[0] == "sheet":
+            quad, why = edge[1], edge[2]
+    if quad is None:
+        # Brightness could not find the sheet. Ask the segmentation helper,
+        # if this build has one, and judge its answer by the same rules. Only
+        # here, never on the common path: the model costs a second and buys
+        # nothing when the page is already the brightest thing around.
+        seg_quad, seg_why, seg_share = segment_quad(src)
+        if seg_quad is not None:
+            quad = seg_quad
+            why = f"{seg_why}, found by segmentation after brightness failed ({why})"
+            paper_share = max(paper_share, seg_share)
+        elif "no segmentation helper" not in seg_why:
+            report.append(f"segmentation did not find a sheet either: {seg_why}")
+    if quad is not None:
+        return ("sheet", quad, why)
+    if o.rectify == "on":
+        sys.exit(f"a4norm: --rectify on, but no sheet quad found: {why}")
+    report.append(f"no rectification: {why}")
+    # No sheet quad AND almost no paper-like area means there is no document
+    # in the frame — somebody is just turning photos into a PDF. Scanner
+    # treatment would wreck that: it bleaches the picture, straightens it by
+    # a few degrees off some accidental edge, and lays it out as if it were a
+    # text block. Measured paper-like area: 9% for a photo of a screen,
+    # 40-83% for every real document and test page here — the threshold sits
+    # in a wide gap.
+    if o.photo == "auto" and paper_share * 100 < o.photo_paper:
+        report.append(f"no document in the frame (paper-like area "
+                      f"{paper_share:.0%}, under --photo-paper "
+                      f"{o.photo_paper:.0f}%) — kept as a photo, not scanned")
+        return ("photo",)
+    report.append(f"paper-like area {paper_share:.0%} >= --photo-paper "
+                  f"{o.photo_paper:.0f}% — treated as a document")
+    return ("frame",)
+
+
+def a4_px(dpi):
+    """A portrait A4 page in pixels at `dpi`."""
+    return round(210 / MM * dpi), round(297 / MM * dpi)
+
+
+def rectify_spread(job, spread):
+    """Warp each page of a spread flat, join them at the fold, erase a finger.
+
+    Returns the joined size (W, H).
+    """
+    o = job.o
+    squads, axis, swhy = spread
+    d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    # Both pages are warped to ONE size, the mean of what the photo shows: a
+    # booklet's pages are equal, and joining two rectangles of different
+    # sizes along the spine would leave a step in the edge.
+    pw_ = sum((d(q[0], q[1]) + d(q[3], q[2])) / 2 for q in squads) / 2
+    ph_ = sum((d(q[0], q[3]) + d(q[1], q[2])) / 2 for q in squads) / 2
+    sw, sh_ = (2 * pw_, ph_) if axis == "h" else (pw_, 2 * ph_)
+    k = 1.0
+    if o.fit == "auto":
+        # the spread may turn a quarter, so cap it against the page either
+        # way round: long side against long side
+        cap = a4_px(o.dpi)
+        k = min(1.0, max(cap) / max(sw, sh_), min(cap) / min(sw, sh_))
+    W1, H1 = max(50, round(pw_ * k)), max(50, round(ph_ * k))
+    halves = []
+    for idx, q in enumerate(squads):
+        dst = job.path(f"page{idx + 1}")
+        rectify(job.src, dst, q, o.rect_inset, size=(W1, H1))
+        halves.append(dst)
+    dst = job.path("spread")
+    # +repage: the joined image keeps the first page's canvas otherwise, and
+    # a canvas half the image's size shifted the spread by a page once it was
+    # rotated -- the photo-place test then read nothing
+    magick(*halves, "+append" if axis == "h" else "-append", "+repage", dst)
+    job.cur = dst
+    W, H = dims(job.cur)
+    job.say(f"spread: two facing pages ({swhy}), each rectified to {W1}x{H1} "
+            f"and joined at the fold -> {W}x{H}")
+    got, share = erase_fingers(job.cur, job.path("fingers"), axis)
+    if got:
+        job.cur = got
+        job.say(f"erased a finger at the outer edge ({share:.1f}% of the spread)")
+    elif share > FINGER_MAX:
+        job.say(f"finger erase skipped: what looked like skin was "
+                f"{share:.0f}% of the spread — the pages' own colour")
+    return W, H
+
+
+def rectify_sheet(job, quad, why):
+    """Warp one sheet's quadrilateral flat. Returns its size (W, H)."""
+    o = job.o
+    dst = job.path("rectify")
+    # Capped only for the default fit. --fit content and --fit edges derive
+    # their scale from the layout, not from the frame, and may legitimately
+    # want to blow the page up past 1:1; capping the warp would hand them
+    # fewer pixels to blow up. The auto fit on a rectified page always scales
+    # by min(pw/W, ph/H), so there the cap costs nothing and saves a resample.
+    cap = None
+    if o.fit == "auto":
+        cap = a4_px(o.dpi)
+        if o.landscape:
+            cap = (cap[1], cap[0])
+    W, H = rectify(job.src, dst, quad, o.rect_inset, cap=cap,
+                   cap_turns=(o.rotate == "auto" and not o.landscape))
+    job.cur = dst
+    job.say(f"rectified the sheet quad ({why}) -> {W}x{H}")
+    return W, H
+
+
+def erase_outside(job, W, H):
+    """After a rectify: repaint what leans in from outside the sheet, and
+    crop a solid band of it (a binding) away."""
+    o = job.o
+    if o.no_edge_clean:
+        return
+    got, share, cut, verdict = clean_border(
+        job.cur, job.path("border"), o.edge_band, o.edge_keep,
+        o.band_structure, o.band_dark)
+    kept = [f"{k} (structure {verdict[k][0]:.1f}%, "
+            f"brightness {verdict[k][1]:.0f}% of paper)"
+            for k in SIDES if verdict.get(k) and verdict[k][2] and verdict[k][3]]
+    if kept:
+        job.say("kept as document, not erased or cut: " + "; ".join(kept))
+    if not got:
+        if share:
+            job.say(f"border cleanup skipped: it would have repainted "
+                    f"{share:.0f}% of the page")
+        return
+    job.cur = got
+    job.say(f"erased what leaned in from outside the sheet ({share:.1f}% of the page)")
+    pad = round(max(W, H) * 0.004)
+    l = cut["left"] + pad if cut["left"] else 0
+    r = cut["right"] + pad if cut["right"] else 0
+    t = cut["top"] + pad if cut["top"] else 0
+    b = cut["bottom"] + pad if cut["bottom"] else 0
+    if (l or r or t or b) and W - l - r > 100 and H - t - b > 100:
+        job.stage("binding", "-crop", f"{W - l - r}x{H - t - b}+{l}+{t}", "+repage")
+        job.say(f"cut a solid band of it away: L/R/T/B = {l}/{r}/{t}/{b} px")
+        # the crop exposes a fresh border: whatever the band was hiding is
+        # now the outermost pixel, so flood once more
+        got2, share2, _, _ = clean_border(
+            job.cur, job.path("border2"), o.edge_band, o.edge_keep,
+            o.band_structure, o.band_dark)
+        if got2:
+            job.cur = got2
+            job.say(f"second pass on the new border ({share2:.1f}%)")
+
+
+def orient(job, spread):
+    """Turn the picture, but only when asked to -- or on a spread.
+
+    `--rotate auto` turns nothing: the PAGE follows the picture at the fit,
+    exactly as it does in photo mode. Turning the pixels instead assumes a
+    wide frame means a sideways sheet, and it usually does not -- a square
+    notebook page shot in a wide frame is wide because of the FRAME, and
+    standing its lines on end makes it unreadable. A portrait sheet genuinely
+    photographed sideways stays sideways, which the reader fixes with one
+    keypress; unreadable text is not fixable at all. A spread is the
+    exception, because there the evidence is on the page: which way its
+    lines of text run, and which side its photo is on.
+    """
+    o = job.o
     if o.rotate not in ("auto", "0"):
-        stage("rot", "-rotate", o.rotate)
-        report.append(f"rotated {o.rotate}°")
+        job.stage("rot", "-rotate", o.rotate)
+        job.say(f"rotated {o.rotate}°")
     elif spread and o.rotate == "auto":
-        turn = spread_turn(cur, spread[1], report)
+        turn = spread_turn(job.cur, spread[1], job.report)
         if turn:
-            stage("rot", "-rotate", str(turn))
-            report.append(f"rotated {turn}°")
+            job.stage("rot", "-rotate", str(turn))
+            job.say(f"rotated {turn}°")
 
-    # 3. cut the photographic border (desk, shadow, sheet edge). Pointless
-    #    after a rectify — the quad already ended exactly at the sheet.
+
+def trim_border(job):
+    """Cut the photographic border (desk, shadow, sheet edge) of a page that
+    was not rectified. Returns (flags, span, shave) for the fit."""
+    o = job.o
     flags, span, shave = {}, {}, {"l": 0, "t": 0}
-    if not o.no_trim and not rectified:
-        dl, dr, dt, db, flags = detect_border(cur, o.trim_band / 100.0, o.trim_step)
-        iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
-        # The detected step IS the sheet boundary, so the span between two
-        # opposite steps is the real sheet size — remembered before shaving, so
-        # the A4 scale stays exact even though a little paper is cut away.
-        span = {"w": iw - dl - dr, "h": ih - dt - db}
-        sh = max(o.trim_pad, round(o.trim_shave / 100.0 * min(iw, ih)))
-        cut = {}
-        for key, val, name in (("l", dl, "left"), ("r", dr, "right"),
-                               ("t", dt, "top"), ("b", db, "bottom")):
-            cut[key] = val + sh if flags[name] else 0
-        shave = {"l": cut["l"] and sh, "t": cut["t"] and sh}
-        if any(cut.values()):
-            stage("trim", "-crop",
+    if o.no_trim:
+        return flags, span, shave
+    dl, dr, dt, db, flags = detect_border(job.cur, o.trim_band / 100.0, o.trim_step)
+    iw, ih = dims(job.cur)
+    # The detected step IS the sheet boundary, so the span between two
+    # opposite steps is the real sheet size — remembered before shaving, so
+    # the A4 scale stays exact even though a little paper is cut away.
+    span = {"w": iw - dl - dr, "h": ih - dt - db}
+    sh = max(o.trim_pad, round(o.trim_shave / 100.0 * min(iw, ih)))
+    cut = {}
+    for key, val, name in (("l", dl, "left"), ("r", dr, "right"),
+                           ("t", dt, "top"), ("b", db, "bottom")):
+        cut[key] = val + sh if flags[name] else 0
+    shave = {"l": cut["l"] and sh, "t": cut["t"] and sh}
+    if any(cut.values()):
+        job.stage("trim", "-crop",
                   f"{iw - cut['l'] - cut['r']}x{ih - cut['t'] - cut['b']}"
                   f"+{cut['l']}+{cut['t']}", "+repage")
-        report.append(
-            "border cut L/R/T/B = %d/%d/%d/%d px (edge + %d px shave; edges: %s)"
+    job.say("border cut L/R/T/B = %d/%d/%d/%d px (edge + %d px shave; edges: %s)"
             % (cut["l"], cut["r"], cut["t"], cut["b"], sh,
                ",".join(k for k, v in flags.items() if v) or "none"))
+    return flags, span, shave
 
-    # 3b. An open passport is copied, not scanned: its tint, guilloche and
-    #     ornament are the document, like a card's, and the scan treatment
-    #     below erased them -- the red frame round the photo lost its thin
-    #     lines to "paper", and the photo, toned apart and laid back, stood
-    #     in a rectangle of guilloche that the rest of the page no longer
-    #     had. So a spread gets the card's colour copy, and every whitening
-    #     step after this is skipped. --spread-scan brings the scan back.
-    copy = bool(spread) and not o.spread_scan
-    if copy:
-        iw0, _ = dims(cur)
-        step += 1
-        dst = f"{out_png}.s{step}-copy.png"
-        magick(*copy_tone_args(cur, iw0), dst)
-        cur = dst
-        report.append("colour copy: light evened, tint and security print "
-                      "kept, nothing whitened")
 
-    # 4a. a face photo on the page is found BEFORE the flat-field touches it.
-    #    Everything from here on is built to turn light smooth areas into white
-    #    paper, and a face is a light smooth area: the background estimate
-    #    follows it, the division lifts it to white, the haze and paper screens
-    #    finish the job. What came out of a passport was a face with white
-    #    holes for cheeks. So the photo is cut out of the page as it is now,
-    #    toned gently on its own, and laid back over the finished page.
-    keep = None
-    if not o.no_keep_photo and not copy:
-        if spread:
-            # on a spread the photo is only ever on the lower page's left
-            box = None
-            iw_, ih_ = dims(cur)
-            x1_, y0_ = round(iw_ * 0.45), round(ih_ * 0.5)
-            part = f"{out_png}.photo-place.png"
-            magick(cur, "-crop", f"{x1_}x{ih_ - y0_}+0+{y0_}", "+repage", part)
-            # the place is a quarter of the spread, so the photo fills far
-            # more of it than of a page: up to two thirds
-            # In its known place the photo's known shape does the work the
-            # fill test does elsewhere: a light portrait fills only 0.29 of
-            # its box, while the narrow column of print beside it that won
-            # instead is 0.40 wide for its height -- a photo's dark block,
-            # hair to jacket, measured 0.48-1.69. The photo also fills a good
-            # part of its place (a 1% scrap of print won once without a
-            # floor). Three passes, strictest first: a sizeable block with
-            # the ordinary fill; one with a light portrait's loose fill; and
-            # a small one -- a child's face in pieces measured 5%.
-            kw = dict(area_max=65.0, aspect=(0.45, 1.8))
-            got = (find_photo_block(part, area_min=8.0, **kw)
-                   or find_photo_block(part, area_min=8.0, fill=0.25, **kw)
-                   or find_photo_block(part, area_min=3.0, **kw))
-            os.unlink(part)
-            if got:
-                # The dark cells are the hair and the eyes; a light face and
-                # a light collar below them were left to the paper treatment
-                # and came out as white holes. A passport photo's size is
-                # known -- 35 x 45 mm on a 88 x 125 mm page -- so the box is
-                # grown to at least that height, down from the top of what
-                # was found.
-                bx, by, bw, bh = got[0], got[1] + y0_, got[2], got[3]
-                pw_ = round(iw_ * SPREAD_PHOTO_MM[0] / 88.0)
-                ph_ = round(ih_ / 2 * SPREAD_PHOTO_MM[1] / 125.0)
-                # Only downward: where the dark block sits across is where
-                # the photo is (widening it centred slid it onto the print
-                # beside a photo whose hair lay to one side).
-                if bw > 1.25 * pw_:
-                    # the block ran on into the print beside the photo; the
-                    # photo is the leftmost thing in its place
-                    bw = round(1.1 * pw_)
-                if bh < ph_:
-                    bh = min(ph_, ih_ - by)
-                box = (bx, by, bw, bh)
-        else:
-            box = find_photo_block(cur)
-        if box:
-            keep = (cur, box)
-            pw0, ph0 = dims(cur)
-            report.append(f"face photo at {box[2]}x{box[3]}+{box[0]}+{box[1]} "
-                          f"of {pw0}x{ph0} — toned on its own, not flattened "
-                          f"into the paper")
+def colour_copy(job):
+    """An open passport is copied, not scanned.
 
-    # 4. flat-field: divide by a smoothed background estimate -> even white paper
-    iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
-    # The background estimate is in COLOUR on purpose. A grey estimate divides
-    # the paper's cast into itself and leaves it: cream paper stays cream, and
-    # then its own tint on the ink reads as "coloured ink" and gets preserved,
-    # which is how a black biro came out brown. A per-channel estimate white-
-    # balances the sheet, so what survives in colour is really coloured.
-    # The estimate is then squeezed to --bg-scale and blurred there, so no
-    # detail finer than that survives it: closing at full resolution is six
-    # times the work for a result within RMSE 0.01 of this one. So sample the
-    # page down and scale the kernel with it -- the structure the close
-    # swallows stays the same size in the ORIGINAL, which is what matters.
-    # Measured 3.16s -> 0.53s on a 1644x2329 page. The divisor is bounded so
-    # the kernel never drops below ~3: below that the close stops swallowing
-    # strokes and the estimate darkens under the text, which showed up as
-    # nearly three times the drift (RMSE 0.035 vs 0.012 across the corpus).
+    Its tint, guilloche and ornament are the document, like a card's, and the
+    scan treatment erased them -- the red frame round the photo lost its thin
+    lines to "paper", and the photo, toned apart and laid back, stood in a
+    rectangle of guilloche that the rest of the page no longer had. So a
+    spread gets the card's colour copy, and every whitening stage after it is
+    skipped. --spread-scan brings the scan back.
+    """
+    iw0, _ = dims(job.cur)
+    dst = job.path("copy")
+    magick(*copy_tone_args(job.cur, iw0), dst)
+    job.cur = dst
+    job.say("colour copy: light evened, tint and security print kept, nothing whitened")
+
+
+def spread_photo_box(job):
+    """The face photo's box on an upright spread, or None.
+
+    On a spread the photo is only ever on the lower page's left, so only
+    that place is searched. The place is a quarter of the spread, so the
+    photo fills far more of it than of a page: up to two thirds. In its known
+    place the photo's known shape does the work the fill test does elsewhere:
+    a light portrait fills only 0.29 of its box, while the narrow column of
+    print beside it that won instead is 0.40 wide for its height -- a photo's
+    dark block, hair to jacket, measured 0.48-1.69. The photo also fills a
+    good part of its place (a 1% scrap of print won once without a floor).
+    Three passes, strictest first: a sizeable block with the ordinary fill;
+    one with a light portrait's loose fill; and a small one -- a child's face
+    in pieces measured 5%.
+    """
+    iw_, ih_ = dims(job.cur)
+    x1_, y0_ = round(iw_ * 0.45), round(ih_ * 0.5)
+    part = f"{job.out_png}.photo-place.png"
+    magick(job.cur, "-crop", f"{x1_}x{ih_ - y0_}+0+{y0_}", "+repage", part)
+    kw = dict(area_max=65.0, aspect=(0.45, 1.8))
+    got = (find_photo_block(part, area_min=8.0, **kw)
+           or find_photo_block(part, area_min=8.0, fill=0.25, **kw)
+           or find_photo_block(part, area_min=3.0, **kw))
+    os.unlink(part)
+    if not got:
+        return None
+    # The dark cells are the hair and the eyes; a light face and a light
+    # collar below them were left to the paper treatment and came out as
+    # white holes. A passport photo's size is known -- 35 x 45 mm on a
+    # 88 x 125 mm page -- so the box is grown to at least that height, down
+    # from the top of what was found. Only downward: where the dark block
+    # sits across is where the photo is (widening it centred slid it onto the
+    # print beside a photo whose hair lay to one side).
+    bx, by, bw, bh = got[0], got[1] + y0_, got[2], got[3]
+    pw_ = round(iw_ * SPREAD_PHOTO_MM[0] / 88.0)
+    ph_ = round(ih_ / 2 * SPREAD_PHOTO_MM[1] / 125.0)
+    if bw > 1.25 * pw_:
+        # the block ran on into the print beside the photo; the photo is the
+        # leftmost thing in its place
+        bw = round(1.1 * pw_)
+    if bh < ph_:
+        bh = min(ph_, ih_ - by)
+    return (bx, by, bw, bh)
+
+
+def keep_face_photo(job, spread):
+    """Find a face photo BEFORE the flat-field touches it: (page, box) or None.
+
+    Everything after this is built to turn light smooth areas into white
+    paper, and a face is a light smooth area: the background estimate
+    follows it, the division lifts it to white, the haze and paper screens
+    finish the job. What came out of a passport was a face with white holes
+    for cheeks. So the photo is cut out of the page as it is now, toned
+    gently on its own, and laid back over the finished page.
+    """
+    box = spread_photo_box(job) if spread else find_photo_block(job.cur)
+    if not box:
+        return None
+    pw0, ph0 = dims(job.cur)
+    job.say(f"face photo at {box[2]}x{box[3]}+{box[0]}+{box[1]} of {pw0}x{ph0} "
+            f"— toned on its own, not flattened into the paper")
+    return (job.cur, box)
+
+
+def flat_field(job):
+    """Divide by a smoothed background estimate -> even white paper.
+
+    The estimate is in COLOUR on purpose. A grey estimate divides the paper's
+    cast into itself and leaves it: cream paper stays cream, and then its own
+    tint on the ink reads as "coloured ink" and gets preserved, which is how
+    a black biro came out brown. A per-channel estimate white-balances the
+    sheet, so what survives in colour is really coloured.
+
+    The estimate is then squeezed to --bg-scale and blurred there, so no
+    detail finer than that survives it: closing at full resolution is six
+    times the work for a result within RMSE 0.01 of this one. So sample the
+    page down and scale the kernel with it -- the structure the close
+    swallows stays the same size in the ORIGINAL, which is what matters.
+    Measured 3.16s -> 0.53s on a 1644x2329 page. The divisor is bounded so
+    the kernel never drops below ~3: below that the close stops swallowing
+    strokes and the estimate darkens under the text, which showed up as
+    nearly three times the drift (RMSE 0.035 vs 0.012 across the corpus).
+    """
+    o = job.o
+    iw, ih = dims(job.cur)
     bg_div = max(1, round(o.close / 3))
     bg_kern = max(1, round(o.close / bg_div))
-    if not copy:
-        stage("flat",
-                  "(", "+clone",
-                  "-sample", f"{100.0 / bg_div:.4f}%",
-                  "-morphology", "Close", f"Octagon:{bg_kern}",
-                  "-resize", f"{o.bg_scale * bg_div:.4f}%", "-blur", "0x6",
-                  "-filter", "Triangle", "-resize", f"{iw}x{ih}!", "+filter", ")",
-                  "-compose", op_divide(), "-composite")
+    job.stage("flat",
+              "(", "+clone",
+              "-sample", f"{100.0 / bg_div:.4f}%",
+              "-morphology", "Close", f"Octagon:{bg_kern}",
+              "-resize", f"{o.bg_scale * bg_div:.4f}%", "-blur", "0x6",
+              "-filter", "Triangle", "-resize", f"{iw}x{ih}!", "+filter", ")",
+              "-compose", op_divide(), "-composite")
 
-    # 5. deskew — AFTER the flat-field on purpose. The angle is measured on a
-    #    binarized copy, and on a dim photo the whole sheet falls below the
-    #    threshold and reads as one blob, so a real tilt is measured as 0.0deg.
-    #    Once the paper is white, the text lines are what the estimator sees.
-    if not o.no_deskew and not rectified:
-        # After a rectify the quad IS the page orientation. Re-measuring it from
-        # text baselines then fights it, and on handwriting the estimator has no
-        # baselines worth trusting: it read +1.61 deg off an already-flat page.
-        ang = deskew_angle(cur)
-        if o.deskew_min <= abs(ang) <= 5.0:
-            before = tuple(int(x) for x in fmt(cur, "%w %h").split())
-            stage("deskew", "-background", "white", "-deskew", "40%")
-            after = tuple(int(x) for x in fmt(cur, "%w %h").split())
-            if span and after != before:
-                # keep the sheet span in sync with the canvas the fit will use
-                span["w"] = round(span["w"] * after[0] / before[0])
-                span["h"] = round(span["h"] * after[1] / before[1])
-            # Rotating swings the edges: a strip as wide as max_side * sin(angle)
-            # that used to sit outside the frame now leans into it, dragging the
-            # sliver of desk the pre-rotation shave did not reach. Cut it, and
-            # book it as shave so the A4 anchor stays put.
-            lean = math.ceil(max(after) * abs(math.sin(math.radians(ang))))
-            if lean and any(flags.values()):
-                iw2, ih2 = after
-                cl = lean if flags.get("left") else 0
-                cr = lean if flags.get("right") else 0
-                ct = lean if flags.get("top") else 0
-                cb = lean if flags.get("bottom") else 0
-                if iw2 - cl - cr > 100 and ih2 - ct - cb > 100:
-                    stage("lean", "-crop",
-                          f"{iw2 - cl - cr}x{ih2 - ct - cb}+{cl}+{ct}", "+repage")
-                    shave["l"] += cl
-                    shave["t"] += ct
-            report.append(f"deskewed {ang:+.2f}°, edge lean cut {lean}px")
-            if keep:
-                # the photo's box is in the coordinates of the page BEFORE the
-                # turn; laying it back at those would misplace it
-                keep = None
-                report.append("face photo left to the page treatment: the page "
-                              "was deskewed after the photo was cut out")
-        else:
-            report.append(f"skew {ang:+.2f}° — left as is")
 
-    # 6. neutralize the photo's colour cast on the ink, keep genuinely coloured ink
-    if o.gray:
-        stage("gray", "-colorspace", "gray", "-colorspace", "sRGB",
-              "-type", "TrueColor")
-        report.append("grayscale output")
-    elif not o.no_neutralize and not copy:
-        # One process, not six. Each of the six wrote a full-resolution PNG for
-        # the next one to read back, and at 12 MP that handoff cost more than
-        # the arithmetic it carried. mpr: keeps the page in memory, and -print
-        # hands the coverage back without a seventh read of the mask.
-        # Coloured ink = high chroma AND dark. Chroma alone also fires on the
-        # warm cast of a bright paper edge and on JPEG chroma speckle, so both
-        # conditions are required, then an opening drops single-pixel noise.
-        step += 1
-        nxt = f"{out_png}.s{step}-neutral.png"
-        share = float(magick(
-            cur, "-write", "mpr:flat",
-            # Split the channels ONCE and take both the max and the min off
-            # that one split, instead of splitting the page twice. The split is
-            # parked in a register rather than addressed by index, because a
-            # grayscale source -- a PDF with a gray image in it -- separates
-            # into ONE plane, and any "planes 0 to 2" form dies on it.
-            "(", "+clone", "-channel", "RGB", "-separate", "+channel",
-            "-write", "mpr:ch", "-evaluate-sequence", "max",
-            "(", "mpr:ch", "-evaluate-sequence", "min", ")",
-            "-compose", op_minus(), "-composite", "-alpha", "off", ")",
-            "-delete", "0",
-            "-threshold", f"{o.chroma}%",
-            "(", "mpr:flat", "-colorspace", "gray",
-            "-threshold", f"{o.ink_dark}%", "-negate", "-alpha", "off", ")",
-            "-compose", "Multiply", "-composite",
-            "-morphology", "Open", "Octagon:1",
-            # Growing and softening a binary mask is a 10px-scale operation,
-            # so it does not need full resolution: at a third of it the kernel
-            # and the blur scale with it. It is not quite free -- a page of
-            # blue biro kept 8.67% of its area coloured instead of 9.02% -- but
-            # that is the thinnest ends of strokes going neutral, not a stroke.
-            "-sample", "33.3333%",
-            "-morphology", "Dilate",
-            f"Octagon:{max(1, round(o.chroma_grow / 3))}",
-            "-blur", "0x1.3333", "-filter", "Triangle",
-            "-resize", f"{iw}x{ih}!", "+filter",
-            "-write", "mpr:mask", "-print", "%[fx:mean*100]",
-            "-delete", "0",
-            "(", "mpr:flat", "-colorspace", "gray", "-colorspace", "sRGB",
-            "-type", "TrueColor", ")",
-            "mpr:flat", "mpr:mask",
-            "-compose", "Over", "-composite", f"PNG24:{nxt}").strip())
-        cur = nxt
-        report.append(f"ink neutralized, coloured ink kept on {share:.3f}% of the page")
+def deskew(job, flags, span, shave, keep):
+    """Straighten a page that was not rectified. Returns `keep`, dropped when
+    the page turned under the photo's box.
 
-    # 7-9. tone, haze and paper-flattening in ONE pass over the pixels.
-    #    tone: paper to white, ink deep — percentile based, not a fixed curve.
-    #    haze: erase leftover smooth haze — a soft shadow, a finger, an edge
-    #      glow. Bright AND featureless -> paper; anything with structure (ink,
-    #      a faint stamp, a pencil note) has local variance and survives.
-    #    white: clean the paper to pure white, protecting a 1px ring around ink.
-    #    They used to be four processes handing a full-resolution PNG along;
-    #    the writes cost more than the arithmetic. Same operators, same order.
+    AFTER the flat-field on purpose: the angle is measured on a binarized
+    copy, and on a dim photo the whole sheet falls below the threshold and
+    reads as one blob, so a real tilt is measured as 0.0deg. Once the paper
+    is white, the text lines are what the estimator sees.
+    """
+    o = job.o
+    ang = deskew_angle(job.cur)
+    if not o.deskew_min <= abs(ang) <= 5.0:
+        job.say(f"skew {ang:+.2f}° — left as is")
+        return keep
+    before = dims(job.cur)
+    job.stage("deskew", "-background", "white", "-deskew", "40%")
+    after = dims(job.cur)
+    if span and after != before:
+        # keep the sheet span in sync with the canvas the fit will use
+        span["w"] = round(span["w"] * after[0] / before[0])
+        span["h"] = round(span["h"] * after[1] / before[1])
+    # Rotating swings the edges: a strip as wide as max_side * sin(angle) that
+    # used to sit outside the frame now leans into it, dragging the sliver of
+    # desk the pre-rotation shave did not reach. Cut it, and book it as shave
+    # so the A4 anchor stays put.
+    lean = math.ceil(max(after) * abs(math.sin(math.radians(ang))))
+    if lean and any(flags.values()):
+        iw2, ih2 = after
+        cl = lean if flags.get("left") else 0
+        cr = lean if flags.get("right") else 0
+        ct = lean if flags.get("top") else 0
+        cb = lean if flags.get("bottom") else 0
+        if iw2 - cl - cr > 100 and ih2 - ct - cb > 100:
+            job.stage("lean", "-crop",
+                      f"{iw2 - cl - cr}x{ih2 - ct - cb}+{cl}+{ct}", "+repage")
+            shave["l"] += cl
+            shave["t"] += ct
+    job.say(f"deskewed {ang:+.2f}°, edge lean cut {lean}px")
+    if keep:
+        # the photo's box is in the coordinates of the page BEFORE the turn;
+        # laying it back at those would misplace it
+        job.say("face photo left to the page treatment: the page was "
+                "deskewed after the photo was cut out")
+        return None
+    return keep
+
+
+def neutralize_ink(job, size):
+    """Take the photo's colour cast off the ink, keep genuinely coloured ink.
+
+    Coloured ink = high chroma AND dark. Chroma alone also fires on the warm
+    cast of a bright paper edge and on JPEG chroma speckle, so both
+    conditions are required, then an opening drops single-pixel noise.
+
+    One process, not six. Each of the six wrote a full-resolution PNG for the
+    next one to read back, and at 12 MP that handoff cost more than the
+    arithmetic it carried. mpr: keeps the page in memory, and -print hands
+    the coverage back without a seventh read of the mask.
+    """
+    o = job.o
+    # `size` is the page's size BEFORE deskew, as it has always been; see
+    # process_page
+    iw, ih = size
+    nxt = job.path("neutral")
+    share = float(magick(
+        job.cur, "-write", "mpr:flat",
+        # Split the channels ONCE and take both the max and the min off that
+        # one split, instead of splitting the page twice. The split is parked
+        # in a register rather than addressed by index, because a grayscale
+        # source -- a PDF with a gray image in it -- separates into ONE
+        # plane, and any "planes 0 to 2" form dies on it.
+        "(", "+clone", "-channel", "RGB", "-separate", "+channel",
+        "-write", "mpr:ch", "-evaluate-sequence", "max",
+        "(", "mpr:ch", "-evaluate-sequence", "min", ")",
+        "-compose", op_minus(), "-composite", "-alpha", "off", ")",
+        "-delete", "0",
+        "-threshold", f"{o.chroma}%",
+        "(", "mpr:flat", "-colorspace", "gray",
+        "-threshold", f"{o.ink_dark}%", "-negate", "-alpha", "off", ")",
+        "-compose", "Multiply", "-composite",
+        "-morphology", "Open", "Octagon:1",
+        # Growing and softening a binary mask is a 10px-scale operation, so it
+        # does not need full resolution: at a third of it the kernel and the
+        # blur scale with it. It is not quite free -- a page of blue biro kept
+        # 8.67% of its area coloured instead of 9.02% -- but that is the
+        # thinnest ends of strokes going neutral, not a stroke.
+        "-sample", "33.3333%",
+        "-morphology", "Dilate",
+        f"Octagon:{max(1, round(o.chroma_grow / 3))}",
+        "-blur", "0x1.3333", "-filter", "Triangle",
+        "-resize", f"{iw}x{ih}!", "+filter",
+        "-write", "mpr:mask", "-print", "%[fx:mean*100]",
+        "-delete", "0",
+        "(", "mpr:flat", "-colorspace", "gray", "-colorspace", "sRGB",
+        "-type", "TrueColor", ")",
+        "mpr:flat", "mpr:mask",
+        "-compose", "Over", "-composite", f"PNG24:{nxt}").strip())
+    job.cur = nxt
+    job.say(f"ink neutralized, coloured ink kept on {share:.3f}% of the page")
+
+
+def paper_screen(o):
+    """ImageMagick args that clean the paper to pure white, protecting a 1px
+    ring around the ink."""
+    return ["(", "+clone", "-colorspace", "gray", "-threshold", f"{o.paper_thr}%",
+            "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
+            "-compose", "Screen", "-composite"]
+
+
+def tone(job):
+    """Tone, haze and paper-flattening in ONE pass over the pixels.
+
+    tone: paper to white, ink deep — percentile based, not a fixed curve.
+    haze: erase leftover smooth haze — a soft shadow, a finger, an edge glow.
+      Bright AND featureless -> paper; anything with structure (ink, a faint
+      stamp, a pencil note) has local variance and survives.
+    white: clean the paper to pure white, protecting a 1px ring around ink.
+    They used to be four processes handing a full-resolution PNG along; the
+    writes cost more than the arithmetic. Same operators, same order.
+    """
+    o = job.o
     args = ["-contrast-stretch", f"{o.black_clip}%x{o.white_clip}%"]
     if not o.no_haze:
         args += ["-write", "mpr:toned",
@@ -3060,18 +3122,20 @@ def process_page(src, out_png, o, report):
                  "-morphology", "Erode", "Octagon:2", "-alpha", "off", ")",
                  "-compose", "Screen", "-composite"]
     if not o.no_flatten_paper:
-        args += ["(", "+clone", "-colorspace", "gray",
-                 "-threshold", f"{o.paper_thr}%",
-                 "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
-                 "-compose", "Screen", "-composite"]
-    if not copy:
-        stage("tone", *args)
+        args += paper_screen(o)
+    job.stage("tone", *args)
 
-    # 10. fit onto A4
-    iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
+
+def choose_fit(job, rectified, flags, span, shave):
+    """How the page is laid onto A4: (pw, ph, scale, (x, y), mode, dpi, lowres).
+
+    `lowres` is the factor the page was brought down by when the photo holds
+    too little detail for --dpi, or None.
+    """
+    o = job.o
+    iw, ih = dims(job.cur)
     page_dpi = o.dpi
-    pw = round(210 / MM * page_dpi)
-    ph = round(297 / MM * page_dpi)
+    pw, ph = a4_px(page_dpi)
     # The page turns, not the picture -- the rule photo mode has always used.
     # A near-square page has no meaningful orientation, so a few percent
     # between the sides is noise, not a decision.
@@ -3084,8 +3148,8 @@ def process_page(src, out_png, o, report):
         scale = min(pw / iw, ph / ih)
         mode_used = "frame (the rectified quad is the sheet)"
     if scale is None and o.fit in ("auto", "edges"):
-        # Both edges of one axis found => that axis spans the whole sheet, so it
-        # gives the true px-per-mm without guessing anything about the layout.
+        # Both edges of one axis found => that axis spans the whole sheet, so
+        # it gives the true px-per-mm without guessing anything about layout.
         if flags.get("top") and flags.get("bottom"):
             scale = ph / span["h"]
             off_y = round(shave["t"] * scale)
@@ -3097,18 +3161,18 @@ def process_page(src, out_png, o, report):
         elif o.fit == "edges":
             mode_used = "frame (no pair of opposite edges found)"
     if scale is None and o.fit in ("auto", "content"):
-        # The content fit invents the scale from an ASSUMED text width. That is
-        # only defensible when the frame is cropped tight to the ink and the
+        # The content fit invents the scale from an ASSUMED text width. That
+        # is only defensible when the frame is cropped tight to the ink and the
         # margins genuinely have to be guessed. If any sheet edge was found the
-        # sheet is inside the frame, there is nothing to guess, and anchoring on
-        # a 165 mm text column shrinks a wide worksheet to two thirds of the
+        # sheet is inside the frame, there is nothing to guess, and anchoring
+        # on a 165 mm text column shrinks a wide worksheet to two thirds of the
         # page -- measured 2.11 where fitting the frame gives 2.69 and the real
         # sheet gives 3.15. --fit content still forces it.
         if o.fit == "auto" and any(flags.get(k) for k in
                                    ("left", "right", "top", "bottom")):
             mode_used = "frame (a sheet edge was found; no text width to guess)"
         else:
-            bb = ink_bbox(cur)
+            bb = ink_bbox(job.cur)
             if bb and bb[2] >= o.content_min / 100.0 * iw:
                 bx, by, bw, _ = bb
                 text_w = (297 if o.landscape else 210) - o.ml - o.mr
@@ -3137,54 +3201,116 @@ def process_page(src, out_png, o, report):
     # dpi with 4:2:0 chroma (the phone's own JPEG already threw that colour
     # resolution away): 577 KB instead, with no visible difference side by
     # side. An explicit --dpi is always obeyed.
-    lowres = False
+    lowres = None
     if not o.dpi_given and scale > o.dpi / LOWRES_DPI and o.dpi > 200:
         wide = pw > ph
-        pw, ph = round(210 / MM * 200), round(297 / MM * 200)
+        pw, ph = a4_px(200)
         if wide:
             pw, ph = ph, pw
-        f = pw / (round(297 / MM * o.dpi) if wide else round(210 / MM * o.dpi))
+        f = pw / (a4_px(o.dpi)[1] if wide else a4_px(o.dpi)[0])
         scale *= f
         off_x, off_y = round(off_x * f), round(off_y * f)
         page_dpi = 200
-        lowres = True
-    off = (off_x, off_y)
+        lowres = f
+    return pw, ph, scale, (off_x, off_y), mode_used, page_dpi, lowres
 
-    # The resize and the A4 layout are one process: the scaled page is the
-    # single biggest intermediate in the run (A4 at 300 dpi is 8.7 MP), and
-    # writing it only for the next process to read it back was the most
-    # expensive handoff left.
-    page = f"{out_png}"
-    over = []
-    if keep:
-        over = photo_patch(keep, scale, off, o, out_png)
+
+def lay_out(job, rectified, flags, span, shave, keep, copy):
+    """Fit the page onto A4, clean the open paper, lay the face photo back.
+
+    The resize and the A4 layout are one process: the scaled page is the
+    single biggest intermediate in the run (A4 at 300 dpi is 8.7 MP), and
+    writing it only for the next process to read it back was the most
+    expensive handoff left.
+    """
+    o = job.o
+    pw, ph, scale, off, mode_used, page_dpi, lowres = choose_fit(
+        job, rectified, flags, span, shave)
+    page = job.out_png
+    over = photo_patch(keep, scale, off, o, job.out_png) if keep else []
     magick("-size", f"{pw}x{ph}", "xc:white",
-           "(", cur, "-resize", f"{scale * 100:.4f}%",
+           "(", job.cur, "-resize", f"{scale * 100:.4f}%",
            "-unsharp", f"0x1+{o.sharpen}+0.02", ")",
            "-geometry", f"{off[0]:+d}{off[1]:+d}", "-compose", "Over",
            "-composite",
            "-colorspace", "sRGB", "-geometry", "+0+0",
-           *([] if copy else
-             ["(", "+clone", "-colorspace", "gray", "-threshold",
-              f"{o.paper_thr}%", "-morphology", "Erode", "Octagon:1",
-              "-alpha", "off", ")", "-compose", "Screen", "-composite"]),
+           *([] if copy else paper_screen(o)),
            page)
-    # 11. specks on the white. Before the face photo goes back on, which is
-    #     all grey tones and would be read as nothing but specks.
+    # specks on the white. Before the face photo goes back on, which is all
+    # grey tones and would be read as nothing but specks.
     if not o.no_despeckle and not copy:
         share = clean_specks(page, page_dpi)
         if share:
-            report.append(f"cleaned {share:.3f}% of the page of specks on "
-                          f"open paper")
+            job.say(f"cleaned {share:.3f}% of the page of specks on open paper")
     if over:
         magick(page, *over, page)
-    report.append(f"fit: {mode_used}; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
-    report.append(f"page: {pw}x{ph}px @ {page_dpi}dpi")
+    job.say(f"fit: {mode_used}; scale {scale:.4f}, offset {off[0]:+d}{off[1]:+d}")
+    job.say(f"page: {pw}x{ph}px @ {page_dpi}dpi")
     if lowres:
-        report.append(f"the photo holds about {o.dpi / (scale / f):.0f} dpi of "
-                      f"detail at this size — page written at {page_dpi} dpi, "
-                      f"not {o.dpi} (--dpi forces it)")
-    return page, False, page_dpi
+        job.say(f"the photo holds about {o.dpi / (scale / lowres):.0f} dpi of "
+                f"detail at this size — page written at {page_dpi} dpi, "
+                f"not {o.dpi} (--dpi forces it)")
+    return page, page_dpi
+
+
+def process_page(src, out_png, o, report):
+    """One raster -> one A4 page: (png, is_photo, dpi), or the cards found
+    in it: (cards, "cards", dpi), which build() lays out, since a card's back
+    is usually the next photograph."""
+    found = locate(src, o, report)
+    if found[0] == "photo":
+        return fit_photo_page(src, out_png, o, report)
+    if found[0] == "cards":
+        return (process_cards(src, found[1], found[2], out_png, o, report),
+                "cards", o.dpi)
+    spread = found[1] if found[0] == "spread" else None
+
+    # ---- from here on it is a document: a spread, a sheet, or the frame.
+    job = Job(src, out_png, o, report)
+    # 1. rectify first -- every later stage assumes the page is flat, and a
+    #    page shot at an angle is the one thing a rectangular crop can never
+    #    fix -- and erase what leans in from outside it.
+    rectified = found[0] in ("spread", "sheet")
+    if spread:
+        W, H = rectify_spread(job, spread)
+    elif rectified:
+        W, H = rectify_sheet(job, found[1], found[2])
+    if rectified:
+        erase_outside(job, W, H)
+    # 2. orient
+    orient(job, spread)
+    # 3. trim the photographic border -- pointless after a rectify, the quad
+    #    already ended exactly at the sheet
+    flags, span, shave = ({}, {}, {"l": 0, "t": 0}) if rectified else trim_border(job)
+    # 3b. a spread is a colour copy: nothing below whitens it
+    copy = bool(spread) and not o.spread_scan
+    if copy:
+        colour_copy(job)
+    # 4. the face photo, the flat-field, deskew, the ink, the tone
+    keep = None if (o.no_keep_photo or copy) else keep_face_photo(job, spread)
+    # The ink mask below is resized to the page as it is HERE, before a
+    # deskew can grow the canvas. That is how it has always run; whether it
+    # should follow the deskewed size is a behaviour change of its own.
+    size = dims(job.cur)
+    if not copy:
+        flat_field(job)
+    if not o.no_deskew and not rectified:
+        # After a rectify the quad IS the page orientation. Re-measuring it
+        # from text baselines then fights it, and on handwriting the
+        # estimator has no baselines worth trusting: it read +1.61 deg off an
+        # already-flat page.
+        keep = deskew(job, flags, span, shave, keep)
+    if o.gray:
+        job.stage("gray", "-colorspace", "gray", "-colorspace", "sRGB",
+                  "-type", "TrueColor")
+        job.say("grayscale output")
+    elif not o.no_neutralize and not copy:
+        neutralize_ink(job, size)
+    if not copy:
+        tone(job)
+    # 5. fit onto A4
+    page, dpi = lay_out(job, rectified, flags, span, shave, keep, copy)
+    return page, False, dpi
 
 
 def write_pdf(jpegs, out, dpi, label=None):
