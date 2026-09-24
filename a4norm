@@ -915,7 +915,7 @@ def detect_spread(pm):
     return quads, ("h" if horiz else "v"), why
 
 
-def _ink_runs(path, side=600):
+def _ink_runs(path, side=600, thr=75):
     """(horizontal, vertical) ink in long runs: which way the lines of text go.
 
     Text is letters close together along a line and far apart across it, so
@@ -933,7 +933,7 @@ def _ink_runs(path, side=600):
     raw = subprocess.run(
         ["magick", str(path), "-resize", f"{w}x{h}!", "-colorspace", "gray",
          "(", "+clone", "-morphology", "Close", "Octagon:3", "-blur", "0x2", ")",
-         "-compose", op_divide(), "-composite", "-threshold", "75%",
+         "-compose", op_divide(), "-composite", "-threshold", f"{thr}%",
          "-depth", "8", "gray:-"], check=True, capture_output=True).stdout
     minlen = max(8, round(0.025 * max(w, h)))
 
@@ -1929,8 +1929,18 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
     pgm = f"P5\n{w} {h}\n255\n".encode() + bytes(255 if v else 0 for v in reach)
     mpath = dst + ".bordermask.pgm"
     open(mpath, "wb").write(pgm)
-    # the page's own paper tone, so the later flat-field sees no bright patch
-    tone = fmt(path, "%[pixel:p{" + f"{w0 // 2},{h0 // 2}" + "}]")
+    # The page's own paper tone, so the later flat-field sees no bright
+    # patch: the median colour of the page the flood did not reach, less its
+    # ink (under 60% of the paper level) and its coloured print. Only the
+    # brightest pixels made a border lighter than the page, and on a copy
+    # that is kept that light frame read as "paper" round a "dark" page. Not the centre pixel -- on a spread the centre is the fold, a
+    # passport's red strip, and every repainted edge came out pink.
+    rs, gs, bs = [], [], []
+    for i in range(0, n, 3):
+        if not reach[i] and V[i] >= 0.6 * paper and C[i] <= 45:
+            rs.append(buf[3 * i]); gs.append(buf[3 * i + 1]); bs.append(buf[3 * i + 2])
+    med = lambda v: sorted(v)[len(v) // 2] if v else 255
+    tone = f"rgb({med(rs)},{med(gs)},{med(bs)})"
     magick(path, "(", "-size", f"{w0}x{h0}", f"xc:{tone}", ")",
            "(", mpath, "-morphology", "Dilate", "Disk:3",
            "-resize", f"{w0}x{h0}!", "-blur", "0x2", ")",
@@ -1943,6 +1953,8 @@ FINGER_CHROMA = 45      # the paper mask's own chroma limit
 FINGER_RED = 30         # skin: red leads both other channels by this much
 FINGER_DEPTH = 15.0     # % of the short side a finger may reach in
 FINGER_OVER = 25        # skin is this much more saturated than the median
+FINGER_STD = 12        # median local brightness spread (0-255) above
+                        # which a flooded piece is print, not skin
 FINGER_MAX = 6.0        # % of the spread; a larger "finger" is the page
 SPINE_BAND = 8.0        # % of the spread width kept clear around the spine
 
@@ -2024,6 +2036,22 @@ def erase_fingers(path, dst, axis, side=520):
                     j2 = yy * w + xx
                     if skin[j2] and not reach[j2] and not spine(xx, yy):
                         reach[j2] = 1; q.append((j2, d + 1))
+    # Skin is smooth; print is not. A passport photo's red ornament runs out
+    # to the page's outer edge and is as red as a thumb, so the flood took
+    # it for one and repainted it: the frame round the photo was gone. Each
+    # flooded piece is judged by its texture -- the median local spread of
+    # brightness -- and only a smooth one is a finger: measured 5 for a
+    # thumb, 31 for the ornament (and 16 for the red strip at the spine).
+    if any(reach):
+        spread_ = subprocess.run(
+            ["magick", str(path), "-resize", f"{w}x{h}!", "-colorspace", "gray",
+             "-statistic", "StandardDeviation", "5x5", "-depth", "8", "gray:-"],
+            check=True, capture_output=True).stdout
+        for comp in _components(reach, w, h):
+            vals = sorted(spread_[i] for i in comp)
+            if vals[len(vals) // 2] > FINGER_STD:
+                for i in comp:
+                    reach[i] = 0
     share = 100.0 * sum(reach) / n
     if share < 0.05 or share > FINGER_MAX:
         # a finger is a few percent of a spread; far more than that is the
@@ -2178,6 +2206,26 @@ def card_face(path):
     return "left" if left else "right" if right else None
 
 
+def copy_tone_args(src, width):
+    """ImageMagick args that make a colour copy of a document, not a scan.
+
+    An identity document's tint, guilloche and ornament ARE the document --
+    an ID card's security print, the red frame around a passport photo --
+    and a scan-like treatment erases exactly those: thin light lines on a
+    light ground read as paper. So nothing is whitened. Only the light is
+    evened: the brightness divided by a very wide blur of itself, the same
+    factor on every channel so the colour stays, scaled back to the image's
+    own mean; then a gentle stretch. Applied to `src`; the caller adds the
+    output and anything after it.
+    """
+    sig = round(width / 5)
+    mean = float(fmt(src, "%[fx:mean]")) or 0.5
+    return [src, "(", "+clone", "-colorspace", "gray", "-blur", f"0x{sig}", ")",
+            "(", "-clone", "0", "-evaluate", "multiply", f"{mean:.4f}", ")",
+            "-delete", "0", "+swap", "-compose", op_divide(), "-composite",
+            "-contrast-stretch", "0.3%x0.3%"]
+
+
 def process_cards(src, quads, why, out_png, o, report):
     """Each card in the frame, rectified to its real size and turned upright.
 
@@ -2224,13 +2272,8 @@ def process_cards(src, quads, why, out_png, o, report):
         # the brightness divided by a very wide blur of itself, the same
         # factor on every channel so the colour stays -- then a gentle stretch
         # and the page's own sharpening.
-        sig = round(cw_px / 5)
         fixed = f"{out_png}.card{k}.png"
-        mean = float(fmt(raw, "%[fx:mean]")) or 0.5
-        magick(raw, "(", "+clone", "-colorspace", "gray", "-blur", f"0x{sig}", ")",
-               "(", "-clone", "0", "-evaluate", "multiply", f"{mean:.4f}", ")",
-               "-delete", "0", "+swap", "-compose", op_divide(), "-composite",
-               "-contrast-stretch", "0.3%x0.3%",
+        magick(*copy_tone_args(raw, cw_px),
                "-unsharp", f"0x1+{o.sharpen}+0.02",
                # the rounded corners of ID-1, and a hairline so a white card
                # still has an edge on a white page
@@ -2665,7 +2708,10 @@ def process_page(src, out_png, o, report):
             halves.append(dst)
         step += 1
         dst = f"{out_png}.s{step}-spread.png"
-        magick(*halves, "+append" if axis == "h" else "-append", dst)
+        # +repage: the joined image keeps the first page's canvas otherwise,
+        # and a canvas half the image's size shifted the spread by a page
+        # once it was rotated -- the photo-place test then read nothing
+        magick(*halves, "+append" if axis == "h" else "-append", "+repage", dst)
         cur = dst
         rectified = True
         W, H = dims(cur)
@@ -2786,6 +2832,23 @@ def process_page(src, out_png, o, report):
             % (cut["l"], cut["r"], cut["t"], cut["b"], sh,
                ",".join(k for k, v in flags.items() if v) or "none"))
 
+    # 3b. An open passport is copied, not scanned: its tint, guilloche and
+    #     ornament are the document, like a card's, and the scan treatment
+    #     below erased them -- the red frame round the photo lost its thin
+    #     lines to "paper", and the photo, toned apart and laid back, stood
+    #     in a rectangle of guilloche that the rest of the page no longer
+    #     had. So a spread gets the card's colour copy, and every whitening
+    #     step after this is skipped. --spread-scan brings the scan back.
+    copy = bool(spread) and not o.spread_scan
+    if copy:
+        iw0, _ = dims(cur)
+        step += 1
+        dst = f"{out_png}.s{step}-copy.png"
+        magick(*copy_tone_args(cur, iw0), dst)
+        cur = dst
+        report.append("colour copy: light evened, tint and security print "
+                      "kept, nothing whitened")
+
     # 4a. a face photo on the page is found BEFORE the flat-field touches it.
     #    Everything from here on is built to turn light smooth areas into white
     #    paper, and a face is a light smooth area: the background estimate
@@ -2794,7 +2857,7 @@ def process_page(src, out_png, o, report):
     #    holes for cheeks. So the photo is cut out of the page as it is now,
     #    toned gently on its own, and laid back over the finished page.
     keep = None
-    if not o.no_keep_photo:
+    if not o.no_keep_photo and not copy:
         if spread:
             # on a spread the photo is only ever on the lower page's left
             box = None
@@ -2865,13 +2928,14 @@ def process_page(src, out_png, o, report):
     # nearly three times the drift (RMSE 0.035 vs 0.012 across the corpus).
     bg_div = max(1, round(o.close / 3))
     bg_kern = max(1, round(o.close / bg_div))
-    stage("flat",
-              "(", "+clone",
-              "-sample", f"{100.0 / bg_div:.4f}%",
-              "-morphology", "Close", f"Octagon:{bg_kern}",
-              "-resize", f"{o.bg_scale * bg_div:.4f}%", "-blur", "0x6",
-              "-filter", "Triangle", "-resize", f"{iw}x{ih}!", "+filter", ")",
-              "-compose", op_divide(), "-composite")
+    if not copy:
+        stage("flat",
+                  "(", "+clone",
+                  "-sample", f"{100.0 / bg_div:.4f}%",
+                  "-morphology", "Close", f"Octagon:{bg_kern}",
+                  "-resize", f"{o.bg_scale * bg_div:.4f}%", "-blur", "0x6",
+                  "-filter", "Triangle", "-resize", f"{iw}x{ih}!", "+filter", ")",
+                  "-compose", op_divide(), "-composite")
 
     # 5. deskew — AFTER the flat-field on purpose. The angle is measured on a
     #    binarized copy, and on a dim photo the whole sheet falls below the
@@ -2921,7 +2985,7 @@ def process_page(src, out_png, o, report):
         stage("gray", "-colorspace", "gray", "-colorspace", "sRGB",
               "-type", "TrueColor")
         report.append("grayscale output")
-    elif not o.no_neutralize:
+    elif not o.no_neutralize and not copy:
         # One process, not six. Each of the six wrote a full-resolution PNG for
         # the next one to read back, and at 12 MP that handoff cost more than
         # the arithmetic it carried. mpr: keeps the page in memory, and -print
@@ -2996,7 +3060,8 @@ def process_page(src, out_png, o, report):
                  "-threshold", f"{o.paper_thr}%",
                  "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
                  "-compose", "Screen", "-composite"]
-    stage("tone", *args)
+    if not copy:
+        stage("tone", *args)
 
     # 10. fit onto A4
     iw, ih = (int(x) for x in fmt(cur, "%w %h").split())
@@ -3095,12 +3160,14 @@ def process_page(src, out_png, o, report):
            "-geometry", f"{off[0]:+d}{off[1]:+d}", "-compose", "Over",
            "-composite",
            "-colorspace", "sRGB", "-geometry", "+0+0",
-           "(", "+clone", "-colorspace", "gray", "-threshold", f"{o.paper_thr}%",
-           "-morphology", "Erode", "Octagon:1", "-alpha", "off", ")",
-           "-compose", "Screen", "-composite", page)
+           *([] if copy else
+             ["(", "+clone", "-colorspace", "gray", "-threshold",
+              f"{o.paper_thr}%", "-morphology", "Erode", "Octagon:1",
+              "-alpha", "off", ")", "-compose", "Screen", "-composite"]),
+           page)
     # 11. specks on the white. Before the face photo goes back on, which is
     #     all grey tones and would be read as nothing but specks.
-    if not o.no_despeckle:
+    if not o.no_despeckle and not copy:
         share = clean_specks(page, page_dpi)
         if share:
             report.append(f"cleaned {share:.3f}% of the page of specks on "
@@ -3435,6 +3502,9 @@ def main():
     g.add_argument("--no-trim", action="store_true")
     g.add_argument("--no-deskew", action="store_true")
     g.add_argument("--no-neutralize", action="store_true")
+    g.add_argument("--spread-scan", action="store_true",
+                   help="treat an open passport like a sheet of paper: "
+                        "whiten its background instead of keeping it")
     g.add_argument("--no-despeckle", action="store_true",
                    help="keep small isolated marks on open paper (dust, the "
                         "grain a shadow left in a corner)")

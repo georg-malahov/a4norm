@@ -364,6 +364,18 @@ change what this image may be used for.
    or has one or two blobs and no pitch at all. The test only overrides a
    DOCUMENT verdict, and only for a band darker than `--band-dark`, so it can
    take a side away from the content but never give one to it.
+   **An open passport is a colour copy, not a scan.** Its tint, guilloche
+   and ornament are the document, as on a card: the scan treatment erased
+   the thin red frame round the photo as "paper", and the photo, toned apart
+   and laid back, stood in a rectangle of guilloche the rest of the page no
+   longer had. So a spread gets the card's treatment: the light evened (one
+   factor for every channel, so the colour stays), a gentle stretch, and
+   nothing whitened; steps 5–11 below do not run on it. `--spread-scan`
+   brings the scan back. A finger is told from print by texture as well as
+   colour: a passport's red ornament runs out to the page edge and is as red
+   as a thumb, but a thumb is smooth (median local spread 5) and the
+   ornament is not (31). And a repainted border takes the page's median
+   tone, not the centre pixel's — on a spread the centre is the red strip.
 5. **Keep a face photo out of the paper treatment.** Everything from here on
    turns light smooth areas into white paper, and a face is a light smooth
    area: a passport came back with white holes for cheeks. A photo is a
@@ -465,6 +477,7 @@ flag; `--help` lists them.
 | a spread came out upside down | no face photo told up from down — `--rotate 180` |
 | a face photo came out bleached | it was not found — the report has no `face photo at` line |
 | an ID card came out as a scanned page, not a card | not card-shaped — the report has no `card:` line |
+| a passport spread came out with its background whitened (the old scan look) | that is `--spread-scan`; the default keeps it |
 | a card's back landed on top | neither side's face photo was found; the photos keep their input order — shoot the front first |
 | a card's front and back landed on two pages | they were not two photos in a row, or one of them was not found as a card |
 | a card came out upside down | its face photo was not found — it was taken for a back |
