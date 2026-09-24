@@ -1312,7 +1312,11 @@ def edge_quads(path):
         w, h = EDGE_SIDE, max(1, round(EDGE_SIDE * h0 / w0))
     else:
         w, h = max(1, round(EDGE_SIDE * w0 / h0)), EDGE_SIDE
-    edge = path + ".edges.png"
+    # In a scratch directory, never beside the input: that is the user's
+    # folder, and two runs over one photo at once (the service, a test run
+    # in parallel) overwrote each other's edge map and crashed.
+    work = tempfile.mkdtemp(prefix="a4norm-edges-")
+    edge = os.path.join(work, "edges.png")
     magick(path + "[0]", "-resize", f"{w}x{h}!", "-write", "mpr:s",
            "-colorspace", "gray", "-canny", "0x2+10%+30%",
            "(", "mpr:s", "-colorspace", "HSL", "-channel", "G", "-separate",
@@ -1324,7 +1328,7 @@ def edge_quads(path):
     E = subprocess.run(["magick", edge, "-morphology", "Dilate", "Square:2",
                         "-depth", "8", "gray:-"],
                        check=True, capture_output=True).stdout
-    os.unlink(edge)
+    shutil.rmtree(work, ignore_errors=True)
     lines = []
     for l in out.splitlines():
         m = re.match(r"line ([-\d.]+),([-\d.]+) ([-\d.]+),([-\d.]+)\s+# (\d+)", l)
