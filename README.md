@@ -403,6 +403,25 @@ change what this image may be used for.
    at 200 dpi with 4:2:0 chroma instead of 300 — a passport spread from a
    1280×960 snapshot went from 1.6 MB to 577 KB with no difference visible
    side by side. The report says so; an explicit `--dpi` is always obeyed.
+11. **Clean the open paper.** A white page with grey grain in one corner
+    looks worse than the photo it came from. It is where a hard shadow lay
+    over the sheet's corner and the flat-field could not follow its edge, and
+    the same goes for dust and a pencil tip's fleck. A mark is erased only
+    when three things hold:
+    - it is small (under 2.5 mm square);
+    - it is light (nothing in it darker than 60%: grey 8 pt print measures
+      40–60%, shadow grain 77% and lighter);
+    - nothing of substance lies within 3 mm of it. Substance is a larger mark,
+      a long thin one (a light ruled line breaks into speck-sized fragments),
+      or a few dark pixels.
+
+    A full stop, an i's dot and a decimal point all sit next to print and
+    stay. A cluster of grain has no print among it and goes whole. A large
+    mark filling a corner of the page and running into its edge is taken for
+    that shadow in one piece: it goes too, except the reach around any print
+    it covers. The marks are measured at 150 dpi, the erasing is done at full
+    resolution, and it costs about 1.5–2 s a page. `--no-despeckle` turns it
+    off.
 
 `--dry-run` prints which path each page took and why. Every parameter above is a
 flag; `--help` lists them.
@@ -422,6 +441,8 @@ flag; `--help` lists them.
 | the page came out small, adrift in wide empty margins | the layout was guessed — `--fit frame`, or `--fit edges` |
 | one page of a set came out smaller than the others | its sheet edges were not all found; compare the `border cut` lines in `--dry-run` |
 | a pale stamp or a pencil note vanished | `--no-haze`, then `--paper-thr 95` |
+| tiny light marks on open paper vanished (faint dots, a light dotted line) | `--no-despeckle` |
+| grey grain left in a corner of an otherwise white page | its flecks were dark (under 60%) or near print — `--dry-run` shows what `cleaned` took |
 | a coloured stamp came out grey | `--chroma 5`, or `--chroma-grow 10` |
 | black print stayed brown or blue-ish | `--chroma 10`, or `--gray` |
 | a handwritten page came out tilted | `--no-deskew` — the estimator reads text baselines, handwriting has none worth trusting |
