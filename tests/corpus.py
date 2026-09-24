@@ -29,6 +29,14 @@ cases.json is a list of objects:
                                        # spread: 176x125 mm is 1.41
      "known_fail": "why"}              # optional: reported, not counted
 
+A case can also be several photos going into one document -- a card's front
+and back shot one after the other:
+
+    {"name": "de-ausweis-pair", "files": ["front.jpg", "back.jpg"],
+     "expect": {"cards": 2,            # cards found, over all the photos
+                "fronts": 1,           # of them with a face photo
+                "pages": 1}}           # pages in the PDF
+
 A case marked known_fail is a photo the tool does not handle YET: it stays in
 the corpus as the next thing to fix, is reported as xfail while it fails, and
 as XPASS (so the mark can be removed) once it passes.
@@ -90,6 +98,14 @@ def check(case, rep, page, render, A):
                     bad.append(f"spread is {a}x{b}, long/short {r:.2f}; a "
                                f"passport spread is {lo}-{hi} -- a strip of "
                                f"it was cut off, or something else was added")
+    card_lines = [l for l in lines if re.match(r"card \d+: rectified", l)]
+    if "cards" in exp and len(card_lines) != exp["cards"]:
+        bad.append(f"{len(card_lines)} card(s) found, expected {exp['cards']}")
+    if "fronts" in exp:
+        fronts = sum(1 for l in card_lines if l.endswith("— front"))
+        if fronts != exp["fronts"]:
+            bad.append(f"{fronts} front(s) with a face photo, expected "
+                       f"{exp['fronts']}")
     if "turn" in exp:
         got = 0
         for l in lines:
@@ -148,12 +164,14 @@ def main():
     counts = {"ok": 0, "FAIL": 0, "xfail": 0, "XPASS": 0}
     rows = []
     for case in cases:
-        name = os.path.splitext(case["file"])[0]
-        if a.only and a.only not in (name, case["file"]):
+        files = case.get("files") or [case["file"]]
+        name = case.get("name") or os.path.splitext(files[0])[0]
+        if a.only and a.only not in (name, files[0]):
             continue
-        src = os.path.join(CORPUS, case["file"])
+        srcs = [os.path.join(CORPUS, f) for f in files]
+        src = srcs[0]
         pdf = os.path.join(OUT, name + ".pdf")
-        p = subprocess.run([a.a4norm, *case.get("args", []), "-o", pdf, src],
+        p = subprocess.run([a.a4norm, *case.get("args", []), "-o", pdf, *srcs],
                            capture_output=True, text=True)
         open(os.path.join(OUT, name + ".txt"), "w").write(p.stdout + p.stderr)
         if p.returncode != 0:
@@ -166,6 +184,10 @@ def main():
                  pdf, base)
             render = base + ".png"
             bad = check(case, rep, R.Page(render), render, A)
+            npages = R.pdf_facts(pdf)[0]
+            if npages != case.get("expect", {}).get("pages", npages):
+                bad.append(f"{npages} page(s) in the PDF, expected "
+                           f"{case['expect']['pages']}")
         known = case.get("known_fail")
         if bad and known:
             status = "xfail"
