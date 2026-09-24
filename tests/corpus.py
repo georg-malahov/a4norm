@@ -107,6 +107,16 @@ def check(case, rep, page, render, A, pdf=None):
         if fronts != exp["fronts"]:
             bad.append(f"{fronts} front(s) with a face photo, expected "
                        f"{exp['fronts']}")
+    if exp.get("front_on_top") and card_lines:
+        # the rendered page's upper card must hold the face: its left
+        # third darker than the lower card's
+        top = page.share(lambda i: i // page.w < page.h // 2
+                         and i % page.w < page.w // 2 and page.lum[i] < 120)
+        bottom = page.share(lambda i: i // page.w >= page.h // 2
+                            and i % page.w < page.w // 2 and page.lum[i] < 120)
+        if top <= bottom:
+            bad.append(f"the front is not on top (dark on the left: top "
+                       f"{top:.2f}%, bottom {bottom:.2f}%)")
     if exp.get("clean_corners"):
         # A white page does not end in grey corners. What a shadow over the
         # sheet's corner leaves is GRAIN: many small separate grey flecks.

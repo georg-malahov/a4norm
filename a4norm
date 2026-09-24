@@ -1357,6 +1357,17 @@ def edge_quads(path):
         i1 = max(0, min(2 * s + 1, round(tb) + s + 1))
         return (ln["pre"][i1] - ln["pre"][i0]) / max(1, i1 - i0)
 
+    def seg_support(a, b):
+        """Share of the straight segment a-b that lies on an edge."""
+        n = max(10, int(math.hypot(b[0] - a[0], b[1] - a[1])))
+        hit = 0
+        for k in range(n):
+            t = (k + 0.5) / n
+            x = round(a[0] + (b[0] - a[0]) * t)
+            y = round(a[1] + (b[1] - a[1]) * t)
+            hit += 1 if 0 <= x < w and 0 <= y < h and E[y * w + x] > 128 else 0
+        return hit / n
+
     horiz = sorted((l for l in lines if abs(l["l"][2]) >= abs(l["l"][3])),
                    key=lambda l: -l["cnt"])[:EDGE_LINES]
     vert = sorted((l for l in lines if abs(l["l"][2]) < abs(l["l"][3])),
@@ -1395,7 +1406,7 @@ def edge_quads(path):
                                   "score": sum(sup) / 4 * math.sqrt(share),
                                   "share": share})
     cands.sort(key=lambda c: -c["score"])
-    return cands, (lines, support), w, h, w0, h0
+    return cands, (lines, support, seg_support), w, h, w0, h0
 
 
 def _quad_sides(q):
@@ -1500,7 +1511,7 @@ def edge_document(src, bright_quad, o, report):
     card-shaped outline goes to the card path, which still wants a face
     photo on the card or its partner before it lays anything out as a card.
     """
-    cands, (lines, support), w, h, w0, h0 = edge_quads(src)
+    cands, (lines, support, seg_support), w, h, w0, h0 = edge_quads(src)
     if not cands:
         return None
     best = cands[0]
@@ -1514,11 +1525,26 @@ def edge_document(src, bright_quad, o, report):
     if o.cards != "off" and CARD_ASPECT[0] <= aspect <= CARD_ASPECT[1]:
         return ("cards", [full(q)], why)
     only_spread = False
+    edged_sheet = False
     if bright_quad is not None:
         bq = [(p[0] / sx, p[1] / sy) for p in bright_quad]
         slack = 0.02 * max(w, h)
         if (all(_inside(p, q, slack) for p in bq)
                 and _shoelace(q) >= EDGE_GROWTH * _shoelace(bq)):
+            # A scrap is a piece of the page the paper mask kept: its outline
+            # is ragged, where it ran into a picture. A real sheet's outline
+            # is a straight edge on every side. The landing's notebook demo
+            # lost its page to an outline around the page AND a band of desk
+            # above it, until this asked whether the brightness quad was
+            # itself edged: there, all four sides were. Such a quad is kept,
+            # unless a fold turns the larger outline into a spread (the upper
+            # page of a passport is edged all round too).
+            # Three sides of four: a spiral binding or a hand spoils one
+            # (the demo's page: 0.40, 1.00, 0.96, 1.00; the upper page of a
+            # passport on a sweater, a true scrap of its spread: 0.02-0.17).
+            bsup = sorted(seg_support(bq[i], bq[(i + 1) % 4]) for i in range(4))
+            if bsup[1] >= EDGE_SHEET:
+                edged_sheet = True
             why += ", the brightness quad was a scrap inside it"
         elif ((all(_inside(p, bq, slack) for p in q)
                 and _shoelace(bq) >= EDGE_GROWTH * _shoelace(q))
@@ -1532,6 +1558,8 @@ def edge_document(src, bright_quad, o, report):
             only_spread = True
         else:
             return None
+    if edged_sheet:
+        only_spread = True
     if o.spread != "off":
         fold = edge_fold(q, lines, support)
         if fold:
@@ -2163,6 +2191,13 @@ def process_cards(src, quads, why, out_png, o, report):
     radius = CARD_RADIUS_MM / MM * o.dpi
     cards = []
     d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    # INTERFACE -- do not reword without updating the consumers. The
+    # malahov.io browser demo (oneCard() in
+    # src/components/products/product-try-in-browser.tsx) runs each photo
+    # alone and matches /^card: 1 ID-1 card / to decide that the photo must
+    # be re-run together with the next one, so build() can pair front and
+    # back. Its sync script refuses a script without this text, and
+    # tests/regression.py asserts it (check_report_contract).
     report.append(f"card: {len(quads)} ID-1 card{'s' if len(quads) > 1 else ''} "
                   f"in the frame ({why})")
     for k, q in enumerate(quads):

@@ -380,9 +380,107 @@ def sample_checks():
     ]
 
 
+def landing_notebook_checks():
+    def rectified(rep, page):
+        if not rep["rectified"]:
+            raise Fail("the notebook page was not rectified")
+        pct, w, h = rep["rectified"]
+        if not (18 <= pct <= 35) or not (0.9 <= w / h <= 1.15):
+            raise Fail(f"quad {pct}% of the frame, {w}x{h}: expected the "
+                       f"nearly square notebook page, 18-35% of the frame "
+                       f"(an outline taking in the desk above it measured "
+                       f"36%, 1.43 tall)")
+
+    def no_desk(rep, page):
+        # the regression this case exists for: a band of orange desk across
+        # the top of the page
+        top = page.h * 15 // 100
+        n = sum(1 for i in range(top * page.w) if page.chroma[i] > 40)
+        share = 100.0 * n / (top * page.w)
+        if share > 0.5:
+            raise Fail(f"the top 15% of the page is {share:.1f}% strongly "
+                       f"coloured (expected <= 0.5%): desk on the page")
+
+    def binding_cut(rep, page):
+        if not rep["cut"] or rep["cut"]["left"] <= 0:
+            raise Fail(f"no band was cut from the left (cut = {rep['cut']}): "
+                       f"the spiral binding is still there")
+        s = page.column_ink(0, max(1, page.w * 4 // 100))
+        if s > 2.0:
+            raise Fail(f"the left 4% of the page is {s:.1f}% ink: binding "
+                       f"marks in the margin")
+
+    def lines_across(rep, page):
+        if page.line_direction() < 1.5:
+            raise Fail("the handwriting no longer runs across the page")
+
+    return [
+        ("the notebook page is rectified, not page and desk", rectified),
+        ("no desk across the top of the page", no_desk),
+        ("the spiral binding is cut", binding_cut),
+        ("handwriting runs across the page", lines_across),
+    ]
+
+
+def landing_invoice_checks():
+    def rectified(rep, page):
+        if not rep["rectified"]:
+            raise Fail("the invoice sheet was not rectified")
+        pct, w, h = rep["rectified"]
+        if not (55 <= pct <= 80) or not (1.3 <= h / w <= 1.5):
+            raise Fail(f"quad {pct}% of the frame, {w}x{h}: expected the A4 "
+                       f"sheet, 55-80% of the frame, 1.3-1.5 tall")
+
+    def not_blank(rep, page):
+        s = page.ink_share()
+        if not (1.0 <= s <= 15.0):
+            raise Fail(f"{s:.2f}% of the page is ink, expected 1-15%")
+
+    def clean_corner(rep, page):
+        # The shadow over the sheet's lower-right corner must not leave grey
+        # grain on the page (it did before the open-paper pass). Grain is
+        # many small separate flecks; a share of grey pixels cannot tell it
+        # from the footer rule that runs into the corner, a count can. At
+        # 150 dpi: at 50 the flecks average away.
+        base = page.pdf[:-4] + "-150"
+        sh("pdftoppm", "-r", "150", "-png", "-singlefile", page.pdf, base)
+        hi = Page(base + ".png")
+        cw, ch = hi.w // 10, hi.h // 10
+        grey = {(x, y) for y in range(hi.h - ch, hi.h)
+                for x in range(hi.w - cw, hi.w) if hi.lum[y * hi.w + x] < 230}
+        flecks = 0
+        while grey:
+            stack, size = [grey.pop()], 1
+            while stack:
+                x, y = stack.pop()
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        q = (x + dx, y + dy)
+                        if q in grey:
+                            grey.discard(q); stack.append(q); size += 1
+            flecks += size <= 150
+        if flecks > 2:
+            raise Fail(f"lower-right corner holds {flecks} grey flecks "
+                       f"(expected <= 2; 5 before the open-paper pass): "
+                       f"shadow grain is back")
+
+    return [
+        ("the invoice sheet is rectified, not the desk", rectified),
+        ("the page is not blank", not_blank),
+        ("the shadowed corner comes out clean", clean_corner),
+    ]
+
+
+# The landing page's own demo photos (malahov.io/products/a4norm). They are
+# NOT the same photos as notebook-photo / sample-photo: the landing notebook
+# lost its page to an edge outline around the page and a band of desk above
+# it, and nothing here noticed, because only the README's examples were
+# tested. Whatever the landing shows is tested here too.
 CASES = [
     ("notebook-photo", "notebook-photo.jpg", notebook_checks),
     ("sample-photo", "sample-photo.jpg", sample_checks),
+    ("landing-notebook", "landing-notebook.webp", landing_notebook_checks),
+    ("landing-invoice", "landing-invoice.webp", landing_invoice_checks),
 ]
 
 
@@ -415,6 +513,7 @@ def run_case(name, src, checks, a4norm, update, artifacts, golden_dir):
         sh("pdftoppm", "-r", str(RENDER_DPI), "-png", "-singlefile", pdf, png_base)
         render = png_base + ".png"
         page = Page(render)
+        page.pdf = pdf
 
         for desc, fn in checks():
             try:
@@ -457,6 +556,30 @@ def run_case(name, src, checks, a4norm, update, artifacts, golden_dir):
     return failures, metric, p.stdout
 
 
+# Report lines other programs parse. Changing one of these strings is an
+# interface change: update the consumer named beside it first.
+REPORT_CONTRACT = [
+    # malahov.io browser demo, oneCard(): /^card: 1 ID-1 card /
+    ("card: 1 ID-1 card", 'report.append(f"card: {len(quads)} ID-1 card'),
+]
+
+
+def check_report_contract(a4norm):
+    """Fail if a report line another program parses was reworded.
+
+    Neither public example holds a card, so the line cannot be observed in
+    a run; the source is checked instead, the same way the demo's sync
+    script checks it before it takes a new version.
+    """
+    try:
+        src = open(a4norm, encoding="utf-8").read()
+    except OSError as e:
+        return [f"cannot read {a4norm} to check the report contract: {e}"]
+    return [f"report line {line!r} is no longer written (expected the code "
+            f"{code!r}) -- a program parses it, see REPORT_CONTRACT"
+            for line, code in REPORT_CONTRACT if code not in src]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--a4norm", default=shutil.which("a4norm") or
@@ -476,6 +599,11 @@ def main():
     print(f"a4norm under test: {a.a4norm}  (goldens: {flavor})")
     print(sh("magick", "-version").stdout.decode().splitlines()[0])
     bad = 0
+    for f in check_report_contract(a.a4norm):
+        bad += 1
+        print(f"FAIL  report contract\n  x {f}")
+    if not bad:
+        print("ok    report contract")
     for name, src, checks in CASES:
         if a.only and a.only != name:
             continue
