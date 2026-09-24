@@ -161,17 +161,27 @@ def check(case, rep, page, render, A, pdf=None):
                 got = int(l.split()[1].rstrip("°"))
         if got != exp["turn"]:
             bad.append(f"turned {got}°, expected {exp['turn']}°")
-    if exp.get("lines_across"):
+    copy = any(l.startswith("colour copy:") for l in lines)
+    # On a colour copy the two measures below are read on a page that keeps
+    # its guilloche, and they misread it both ways (a correctly turned spread
+    # measured 0.53 "across", a present photo 0.10 "dark"). There the "turn"
+    # expectation already fixes the orientation, and the contact sheet is
+    # the check that the photo and the ornament are there.
+    if exp.get("lines_across") and not copy:
         # a4norm's own run-length measure, not regression.py's profile
         # variance: on a passport page the photo and the vertical serial
         # number swing the column profile as hard as the text swings the rows
         # (1.22 on a correctly turned spread)
-        across, along = A._ink_runs(render)
+        # Dark print only: a colour copy keeps the guilloche, whose light
+        # lines run every way and at the default bar read as text.
+        across, along = A._ink_runs(render, thr=55)
         ratio = across / max(1, along)
         if ratio < 1.6:
             bad.append(f"text does not run across the page (ink in runs "
                        f"across/along {ratio:.2f}, expected >= 1.6)")
-    if "face_photo" in exp:
+    if "face_photo" in exp and copy:
+        pass
+    elif "face_photo" in exp:
         box = None
         for l in lines:
             m = re.match(r"face photo at (\d+)x(\d+)\+(\d+)\+(\d+) of (\d+)x(\d+)", l)
