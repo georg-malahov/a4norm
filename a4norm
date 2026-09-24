@@ -3036,7 +3036,7 @@ def deskew(job, flags, span, shave, keep):
     return keep
 
 
-def neutralize_ink(job, size):
+def neutralize_ink(job):
     """Take the photo's colour cast off the ink, keep genuinely coloured ink.
 
     Coloured ink = high chroma AND dark. Chroma alone also fires on the warm
@@ -3049,9 +3049,7 @@ def neutralize_ink(job, size):
     the coverage back without a seventh read of the mask.
     """
     o = job.o
-    # `size` is the page's size BEFORE deskew, as it has always been; see
-    # process_page
-    iw, ih = size
+    iw, ih = dims(job.cur)
     nxt = job.path("neutral")
     share = float(magick(
         job.cur, "-write", "mpr:flat",
@@ -3293,10 +3291,6 @@ def process_page(src, out_png, o, report):
         colour_copy(job)
     # 4. the face photo, the flat-field, deskew, the ink, the tone
     keep = None if (o.no_keep_photo or copy) else keep_face_photo(job, spread)
-    # The ink mask below is resized to the page as it is HERE, before a
-    # deskew can grow the canvas. That is how it has always run; whether it
-    # should follow the deskewed size is a behaviour change of its own.
-    size = dims(job.cur)
     if not copy:
         flat_field(job)
     if not o.no_deskew and not rectified:
@@ -3310,7 +3304,7 @@ def process_page(src, out_png, o, report):
                   "-type", "TrueColor")
         job.say("grayscale output")
     elif not o.no_neutralize and not copy:
-        neutralize_ink(job, size)
+        neutralize_ink(job)
     if not copy:
         tone(job)
     # 5. fit onto A4
