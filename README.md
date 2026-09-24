@@ -1,5 +1,28 @@
 # a4norm
 
+Photos of paper documents into one scanner-grade A4 PDF — **use it at
+[malahov.io/a4norm](https://malahov.io/a4norm)**
+([Deutsch](https://malahov.io/de/a4norm), [Русский](https://malahov.io/ru/a4norm)).
+
+- **In the browser:** [malahov.io/a4norm](https://malahov.io/a4norm). This
+  script, unchanged, runs inside the page — Python through Pyodide, ImageMagick
+  compiled to WebAssembly. The photos never leave the device, it works offline,
+  and it is free.
+- **As an app:** [malahov.io/a4norm/app](https://malahov.io/a4norm/app)
+  installs the same scanner on a phone or a computer (a PWA).
+- **Inside Telegram:** [@a4norm_bot](https://t.me/a4norm_bot) → the
+  **Scanner** menu button opens the same in-browser scanner as a Mini App. The
+  bot itself processes no photos. Only when you tap **Send to chat** does the
+  finished PDF pass through the site's server to your chat, and it is not
+  stored there.
+
+How-to guides: [malahov.io/a4norm/how-to](https://malahov.io/a4norm/how-to).
+Privacy: [malahov.io/privacy](https://malahov.io/privacy)
+([the bot](https://malahov.io/privacy#12-a4norm-telegram-bot)).
+
+What follows is for developers: what the script does, and how to run it from
+the command line, in a container and as an HTTP service.
+
 A photo of a paper document is not a scan. `a4norm` makes it one: the sheet is
 found in the frame and warped flat, the desk and the spiral binding are erased,
 the camera's uneven light becomes even white paper, the ink goes neutral while a
@@ -16,13 +39,10 @@ driving ImageMagick and poppler, and the container is 104 MB. A second image,
 `:full`, adds one segmentation model for the photographs the brightness rule
 cannot solve — see **Two images** below. The light image is unchanged by it.
 
-**Product page:** [malahov.io/a4norm](https://malahov.io/a4norm) — what it does,
-with before/after examples. The two photos there are public examples here
-too (`examples/landing-*.webp`), under the same tests.
+The before/after photos on the [product page](https://malahov.io/a4norm) are
+public examples here too (`examples/landing-*.webp`), under the same tests.
 
-**Try it without installing anything:** [@a4norm_bot](https://t.me/a4norm_bot)
-on Telegram is this tool behind a chat window — send a photo, or a whole album,
-and the A4 PDF comes back. It runs the same container as below.
+From the command line, in the container:
 
 ```bash
 docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
