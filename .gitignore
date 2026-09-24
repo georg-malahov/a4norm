@@ -4,3 +4,6 @@ __pycache__/
 
 # Local test corpus: real document photos, personal data. Never committed.
 tests/corpus/
+
+# Test run output and the local report (tests/run.sh). Never committed.
+tests/out/

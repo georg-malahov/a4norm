@@ -36,6 +36,7 @@ not refreshed by that flag -- if one of them fails, either the change is a
 regression or the expectation below has to be edited by hand, on purpose.
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -587,7 +588,10 @@ def main():
                     help="the a4norm to test (default: the one on PATH)")
     ap.add_argument("--update-goldens", action="store_true",
                     help="rewrite tests/golden/<flavor>/*.png from this run")
-    ap.add_argument("--artifacts", help="copy PDFs, renders and reports here")
+    ap.add_argument("--artifacts", default=os.path.join(HERE, "out", "examples"),
+                    help="copy PDFs, renders and reports here, and write "
+                         "results.json for tests/report.py (default: "
+                         "tests/out/examples, git-ignored)")
     ap.add_argument("--only", help="run one case by name")
     ap.add_argument("--flavor", choices=("light", "full"),
                     help="which golden set to compare with (default: 'full' "
@@ -599,6 +603,7 @@ def main():
     print(f"a4norm under test: {a.a4norm}  (goldens: {flavor})")
     print(sh("magick", "-version").stdout.decode().splitlines()[0])
     bad = 0
+    results = []
     for f in check_report_contract(a.a4norm):
         bad += 1
         print(f"FAIL  report contract\n  x {f}")
@@ -610,6 +615,15 @@ def main():
         failures, metric, out = run_case(name, src, checks, a.a4norm,
                                          a.update_goldens, a.artifacts,
                                          golden_dir)
+        results.append({
+            "suite": "examples", "name": name,
+            "input": os.path.join(EXAMPLES, src),
+            "status": "FAIL" if failures else "ok",
+            "failures": failures, "metric": metric, "report": out,
+            "pdf": os.path.join(a.artifacts, name + ".pdf"),
+            "render": os.path.join(a.artifacts, name + "-render.png"),
+            "golden": os.path.join(golden_dir, name + ".png"),
+        })
         if failures:
             bad += 1
             print(f"\nFAIL  {name}  [{metric}]")
@@ -620,6 +634,11 @@ def main():
                 print(f"    {l}")
         else:
             print(f"ok    {name}  [{metric}]")
+    if a.artifacts and not a.only:
+        os.makedirs(a.artifacts, exist_ok=True)
+        with open(os.path.join(a.artifacts, "results.json"), "w") as f:
+            json.dump({"flavor": flavor, "a4norm": a.a4norm,
+                       "cases": results}, f, indent=1)
     if bad:
         print(f"\n{bad} example(s) regressed. A change to a4norm broke a "
               f"public example -- the landing-page demo is notebook-photo.")

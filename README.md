@@ -25,7 +25,7 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   -o /work/contract.pdf /work/page1.HEIC /work/page2.HEIC /work/page3.HEIC
 ```
 
-Four test images live in `examples/`, and none carries anybody's data.
+Four test images live in `examples/`, and none carries anybody's data (see **Testing**).
 `sample-photo.jpg` is a generated letter, degraded to look photographed (warm
 cast, uneven light, a tilt, a desk border). `notebook-photo.jpg` is a real
 phone shot of a handwritten to-do list on a spiral notebook, at an angle on a
@@ -43,34 +43,60 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   --preview /work/examples/sample-photo.jpg
 ```
 
-The regression corpus is larger than this — 26 pages covering receipts, forms,
-multi-page PDFs and sheets darker than their background — and it is
-deliberately **not** in this repository: those are real documents belonging to
-real people. What it protects is stated in the commit messages that changed
-behaviour, with the numbers each decision turned on, so a change can be argued
-about even by someone who cannot run it.
+## Testing
 
-The two public examples ARE under test, in CI, on every push and pull
-request, inside both images before either is pushed: `tests/regression.py`
-checks what a4norm reports (the notebook's quad is rectified, its left side
-is judged a binding and cut while the other three are kept, the page turns
-and the picture does not) and what the page looks like (exact A4, not blank,
-lines run across, the blue signature still blue, the pencil still grey),
-plus a tolerant comparison with a low-resolution golden render. Deploy waits
-for it. Run it locally with `tests/run-in-docker.sh`; when a change is meant
-to alter the pages, refresh the goldens with `--update-goldens` in each image
-and look at them before committing.
+One command runs every test and builds a page to look at:
 
-The private corpus has a runner of its own, `tests/corpus.py`, which reads
-`tests/corpus/` — photos plus a `cases.json` of what each must come out as
-(spread found, turned by how much, face photo kept and in the lower left,
-text running across). That directory is in `.gitignore` and `.dockerignore`
-and exists only on the machines that run it; the runner and its format are
-public, the documents are not. A photo the tool cannot handle yet stays in
-the corpus marked `known_fail` with the reason, is reported as `xfail`, and
-flips to `XPASS` the day it starts passing. Every run writes
-`tests/corpus/out/sheet.png`, each input beside the page it became — the
-checks are necessary, never sufficient.
+```bash
+tests/run.sh --open        # needs magick + poppler + python3, like a4norm
+```
+
+It runs the three layers below, writes `tests/out/report.html` (every input
+beside the page it became, the golden it is held to, the verdict and why,
+a4norm's own report) and opens it. `tests/out/` is git-ignored; nothing
+leaves the machine. The exit code is non-zero when a check failed, and the
+report is built either way — that is when it is needed.
+
+1. **Public examples — snapshot + structure** (`tests/regression.py`). The
+   four photos in `examples/` are in the repository and run in CI on every
+   push and pull request, inside both images, before anything is published
+   or deployed. Each is checked two ways: structural facts read from a4norm's
+   report and the page (the sheet was rectified, the binding cut, exact A4,
+   lines run across, the blue signature still blue, no desk above the page,
+   a clean corner…), and a tolerant comparison with a low-resolution golden
+   render in `tests/golden/<light|full>/` (mean error ≤ 4, ≤ 3% of pixels
+   moved a lot). When a change is MEANT to alter the pages, refresh the
+   goldens with `tests/run-in-docker.sh IMAGE --flavor light|full
+   --update-goldens`, look at them in the report, and say why in the commit.
+   It also asserts report lines other programs parse (`REPORT_CONTRACT`).
+2. **Your own photos — local corpus** (`tests/corpus.py`). Put photos in
+   `tests/corpus/` and describe what each must come out as in
+   `tests/corpus/cases.json`; the directory is in `.gitignore` and
+   `.dockerignore`, so real documents never reach the repository or an
+   image. A case looks like:
+
+   ```json
+   [{"file": "passport-on-sweater.jpg",
+     "note": "what makes it hard",
+     "expect": {"spread": true, "turn": 0, "face_photo": true}},
+    {"name": "id-card-pair", "files": ["front.heic", "back.heic"],
+     "expect": {"cards": 2, "fronts": 1, "pages": 1, "front_on_top": true}},
+    {"file": "licence-on-white.jpg", "expect": {"cards": 1},
+     "known_fail": "as bright as the surface; needs edge finding"}]
+   ```
+
+   Every key is optional; the full list is in `tests/corpus.py`. A photo the
+   tool cannot handle yet stays marked `known_fail` with the reason: it shows
+   as *known*, does not fail the run, and flips to *XPASS* the day it
+   passes. The author's own corpus (passports, ID cards, licences found on
+   the web) is not published for the same reason yours should not be.
+3. **The report** (`tests/report.py`) — the checks are necessary, never
+   sufficient: every bug in this pipeline so far produced a valid A4 PDF and
+   a plausible report. Look at the pages.
+
+What the checks protect, and the numbers each decision turned on, is in the
+commit messages that changed behaviour, so a change can be argued about even
+by someone who cannot run the private corpus.
 
 ## Run it
 
