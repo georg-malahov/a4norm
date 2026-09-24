@@ -263,9 +263,15 @@ change what this image may be used for.
    corners and a hairline edge so a white card still has one on a white
    page. Cards are laid out **front above back on one A4**, whether both are
    in one photo or in two photos in a row (`--card-size fit` blows them up
-   to the page width). A group of cards needs a face photo on at least one:
-   a bright 16:10 rectangle without one — a screen, a sign — is no identity
-   card, and its photo goes back through as a document.
+   to the page width). What makes a card is its shape, not a face: a bank
+   card has none, and a German ID card's pale portrait once read as "no
+   face" on both sides of a perfectly shot pair, which went out as a
+   snapshot and a scanned page. The face only decides which side goes on
+   top and which way up — found as a dark, columnar block in the left third,
+   or as a place far darker than its mirror (0.41 against 0.06 on that ID).
+   A card beats a spread only when the spread was one region cut at a kink:
+   a whole open passport is card-shaped too. `--cards off` for a 16:10
+   rectangle that is no card.
    **When brightness cannot see the document, its edges can** (`--edges`,
    auto). Every detector above looks for PAPER, and a white page on a white
    desk, a passport over a light floor or a page whose colour pictures broke
@@ -280,7 +286,7 @@ change what this image may be used for.
    (30% smaller or more), or the frame itself (70% of it and more).
 
    - A card-shaped outline (1.50–1.68) goes to the card path, which still
-     wants a face photo before it lays anything out as a card.
+     lays it out as a card, face or no face.
    - An outline with a **fold** becomes a spread. The fold is a line across
      the middle, parallel to the short sides, and it must stand alone: a card
      or a page of print has one under every row of text (6–14 measured),
@@ -428,7 +434,8 @@ flag; `--help` lists them.
 | something that is not a booklet was split in two and joined | `--spread off` |
 | a spread came out upside down | no face photo told up from down — `--rotate 180` |
 | a face photo came out bleached | it was not found — the report has no `face photo at` line |
-| an ID card came out as a scanned page, not a card | not card-shaped (the report has no `card:` line) or no face photo on it or its partner |
+| an ID card came out as a scanned page, not a card | not card-shaped — the report has no `card:` line |
+| a card's back landed on top | neither side's face photo was found; the photos keep their input order — shoot the front first |
 | a card's front and back landed on two pages | they were not two photos in a row, or one of them was not found as a card |
 | a card came out upside down | its face photo was not found — it was taken for a back |
 | cards too small to read | `--card-size fit` — each card at the page width |
