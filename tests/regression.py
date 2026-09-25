@@ -496,6 +496,34 @@ def white_on_white_checks():
     ]
 
 
+def specimen_card_checks():
+    def pair(rep, page):
+        cards = [l for l in rep["lines"] if re.match(r"card \d+: rectified", l)]
+        if len(cards) != 2 or not any(l.endswith("— front") for l in cards):
+            raise Fail("expected two ID-1 cards, one of them a front with its "
+                       "face photo. Report:\n    " + "\n    ".join(rep["lines"]))
+        if not any("laid out on one page, front above back" in l
+                   for l in rep["lines"]):
+            raise Fail("the two photos were not laid out as one card page")
+        if any("refused" in l for l in rep["lines"]):
+            raise Fail("a card was refused as part of something larger: the "
+                       "run-on test fires on a clean card on a textured cloth")
+
+    def front_on_top(rep, page):
+        top = page.share(lambda i: i // page.w < page.h // 2
+                         and i % page.w < page.w // 2 and page.lum[i] < 140)
+        bottom = page.share(lambda i: i // page.w >= page.h // 2
+                            and i % page.w < page.w // 2 and page.lum[i] < 140)
+        if top <= bottom:
+            raise Fail(f"the front (face photo on the left) is not on top "
+                       f"(dark on the left: top {top:.2f}%, bottom {bottom:.2f}%)")
+
+    return [
+        ("both photos are ID-1 cards, laid out on one page", pair),
+        ("the front is on top", front_on_top),
+    ]
+
+
 # The landing page's own demo photos (malahov.io/products/a4norm). They are
 # NOT the same photos as notebook-photo / sample-photo: the landing notebook
 # lost its page to an edge outline around the page and a band of desk above
@@ -508,6 +536,10 @@ CASES = [
     ("landing-invoice", "landing-invoice.webp", landing_invoice_checks),
     # made by tests/make-white-on-white.sh from the synthetic invoice
     ("white-on-white", "white-on-white.jpg", white_on_white_checks),
+    # a synthetic "SPECIMEN CARD", front then back, on a textured dark cloth
+    # (made by the malahov.io session): the only card path in CI
+    ("specimen-card", ["specimen-card-front.jpg", "specimen-card-back.jpg"],
+     specimen_card_checks),
 ]
 
 
@@ -517,7 +549,9 @@ def run_case(name, src, checks, a4norm, update, artifacts, golden_dir):
     failures = []
     with tempfile.TemporaryDirectory(prefix=f"a4reg-{name}-") as wd:
         pdf = os.path.join(wd, name + ".pdf")
-        p = subprocess.run([a4norm, "-o", pdf, os.path.join(EXAMPLES, src)],
+        srcs = src if isinstance(src, (list, tuple)) else [src]
+        p = subprocess.run([a4norm, "-o", pdf,
+                            *(os.path.join(EXAMPLES, f) for f in srcs)],
                            capture_output=True, text=True)
         if p.returncode != 0:
             return ([f"a4norm exited {p.returncode}:\n{p.stderr}"], "no output",
@@ -643,7 +677,9 @@ def main():
                                          golden_dir)
         results.append({
             "suite": "examples", "name": name,
-            "input": os.path.join(EXAMPLES, src),
+            "input": os.path.join(EXAMPLES, src if isinstance(src, str) else src[0]),
+            "inputs": [os.path.join(EXAMPLES, f) for f in
+                       ([src] if isinstance(src, str) else src)],
             "status": "FAIL" if failures else "ok",
             "failures": failures, "metric": metric, "report": out,
             "pdf": os.path.join(a.artifacts, name + ".pdf"),

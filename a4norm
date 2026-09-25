@@ -1304,7 +1304,7 @@ EDGE_SHEET = 0.60       # ...and this much, before a quad replaces a sheet
 
 
 def edge_map(path, hough=False):
-    """The frame's edges at the analysis scale: (E, w, h, w0, h0, hough).
+    """The frame's edges at the analysis scale: (E, w, h, w0, h0, hough, G).
 
     E is the edge map dilated by one step, as bytes, so that "on an edge"
     means within 2 px of one; `hough` is ImageMagick's Hough-line MVG when
@@ -1342,7 +1342,7 @@ def edge_map(path, hough=False):
                         "-depth", "8", "gray:-"],
                        check=True, capture_output=True).stdout
     shutil.rmtree(work, ignore_errors=True)
-    return E, w, h, w0, h0, out
+    return E, w, h, w0, h0, out, raw_gray(path + "[0]", w, h)
 
 
 def _seg_support(E, w, h):
@@ -1359,24 +1359,53 @@ def _seg_support(E, w, h):
     return support
 
 
-CARD_ALONE = 0.6        # edge support beyond a corner above which the card
-                        # is part of something larger
+CARD_ALONE = 0.5        # share of a side's own contrast that carries on
+                        # past its corner, above which the card is part of
+                        # something larger
 CARD_RUN_ON = (0.03, 0.18)  # the stretch past each corner that is looked at,
                             # as shares of that side's length
+CARD_EDGE_OFF = 4       # px either side of a line its contrast is read at
 
 
-def card_run_on(q, seg):
-    """How far a card's sides run on past its corners, as edge: the largest
-    support found on the eight stretches beyond the four corners.
+def card_run_on(q, G, w, h):
+    """How far a card's BOUNDARY carries on past its corners: the largest
+    share of a side's own contrast found on the stretches beyond them.
 
     A card is a thing on its own: its edges END at its corners. What else has
-    the ID-1 proportion is usually a piece of something larger -- the upper
-    third of a calendar, a panel of a form, a page of an open passport -- and
-    there at least one straight side carries on past the "corner", because
-    the thing does. Measured: every real card in the corpus 0.00-0.28, a wall
-    calendar 1.00, a passport page in a hand 1.00.
+    the ID-1 proportion is usually a piece of something larger -- the top of
+    a desk calendar, a panel of a form, one page of an open passport -- and
+    there at least one side carries on past the "corner", because the thing
+    does.
+
+    "Carries on" is measured as contrast ACROSS the line, not as edge pixels
+    ON it. The first version counted edge pixels, and a clean card on a
+    textured cloth failed: the cloth is edges everywhere (28% of the frame),
+    and any stretch beyond a corner hit them. Across a side of a card there
+    is light card on one hand and background on the other; past its corner
+    there is background on both, and the difference is zero whatever the
+    texture. Past the "corner" of a calendar panel the calendar is still on
+    one side. So the median brightness step across each side (inside minus
+    outside, CARD_EDGE_OFF px either way) is compared with the step across
+    the stretches beyond its two ends, in the same direction. Measured:
+    every real card of the corpus and a synthetic card on cloth 0.00-0.13,
+    a calendar and two passport pages in a hand 1.00.
     """
     d = lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])
+    off = CARD_EDGE_OFF
+
+    def step(P, ux, uy, nx, ny, t0, t1):
+        vals = []
+        n = max(8, int(abs(t1 - t0)))
+        for k in range(n):
+            t = t0 + (t1 - t0) * (k + 0.5) / n
+            x, y = P[0] + ux * t, P[1] + uy * t
+            xa, ya = round(x + nx * off), round(y + ny * off)
+            xb, yb = round(x - nx * off), round(y - ny * off)
+            if 0 <= xa < w and 0 <= ya < h and 0 <= xb < w and 0 <= yb < h:
+                vals.append(G[ya * w + xa] - G[yb * w + xb])
+        vals.sort()
+        return vals[len(vals) // 2] if vals else 0
+
     worst = 0.0
     g0, g1 = CARD_RUN_ON
     for i in range(4):
@@ -1385,24 +1414,24 @@ def card_run_on(q, seg):
         if L < 1:
             continue
         ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
-        worst = max(worst,
-                    seg((a[0] - ux * g0 * L, a[1] - uy * g0 * L),
-                        (a[0] - ux * g1 * L, a[1] - uy * g1 * L)),
-                    seg((b[0] + ux * g0 * L, b[1] + uy * g0 * L),
-                        (b[0] + ux * g1 * L, b[1] + uy * g1 * L)))
+        nx, ny = uy, -ux
+        side = step(a, ux, uy, nx, ny, 0.2 * L, 0.8 * L)
+        if abs(side) < 8:
+            continue            # no boundary to speak of along this side
+        for t0, t1 in ((-g1 * L, -g0 * L), ((1 + g0) * L, (1 + g1) * L)):
+            worst = max(worst, min(1.0, step(a, ux, uy, nx, ny, t0, t1) / side))
     return worst
 
 
 def cards_alone(src, quads, report):
     """Keep only the cards that are things on their own (card_run_on)."""
-    E, w, h, w0, h0, _ = edge_map(src)
-    seg = _seg_support(E, w, h)
+    _, w, h, w0, h0, _, G = edge_map(src)
     kept = []
     for q in quads:
-        runs = card_run_on([(x * w / w0, y * h / h0) for x, y in q], seg)
+        runs = card_run_on([(x * w / w0, y * h / h0) for x, y in q], G, w, h)
         if runs >= CARD_ALONE:
             report.append(f"card-shaped region refused: a side runs on past "
-                          f"its corner ({runs:.0%} edge) — part of something "
+                          f"its corner ({runs:.0%} of its contrast) — part of something "
                           f"larger")
         else:
             kept.append(q)
@@ -1412,12 +1441,12 @@ def cards_alone(src, quads, report):
 def edge_quads(path):
     """Candidate document quads from straight edges, best first.
 
-    Returns (cands, (lines, support, seg_support), w, h, w0, h0): cands a
+    Returns (cands, (lines, support, seg_support, G), w, h, w0, h0): cands a
     list of dicts {quad, score, minsup, share} at the analysis scale (quad
     tl,tr,br,bl), lines the Hough lines, support() the edge share of a
-    stretch of one of them, seg_support() of any segment.
+    stretch of one of them, seg_support() of any segment, G the grey image.
     """
-    E, w, h, w0, h0, out = edge_map(path, hough=True)
+    E, w, h, w0, h0, out, G = edge_map(path, hough=True)
     lines = []
     for l in out.splitlines():
         m = re.match(r"line ([-\d.]+),([-\d.]+) ([-\d.]+),([-\d.]+)\s+# (\d+)", l)
@@ -1490,7 +1519,7 @@ def edge_quads(path):
                                   "score": sum(sup) / 4 * math.sqrt(share),
                                   "share": share})
     cands.sort(key=lambda c: -c["score"])
-    return cands, (lines, support, seg_support), w, h, w0, h0
+    return cands, (lines, support, seg_support, G), w, h, w0, h0
 
 
 def _quad_sides(q):
@@ -1595,7 +1624,7 @@ def edge_document(src, bright_quad, o, report):
     card-shaped outline goes to the card path, which still wants a face
     photo on the card or its partner before it lays anything out as a card.
     """
-    cands, (lines, support, seg_support), w, h, w0, h0 = edge_quads(src)
+    cands, (lines, support, seg_support, G), w, h, w0, h0 = edge_quads(src)
     if not cands:
         return None
     best = cands[0]
@@ -1607,11 +1636,11 @@ def edge_document(src, bright_quad, o, report):
     why = (f"found by its edges: {best['share']:.0%} of the frame, sides "
            f"{aspect:.2f}:1, outline {best['minsup']:.0%}+ edge")
     if (o.cards != "off" and CARD_ASPECT[0] <= aspect <= CARD_ASPECT[1]):
-        runs = card_run_on(q, seg_support)
+        runs = card_run_on(q, G, w, h)
         if runs < CARD_ALONE:
             return ("cards", [full(q)], why)
         report.append(f"card-shaped outline refused: a side runs on past its "
-                      f"corner ({runs:.0%} edge) — part of something larger")
+                      f"corner ({runs:.0%} of its contrast) — part of something larger")
     only_spread = False
     edged_sheet = False
     if bright_quad is not None:
@@ -1675,11 +1704,11 @@ def edge_document(src, bright_quad, o, report):
     if (not only_spread and best["minsup"] >= EDGE_SHEET
             and 0.15 <= best["share"] <= EDGE_SHEET_MAX
             and EDGE_SHEET_ASPECT[0] <= aspect <= EDGE_SHEET_ASPECT[1]):
-        runs = card_run_on(q, seg_support)
+        runs = card_run_on(q, G, w, h)
         if runs < CARD_ALONE:
             return ("sheet", full(q), why)
         report.append(f"edge outline refused as a sheet: a side runs on past "
-                      f"its corner ({runs:.0%} edge)")
+                      f"its corner ({runs:.0%} of its contrast)")
     return None
 
 

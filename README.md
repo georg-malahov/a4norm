@@ -49,7 +49,7 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   -o /work/contract.pdf /work/page1.HEIC /work/page2.HEIC /work/page3.HEIC
 ```
 
-Five test images live in `examples/`, and none carries anybody's data (see **Testing**).
+Six test cases live in `examples/`, and none carries anybody's data (see **Testing**).
 `sample-photo.jpg` is a generated letter, degraded to look photographed (warm
 cast, uneven light, a tilt, a desk border). `notebook-photo.jpg` is a real
 phone shot of a handwritten to-do list on a spiral notebook, at an angle on a
@@ -69,6 +69,7 @@ shows is now under the same test.
 | <a href="examples/landing-notebook.webp"><img src="examples/landing-notebook.webp" width="220"></a> | <img src="tests/golden/light/landing-notebook.png" width="160"> | [`landing-notebook.webp`](examples/landing-notebook.webp) — the product page's demo: the page alone, no desk band above it |
 | <a href="examples/landing-invoice.webp"><img src="examples/landing-invoice.webp" width="220"></a> | <img src="tests/golden/light/landing-invoice.png" width="160"> | [`landing-invoice.webp`](examples/landing-invoice.webp) — a synthetic invoice with a hard shadow over its corner: the corner comes out clean |
 | <a href="examples/white-on-white.jpg"><img src="examples/white-on-white.jpg" width="220"></a> | <img src="tests/golden/light/white-on-white.png" width="160"> | [`white-on-white.jpg`](examples/white-on-white.jpg) — synthetic: a white sheet on a near-white desk, found by its edges alone, in both images (built by `tests/make-white-on-white.sh`) |
+| <a href="examples/specimen-card-front.jpg"><img src="examples/specimen-card-front.jpg" width="220"></a> | <img src="tests/golden/light/specimen-card.png" width="160"> | [`specimen-card-front.jpg`](examples/specimen-card-front.jpg) + [`-back`](examples/specimen-card-back.jpg) — a synthetic ID-1 card, two photos on textured cloth: one page, front above back, at real size |
 
 The pages are the low-resolution goldens the tests hold each example to
 (`tests/golden/`); see **Testing**.
@@ -95,7 +96,7 @@ leaves the machine. The exit code is non-zero when a check failed, and the
 report is built either way — that is when it is needed.
 
 1. **Public examples — snapshot + structure** (`tests/regression.py`). The
-   five photos in `examples/` are in the repository and run in CI on every
+   six cases in `examples/` are in the repository and run in CI on every
    push and pull request, inside both images, before anything is published
    or deployed. Each is checked two ways: structural facts read from a4norm's
    report and the page (the sheet was rectified, the binding cut, exact A4,
@@ -360,10 +361,14 @@ change what this image may be used for.
    and the browser (non-HDRI) did, so the two took different decisions.
    Now both builds agree within 4% of edge pixels on every photo tested.
 
-   An ID-1 outline is a card only if it is a thing on its own: a side that
-   runs on past a corner (more than 60% edge on the stretch beyond it) means
-   a piece of something larger — the top of a wall calendar, one page of an
-   open passport. Real cards measured 0–28%, those 100%. The outline is only believed
+   An ID-1 outline is a card only if it is a thing on its own: a side whose
+   boundary carries on past a corner — more than half of its own brightness
+   step across the line, still there on the stretch beyond — means a piece
+   of something larger: the top of a wall calendar, one page of an open
+   passport. Counting edge PIXELS there failed on a clean card on textured
+   cloth (the cloth is edges everywhere); contrast across the line is zero
+   past a real card's corner whatever the texture. Real cards measure
+   0.00–0.13, those 1.00. The outline is only believed
    where brightness failed: it found nothing, a scrap inside the outline
    (30% smaller or more), or the frame itself (70% of it and more). A
    "scrap" whose own outline is edged on three sides of four is no scrap
