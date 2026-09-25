@@ -22,10 +22,22 @@ wasm-bindgen --target web --out-dir "$OUT/st" --out-name a4norm "target/wasm-st/
 
 # The shared memory needs a maximum; 1 GiB is four times the peak of a
 # 50 MP photo and reserves nothing up front.
-RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 -C link-arg=--max-memory=1073741824" \
+# Atomics alone leave the memory private; the workers need it imported,
+# shared, and the thread-local storage exported for wasm-bindgen to set up.
+LINK="-C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=1073741824"
+LINK="$LINK -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size"
+LINK="$LINK -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base"
+RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 $LINK" \
   rustup run nightly cargo build --release --lib --target wasm32-unknown-unknown \
     --features wasm-threads --target-dir target/wasm-mt -Z build-std=panic_abort,std
 wasm-bindgen --target web --out-dir "$OUT/mt" --out-name a4norm "target/wasm-mt/$BG"
+
+# The pool's workers load the main module as '../../..', which a bundler
+# resolves and a plain static server answers with 404 (it is a directory):
+# the pool then waits forever. Name the file.
+sed -i.bak "s|import('../../..')|import('../../../a4norm.js')|" "$OUT"/mt/snippets/*/src/workerHelpers.js
+rm -f "$OUT"/mt/snippets/*/src/workerHelpers.js.bak
+grep -q "import('../../../a4norm.js')" "$OUT"/mt/snippets/*/src/workerHelpers.js
 
 rm -f "$OUT"/*/*.d.ts
 # Node reads a bare .js as CommonJS; the modules are ES, which a browser

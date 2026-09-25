@@ -3,15 +3,20 @@
 // The module runs in a worker made from a blob: URL, as on malahov.io, and
 // its thread pool is workers inside that worker.
 const src = `
-self.onmessage = async (e) => {
+self.onmessage = async (e) => { try {
   const { build, threads, files, args } = e.data;
+  const log = (m) => self.postMessage({ log: m });
   const base = self.location.origin + '/dist/' + build + '/';
+  log('import');
   const m = await import(base + 'a4norm.js');
+  log('init');
   const wasm = await m.default({ module_or_path: base + 'a4norm_bg.wasm' });
+  log('pool');
   if (build === 'mt') await m.initThreadPool(threads);
+  log('ready');
   const out = [];
   for (const run of files) {
-    const got = await Promise.all(run.map(async (n) => ({ name: n.split('/').pop(), bytes: new Uint8Array(await (await fetch(n)).arrayBuffer()) })));
+    const got = await Promise.all(run.map(async (n) => ({ name: n.split('/').pop(), bytes: new Uint8Array(await (await fetch(self.location.origin + n)).arrayBuffer()) })));
     const t = performance.now();
     let steps = 0;
     const r = m.process(got, args, () => steps++);
@@ -21,10 +26,14 @@ self.onmessage = async (e) => {
     out.push({ run: run.map((n) => n.split('/').pop()).join('+'), secs, steps, pages: r.pages.length, hash, card: /card: 1 ID-1 card/.test(r.report), mem: wasm.memory.buffer.byteLength / 1048576 });
   }
   self.postMessage(out);
-};`;
+} catch (x) { self.postMessage({ error: String(x && x.stack || x) }); } };`;
 window.check = (build, threads, files, args) => new Promise((ok, fail) => {
   const w = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })), { type: "module" });
-  w.onmessage = (e) => { ok(e.data); w.terminate(); };
+  w.onmessage = (e) => {
+    if (e.data && e.data.log) { console.log(build + ': ' + e.data.log); return; }
+    if (e.data && e.data.error) { fail(e.data.error); w.terminate(); return; }
+    ok(e.data); w.terminate();
+  };
   w.onerror = (e) => fail(e.message || String(e));
   w.postMessage({ build, threads, files, args });
 });
