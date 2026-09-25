@@ -44,6 +44,7 @@ Needs ImageMagick 7 (`magick`) and poppler (`pdfinfo`, `pdfimages`,
 
 import argparse
 import collections
+import hashlib
 import math
 import os
 import re
@@ -59,6 +60,14 @@ MM = 25.4
 
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout
+
+
+# Intermediate images are MIFF, ImageMagick's own uncompressed format: the
+# same pixels at the same depth as the PNG they used to be, without the
+# filtering and deflate. In the browser build that was 0.4 s to write and
+# 0.13 s to read per A4-sized intermediate against 0.12 s and 0.04 s, and a
+# page writes about ten of them.
+TMP = ".miff"
 
 
 def magick(*args):
@@ -258,23 +267,40 @@ def dims(path):
     return tuple(int(x) for x in fmt(path, "%w %h").split())
 
 
+_TO_BITS = bytes.maketrans(b"\x00\x01", b"01")
+_FROM_BITS = bytes.maketrans(b"01", b"\x00\x01")
+
+
+def _rows_to_ints(mask, w, h):
+    """A 0/1 mask as one integer per row, pixel x at bit x."""
+    return [int(mask[y * w:(y + 1) * w].translate(_TO_BITS)[::-1], 2)
+            for y in range(h)]
+
+
+def _ints_to_mask(rows, w):
+    """The inverse of _rows_to_ints."""
+    return bytearray(b"".join(format(r, "0%db" % w)[::-1].encode()
+                              for r in rows).translate(_FROM_BITS))
+
+
 def _open4(mask, w, h):
-    """4-neighbour erode then dilate — drops speckle without moving real edges."""
-    er = bytearray(w * h)
+    """4-neighbour erode then dilate — drops speckle without moving real edges.
+
+    On rows as integers (see _blob_rim): the same pixels as a loop over them,
+    as a handful of C-level operations per row. The outermost row and column
+    stay 0, as they always have.
+    """
+    rows = _rows_to_ints(mask, w, h)
+    inner = ((1 << w) - 1) & ~1 & ~(1 << (w - 1))
+    er = [0] * h
     for y in range(1, h - 1):
-        row = y * w
-        for x in range(1, w - 1):
-            i = row + x
-            if mask[i] and mask[i-1] and mask[i+1] and mask[i-w] and mask[i+w]:
-                er[i] = 1
-    di = bytearray(w * h)
+        r = rows[y]
+        er[y] = r & (r << 1) & (r >> 1) & rows[y - 1] & rows[y + 1] & inner
+    di = [0] * h
     for y in range(1, h - 1):
-        row = y * w
-        for x in range(1, w - 1):
-            i = row + x
-            if er[i] or er[i-1] or er[i+1] or er[i-w] or er[i+w]:
-                di[i] = 1
-    return di
+        r = er[y]
+        di[y] = (r | (r << 1) | (r >> 1) | er[y - 1] | er[y + 1]) & inner
+    return _ints_to_mask(di, w)
 
 
 def _shoelace(pts):
@@ -368,23 +394,62 @@ def detect_quad(path, side=400, pm=None):
     return _quad_from_mask(mask, w, h, w0, h0)
 
 
+_COMPONENTS = collections.OrderedDict()   # mask digest -> blobs, a few kept
+
+
 def _components(mask, w, h):
-    """4-connected blobs of a binary mask, largest first, as index lists."""
+    """4-connected blobs of a binary mask, largest first, as index lists.
+
+    The same masks come back: the spread, the card and the sheet detectors
+    each read the frame's paper masks, and four of seven labelings of a
+    page were repeats. They are remembered by content for the last few
+    masks; the blobs are shared, so callers treat them as read-only.
+    """
+    key = (hashlib.sha1(mask).digest(), w, h)
+    if key in _COMPONENTS:
+        _COMPONENTS.move_to_end(key)
+        return list(_COMPONENTS[key])
+    comps = _label(mask, w, h)
+    _COMPONENTS[key] = comps
+    while len(_COMPONENTS) > 4:
+        _COMPONENTS.popitem(last=False)
+    return list(comps)
+
+
+def _label(mask, w, h):
+    # A breadth-first flood per blob, in the same order as it has always
+    # visited pixels (right, left, down, up): consumers break ties by
+    # first occurrence. Written for the interpreter it runs in -- Pyodide in
+    # the browser is several times slower than CPython per bytecode -- so
+    # the neighbours are indices, not coordinates, and the seed scan skips
+    # over runs of background with find() instead of testing every pixel.
     n = w * h
     seen = bytearray(n); comps = []
-    for s0 in range(n):
-        if mask[s0] and not seen[s0]:
-            q = collections.deque([s0]); seen[s0] = 1; comp = []
-            while q:
-                i = q.popleft(); comp.append(i)
-                x, y = i % w, i // w
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    xx, yy = x + dx, y + dy
-                    if 0 <= xx < w and 0 <= yy < h:
-                        j2 = yy * w + xx
-                        if mask[j2] and not seen[j2]:
-                            seen[j2] = 1; q.append(j2)
-            comps.append(comp)
+    todo = bytearray(mask)       # mask pixels not yet in a blob
+    s0 = todo.find(1)
+    while s0 != -1:
+        seen[s0] = 1; todo[s0] = 0
+        comp = [s0]
+        head = 0
+        while head < len(comp):
+            i = comp[head]; head += 1
+            x = i % w
+            if x + 1 < w:
+                j = i + 1
+                if mask[j] and not seen[j]:
+                    seen[j] = 1; todo[j] = 0; comp.append(j)
+            if x > 0:
+                j = i - 1
+                if mask[j] and not seen[j]:
+                    seen[j] = 1; todo[j] = 0; comp.append(j)
+            j = i + w
+            if j < n and mask[j] and not seen[j]:
+                seen[j] = 1; todo[j] = 0; comp.append(j)
+            j = i - w
+            if j >= 0 and mask[j] and not seen[j]:
+                seen[j] = 1; todo[j] = 0; comp.append(j)
+        comps.append(comp)
+        s0 = todo.find(1, s0 + 1)
     comps.sort(key=len, reverse=True)
     return comps
 
@@ -560,24 +625,71 @@ def _side_points(comp, w, P, Q, h=None):
     ux, uy = (Q[0] - P[0]) / L, (Q[1] - P[1]) / L
     nx, ny = uy, -ux            # outward for tl,tr,br,bl order with y down
     lo, hi = 0.1 * L, 0.9 * L
-    best = {}
-    for i in comp:
-        x, y = i % w, i // w
-        dx, dy = x - P[0], y - P[1]
+    Px, Py = P
+    xs, ys = _blob_xy(comp, w)
+    # best per step k: its s, and its pixel; the dicts keep the order in
+    # which the steps were first met, which the old (s, x, y) dict did too
+    bs, bx, by = {}, {}, {}
+    get = bs.get
+    for x, y in zip(xs, ys):
+        dx = x - Px
+        dy = y - Py
         t = dx * ux + dy * uy
         if t < lo or t > hi:
             continue
-        s = dx * nx + dy * ny
+        sv = dx * nx + dy * ny
         k = int(t)
-        b = best.get(k)
-        if b is None or s > b[0]:
-            best[k] = (s, x, y)
+        b = get(k)
+        if b is None or sv > b:
+            bs[k] = sv; bx[k] = x; by[k] = y
     # Where the region runs into the frame's border its edge is not seen at
     # all, so that step along the side is dropped whole -- dropping only the
     # border pixels makes the next ones in, a straight line again, the edge.
-    return [(x, y) for _, x, y in best.values()
-            if not h or (EDGE_FRAME <= x < w - EDGE_FRAME
-                         and EDGE_FRAME <= y < h - EDGE_FRAME)]
+    return [(bx[k], by[k]) for k in bs
+            if not h or (EDGE_FRAME <= bx[k] < w - EDGE_FRAME
+                         and EDGE_FRAME <= by[k] < h - EDGE_FRAME)]
+
+
+_XY = [None, None, None, None]   # last blob, its width, its x list, its y list
+RIM = 4                 # px: a blob's rim, where its outermost pixels are
+
+
+def _blob_rim(comp, w):
+    """The blob's pixels within RIM of its outside, in the blob's own order.
+
+    Every question the geometry asks of a blob -- its extreme corner along a
+    diagonal, its outermost pixel along a side -- is answered at its rim: a
+    pixel with a blob pixel beyond it in that direction is not extreme. So
+    the per-pixel loops run over the rim, not over the whole blob: a tenth of
+    the pixels on a page-sized blob. In the browser, where Python is several
+    times slower than here, this was the largest part of the Python time.
+
+    The erosion is done on rows as integers, one bit a pixel: a row eroded by
+    one pixel is r & r<<1 & r>>1 and the rows above and below, each a single
+    C-level operation however wide the row is.
+    """
+    if not comp:
+        return comp
+    h = max(comp) // w + 1
+    m = bytearray(w * h)
+    for i in comp:
+        m[i] = 1
+    rows = [0] + _rows_to_ints(m, w, h) + [0]
+    full = (1 << w) - 1
+    for _ in range(RIM):
+        rows = [0] + [(r & (r << 1) & (r >> 1) & full) & rows[k] & rows[k + 2]
+                      for k, r in enumerate(rows[1:-1])] + [0]
+    inner = _ints_to_mask(rows[1:-1], w)
+    return [i for i in comp if not inner[i]]
+
+
+def _blob_xy(comp, w):
+    """The coordinates of a blob's rim, cached for the blob last asked about:
+    a blob's four sides are fitted one after the other."""
+    if _XY[0] is not comp or _XY[1] != w:
+        rim = _blob_rim(comp, w)
+        _XY[:] = [comp, w, [i % w for i in rim], [i // w for i in rim]]
+    return _XY[2], _XY[3]
 
 
 def _fit_line(pts, trim=True):
@@ -702,7 +814,10 @@ def _page_lines(comp, w, h=None):
     Each line is (cx, cy, dx, dy, residual, support): `support` is the share
     of the side's edge points that lie on it -- low when a hand hid the edge.
     """
-    pts = [(i % w, i // w) for i in comp]
+    # the corners are extremes of x+y and x-y: rim pixels, and in the same
+    # order as in the blob, so ties go the same way
+    xs, ys = _blob_xy(comp, w)
+    pts = list(zip(xs, ys))
     tl = min(pts, key=lambda p: p[0] + p[1])
     br = max(pts, key=lambda p: p[0] + p[1])
     tr = max(pts, key=lambda p: p[0] - p[1])
@@ -2220,7 +2335,7 @@ def rasterize(src, workdir, min_px=2400, tag="s00"):
                     return [src]
             except subprocess.CalledProcessError:
                 pass
-        out = os.path.join(workdir, f"{tag}-page-0.png")
+        out = os.path.join(workdir, f"{tag}-page-0{TMP}")
         magick(src, "-auto-orient", out)
         return [out]
 
@@ -2366,14 +2481,14 @@ def process_cards(src, quads, why, out_png, o, report):
                   f"in the frame ({why})")
     for k, q in enumerate(quads):
         wide = (d(q[0], q[1]) + d(q[3], q[2])) >= (d(q[0], q[3]) + d(q[1], q[2]))
-        raw = f"{out_png}.card{k}-rect.png"
+        raw = f"{out_png}.card{k}-rect{TMP}"
         rectify(src, raw, q, 0.0, size=(cw_px, ch_px) if wide else (ch_px, cw_px))
         turn = 0 if wide else 90
         if turn:
             magick(raw, "-rotate", "90", raw)
         # fingers hold a card at its edges: repainted before anything is
         # measured, so a thumb is not read as the face photo either
-        got, share = erase_fingers(raw, raw + ".fingers.png", None)
+        got, share = erase_fingers(raw, raw + ".fingers" + TMP, None)
         if got:
             raw = got
             report.append(f"card {k + 1}: erased a finger at the edge "
@@ -2388,7 +2503,7 @@ def process_cards(src, quads, why, out_png, o, report):
         # the brightness divided by a very wide blur of itself, the same
         # factor on every channel so the colour stays -- then a gentle stretch
         # and the page's own sharpening.
-        fixed = f"{out_png}.card{k}.png"
+        fixed = f"{out_png}.card{k}{TMP}"
         magick(*copy_tone_args(raw, cw_px),
                "-unsharp", f"0x1+{o.sharpen}+0.02",
                # the rounded corners of ID-1, and a hairline so a white card
@@ -2469,7 +2584,7 @@ def fit_photo_page(src, out_png, o, report):
         pw, ph = ph, pw
     scale = min(pw / iw, ph / ih)
     off = (round((pw - iw * scale) / 2), round((ph - ih * scale) / 2))
-    scaled = f"{out_png}.photo-scaled.png"
+    scaled = f"{out_png}.photo-scaled{TMP}"
     magick(src, "-resize", f"{scale * 100:.4f}%", scaled)
     magick("-size", f"{pw}x{ph}", "xc:white", scaled,
            "-geometry", f"{off[0]:+d}{off[1]:+d}", "-composite",
@@ -2551,11 +2666,11 @@ def clean_specks(page, dpi):
     long_min = SPECK_MM * px
     zw, zh = max(1, aw // 2), max(1, ah // 2)
     reach = max(1, round(SPECK_REACH_MM * px / 2))
-    ink = page + ".ink.png"
+    ink = page + ".ink" + TMP
     # Every mark, measured, in the same process that makes the ink mask: any
     # ink in a block keeps the block, so a hairline at 300 dpi does not
     # vanish on the way down to SPECK_DPI.
-    dark = page + ".dark.png"
+    dark = page + ".dark" + TMP
     out = run(["magick", page, "-colorspace", "gray",
                # Dark pixels are substance, whatever mark they are in -- as
                # long as there are a few of them: averaged over a zone pixel
@@ -2671,7 +2786,7 @@ def photo_patch(keep, scale, off, o, out_png):
     hi = max(lo + 10, 100.0 * white / 255)
     pw_, ph_ = max(1, round(bw * scale)), max(1, round(bh * scale))
     feather = max(2, round(min(pw_, ph_) * 0.015))
-    patch = out_png + ".photo.png"
+    patch = out_png + ".photo" + TMP
     magick(src, *crop, *(["-colorspace", "gray"] if mono else []),
            "-level", f"{lo:.2f}%,{hi:.2f}%",
            "-resize", f"{pw_}x{ph_}!",
@@ -2706,7 +2821,7 @@ class Job:
     def path(self, name):
         """The next intermediate's file name."""
         self.step += 1
-        return f"{self.out_png}.s{self.step}-{name}.png"
+        return f"{self.out_png}.s{self.step}-{name}{TMP}"
 
     def stage(self, name, *args):
         """One ImageMagick pass over the current page."""
@@ -3035,7 +3150,7 @@ def spread_photo_box(job):
     """
     iw_, ih_ = dims(job.cur)
     x1_, y0_ = round(iw_ * 0.45), round(ih_ * 0.5)
-    part = f"{job.out_png}.photo-place.png"
+    part = f"{job.out_png}.photo-place{TMP}"
     magick(job.cur, "-crop", f"{x1_}x{ih_ - y0_}+0+{y0_}", "+repage", part)
     kw = dict(area_max=65.0, aspect=(0.45, 1.8))
     got = (find_photo_block(part, area_min=8.0, **kw)
@@ -3529,7 +3644,7 @@ def run_sources(sources, wd, o):
             print(f"  [{si + 1}/{len(sources)}] {os.path.basename(src)}")
         for r in rasterize(src, wd, tag=f"s{si:02d}"):
             rep = []
-            out_png = os.path.join(wd, f"out-{n:03d}.png")
+            out_png = os.path.join(wd, f"out-{n:03d}{TMP}")
             items.append([r, out_png, process_page(r, out_png, o, rep), rep])
             n += 1
     return items
