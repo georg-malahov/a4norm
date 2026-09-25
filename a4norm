@@ -1672,7 +1672,15 @@ def edge_document(src, bright_quad, o, report):
             # the outline over it -- a bare rectangle inside a region could
             # as well be a table printed on the page.
             why += ", the brightness quad took the background with it"
-            only_spread = True
+            # ...but only when that larger quad is itself a sheet, edged on
+            # three sides of four: then a rectangle inside it may be a table
+            # printed on it. A region that is just a light desk running off
+            # the frame has no edges of its own (a notebook on white marble:
+            # 0.00-0.13), and the notebook's outline inside it is the sheet.
+            # Refusing it laid the whole marble table on the page and let the
+            # border cleanup eat the notebook's first line.
+            bsup = sorted(seg_support(bq[i], bq[(i + 1) % 4]) for i in range(4))
+            only_spread = bsup[1] >= EDGE_SHEET
         else:
             return None
     if edged_sheet:
@@ -2023,6 +2031,7 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
     # wrong when it ate the first line and the list dashes.
     cov_need = 0.15
     cut = {}
+    band = {}
     for name in SIDES:
         last = 0
         if verdict[name][2]:
@@ -2043,6 +2052,23 @@ def clean_border(path, dst, band_pct, keep_pct, struct_pct, dark_pct,
                 if sum(reach[row + x] for x in range(w)) / w > cov_need:
                     last = k + 1
             cut[name] = round(last * h0 / h)
+        band[name] = last
+
+    # The flood is repainted only as deep as the band it found. On a side
+    # judged a binding it can run on past the rings along whatever touches
+    # them -- the lines of squared paper, a word written close to the spiral
+    # -- as far as its depth cap, and the repaint then erased the first
+    # letters of every line on a notebook page. The rings end where the
+    # column coverage falls off (0.5 inside, 0.03 past it, measured).
+    for i in range(n):
+        k = owner[i]
+        if not k or not reach[i]:
+            continue
+        name = SIDES[k - 1]
+        if name in band:
+            x, y = i % w, i // w
+            if (x, w - 1 - x, y, h - 1 - y)[k - 1] > band[name] + 2:
+                reach[i] = 0
 
     pgm = f"P5\n{w} {h}\n255\n".encode() + bytes(255 if v else 0 for v in reach)
     mpath = dst + ".bordermask.pgm"
