@@ -1,3 +1,6 @@
 # Local test corpus: real document photos, personal data. Never sent anywhere.
 tests/corpus/
 .git/
+
+# Rust build output: gigabytes, and not what the images are built from
+a4norm-rs/target*/

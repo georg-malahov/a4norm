@@ -1,0 +1,31 @@
+[package]
+name = "a4norm-rs"
+version = "0.1.0"
+edition = "2021"
+description = "a4norm's page finishing (flat-field, ink, tone) in Rust: the stage 1 experiment"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "a4norm-finish"
+required-features = ["cli"]
+
+[features]
+default = []
+# threads over rows; off in the browser build unless it is built with atomics
+par = ["dep:rayon"]
+# the command line: decode and encode files
+cli = ["dep:image"]
+
+[dependencies]
+rayon = { version = "1", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -26,10 +26,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # rs_psnr: how close the Rust stages must stay to this image's
+          # ImageMagick. Debian's 7.1.1 rounds its grey a hair differently
+          # from 7.1.2 (the Alpine image, and the browser's build): ~52 dB
+          # there against 68-96 dB here, and neither is visible.
           - flavor: light
             dockerfile: Dockerfile
+            rs_psnr: 60
           - flavor: full
             dockerfile: Dockerfile.full
+            rs_psnr: 50
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +64,28 @@ jobs:
 
       - name: Run the examples through it
         run: tests/run-in-docker.sh a4norm:test --flavor ${{ matrix.flavor }} --artifacts regression-out
+
+      # The Rust port (a4norm-rs/) against the script in this very image:
+      # the page as it enters flat_field is kept, and every stage the crate
+      # reproduces must stay within rs_psnr dB of what ImageMagick made of it.
+      - name: The Rust finishing matches the script
+        run: |
+          mkdir -p rs-out
+          for ex in notebook-photo.jpg landing-invoice.webp; do
+            docker run --rm -v "$PWD:/repo" -w /repo --user "$(id -u):$(id -g)" \
+              --entrypoint python3 a4norm:test a4norm-rs/bench/dump.py a4norm \
+              "rs-out/${ex%.*}" -- --format jpg -o "rs-out/${ex%.*}.jpg" "examples/$ex"
+          done
+          cd a4norm-rs
+          cargo test --release
+          cargo build --release --features cli
+          for ex in notebook-photo landing-invoice; do
+            target/release/a4norm-finish "../rs-out/$ex-in.png" "../rs-out/$ex-rs.png" \
+              --compare "../rs-out/$ex" --min-psnr ${{ matrix.rs_psnr }}
+          done
+          rustup target add wasm32-unknown-unknown
+          RUSTFLAGS="-C target-feature=+simd128" \
+            cargo build --release --lib --target wasm32-unknown-unknown
 
       - name: Keep the PDFs and renders of a failed run
         if: failure()
