@@ -1,0 +1,32 @@
+<!doctype html><meta charset="utf-8"><title>a4norm check</title>
+<script type="module">
+// The module runs in a worker made from a blob: URL, as on malahov.io, and
+// its thread pool is workers inside that worker.
+const src = `
+self.onmessage = async (e) => {
+  const { build, threads, files, args } = e.data;
+  const base = self.location.origin + '/dist/' + build + '/';
+  const m = await import(base + 'a4norm.js');
+  const wasm = await m.default({ module_or_path: base + 'a4norm_bg.wasm' });
+  if (build === 'mt') await m.initThreadPool(threads);
+  const out = [];
+  for (const run of files) {
+    const got = await Promise.all(run.map(async (n) => ({ name: n.split('/').pop(), bytes: new Uint8Array(await (await fetch(n)).arrayBuffer()) })));
+    const t = performance.now();
+    let steps = 0;
+    const r = m.process(got, args, () => steps++);
+    const secs = (performance.now() - t) / 1000;
+    const pdf = m.pack(r.pages.map((p) => p.jpg), new Uint32Array(r.pages.map((p) => p.dpi)), false);
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', pdf))).slice(0, 6).map((b) => b.toString(16).padStart(2, '0')).join('');
+    out.push({ run: run.map((n) => n.split('/').pop()).join('+'), secs, steps, pages: r.pages.length, hash, card: /card: 1 ID-1 card/.test(r.report), mem: wasm.memory.buffer.byteLength / 1048576 });
+  }
+  self.postMessage(out);
+};`;
+window.check = (build, threads, files, args) => new Promise((ok, fail) => {
+  const w = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })), { type: "module" });
+  w.onmessage = (e) => { ok(e.data); w.terminate(); };
+  w.onerror = (e) => fail(e.message || String(e));
+  w.postMessage({ build, threads, files, args });
+});
+window.isolated = self.crossOriginIsolated;
+</script>

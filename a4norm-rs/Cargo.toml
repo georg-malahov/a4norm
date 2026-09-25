@@ -2,7 +2,7 @@
 name = "a4norm-rs"
 version = "0.1.0"
 edition = "2021"
-description = "a4norm's page finishing (flat-field, ink, tone) in Rust: the stage 1 experiment"
+description = "a4norm in Rust: photos of paper documents -> one scanner-grade A4 PDF, natively and in WebAssembly"
 license = "MIT"
 publish = false
 
@@ -10,19 +10,28 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "a4norm-finish"
-required-features = ["cli"]
+name = "a4norm"
+path = "src/main.rs"
 
 [features]
 default = []
 # threads over rows; off in the browser build unless it is built with atomics
 par = ["dep:rayon"]
-# the command line: decode and encode files
-cli = ["dep:image"]
+# the browser's threaded build: rayon over Web Workers (needs atomics)
+wasm-threads = ["par", "dep:wasm-bindgen-rayon"]
 
 [dependencies]
 rayon = { version = "1", optional = true }
-image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+jpeg-encoder = "0.6"
+# closer to libjpeg-turbo than the image crate's decoder (mean 0.02 against
+# 0.04 levels): the sheet outline moved by two pixels on the public notebook
+jpeg-decoder = { version = "0.3", default-features = false }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-rayon = { version = "1.3", optional = true }
 
 [profile.release]
 opt-level = 3
