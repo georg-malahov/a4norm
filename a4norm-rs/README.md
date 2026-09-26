@@ -71,6 +71,16 @@ Some things depart from the script on purpose:
   taken by its outline whatever its colour. Of near-equal outlines, the
   outermost is used, so print at a crumpled edge is kept. A receipt gets no
   face photo.
+- **A card's back is turned upright by its machine-readable zone.** The
+  script turned a card by its face photo, which a back does not have, so a
+  back shot upside down stayed upside down. The card is rectified at true
+  size, so the MRZ can be read off its geometry: two or three lines of
+  glyph-sized marks at one even pitch (OCR-B, 2.54 mm on a real card), over
+  most of the width and a line apart. If they sit in the upper half, the card
+  turns 180°. A back without an MRZ (a driving licence) stays as shot.
+- **A spread's pages must be page-shaped** (1.1-2:1). A card whose MRZ band
+  and tinted top split into two light regions is no longer taken for a
+  passport spread.
 
 The goal is pages that cannot be told apart by eye or in print, not
 bit-identity.
