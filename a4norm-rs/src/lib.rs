@@ -7,6 +7,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod detect;
+pub mod edit;
 pub mod finish;
 pub mod img;
 pub mod io;

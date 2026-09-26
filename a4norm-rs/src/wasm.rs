@@ -7,6 +7,12 @@
 //!                   (stage, done) => ...);                // done: 0..1, rising
 //! // r = { pages: [{ jpg: Uint8Array, dpi }], report: "photo-0.jpg\n  page 1:\n    - ..." }
 //! const pdf = pack(jpgs, dpis, gray);
+//!
+//! // Edit panel: fill round spots from their surroundings
+//! const jpg2 = inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
+//! // size control: every page written again, in parallel
+//! const small = recompress(jpgs, { dpi: 150, quality: 60, gray: false });
+//! // small = [{ jpg: Uint8Array, dpi }, ...]
 //! ```
 
 use crate::{encode_page, io, parse_args, run, Source};
@@ -85,4 +91,41 @@ pub fn pack(jpgs: Array, dpis: Vec<u32>, gray: bool) -> Result<Uint8Array, JsVal
     }
     let d: Vec<usize> = dpis.iter().map(|&x| x as usize).collect();
     Ok(Uint8Array::from(io::write_pdf(&pages, &d).as_slice()))
+}
+
+/// A finished page with round spots filled from what surrounds them, the
+/// smart eraser. `dots`: x, y, r in page pixels, three numbers per spot.
+/// The page is written again at `quality` (default: the pages' own), its dpi
+/// kept; a grey page stays grey.
+#[wasm_bindgen]
+pub fn inpaint(jpg: Vec<u8>, dots: Vec<f32>, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
+    let spots: Vec<(f64, f64, f64)> = dots.chunks_exact(3).map(|d| (d[0] as f64, d[1] as f64, d[2] as f64)).collect();
+    let q = quality.unwrap_or(crate::Opts::default().quality);
+    let out = crate::edit::inpaint_jpeg(&jpg, &spots, q).map_err(|e| JsValue::from_str(&e.0))?;
+    Ok(Uint8Array::from(out.as_slice()))
+}
+
+/// Pages written again smaller, for the size control. `opts`: { dpi,
+/// quality, gray }; a page is brought down to `dpi` when it is higher, never
+/// up. Pages go four at a time, in parallel in the threaded build: more at
+/// once would hold too many decoded pages for a phone's memory.
+#[wasm_bindgen]
+pub fn recompress(jpgs: Array, opts: JsValue) -> Result<Array, JsValue> {
+    let num = |k: &str, d: f64| get(&opts, k).as_f64().unwrap_or(d);
+    let dpi = num("dpi", 200.0) as usize;
+    let quality = num("quality", crate::Opts::default().quality as f64).clamp(1.0, 100.0) as u8;
+    let gray = get(&opts, "gray").as_bool().unwrap_or(false);
+    let pages: Vec<Vec<u8>> = jpgs.iter().map(|j| Uint8Array::new(&j).to_vec()).collect();
+    let out = Array::new();
+    for group in pages.chunks(4) {
+        let done = crate::ops::par_map(group.len(), |i| crate::edit::recompress(&group[i], dpi, quality, gray));
+        for r in done {
+            let (jpg, d) = r.map_err(|e| JsValue::from_str(&e.0))?;
+            let page = Object::new();
+            set(&page, "jpg", &Uint8Array::from(jpg.as_slice()));
+            set(&page, "dpi", &JsValue::from_f64(d as f64));
+            out.push(&page);
+        }
+    }
+    Ok(out)
 }

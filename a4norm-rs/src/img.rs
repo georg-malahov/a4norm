@@ -378,6 +378,12 @@ pub fn resize_any(src: &dyn Pix, w2: usize, h2: usize) -> Img {
     Img::from_planes(ops::par_map(src.nc(), |k| channel_resized(src, k, w, h, w2, h2)))
 }
 
+/// Any image resized through the given filter, one channel per thread.
+pub fn resize_with(src: &dyn Pix, w2: usize, h2: usize, f: ops::Filter) -> Img {
+    let (w, h) = src.dims();
+    Img::from_planes(ops::par_map(src.nc(), |k| ops::resize_rows(w, h, &|y: usize, out: &mut [f32]| src.row_into(k, y, out), w2, h2, f)))
+}
+
 /// `-colorspace gray -resize WxH!` of any image.
 pub fn gray_resized(src: &dyn Pix, w2: usize, h2: usize) -> Plane {
     let (w, h) = src.dims();

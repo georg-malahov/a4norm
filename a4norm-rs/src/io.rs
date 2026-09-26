@@ -79,7 +79,7 @@ fn jpeg(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), jpeg_decoder::Error> {
 /// A page as JPEG: `-quality Q -sampling-factor 1x1|2x2 -strip`, grey when
 /// every pixel is, with its dpi in the JFIF header.
 pub fn encode_jpeg(img: &Img, quality: u8, subsample: bool, dpi: usize) -> Vec<u8> {
-    use jpeg_encoder::{ColorType, Density, Encoder, SamplingFactor};
+    use jpeg_encoder::{ColorType, Density, Encoder};
     let mut out = vec![];
     let gray = img.c.len() == 1 || (img.c[0].d == img.c[1].d && img.c[1].d == img.c[2].d);
     let mut enc = Encoder::new(&mut out, quality);
@@ -88,10 +88,19 @@ pub fn encode_jpeg(img: &Img, quality: u8, subsample: bool, dpi: usize) -> Vec<u
         let px = img.c[0].bytes();
         enc.encode(&px, img.w as u16, img.h as u16, ColorType::Luma).expect("jpeg");
     } else {
-        enc.set_sampling_factor(if subsample { SamplingFactor::F_2_2 } else { SamplingFactor::F_1_1 });
-        let px = img.to_rgb8();
-        enc.encode(&px, img.w as u16, img.h as u16, ColorType::Rgb).expect("jpeg");
+        return encode_rgb8(&img.to_rgb8(), img.w, img.h, quality, subsample, dpi);
     }
+    out
+}
+
+/// RGB bytes as a colour JPEG, as encode_jpeg writes one.
+pub fn encode_rgb8(px: &[u8], w: usize, h: usize, quality: u8, subsample: bool, dpi: usize) -> Vec<u8> {
+    use jpeg_encoder::{ColorType, Density, Encoder, SamplingFactor};
+    let mut out = vec![];
+    let mut enc = Encoder::new(&mut out, quality);
+    enc.set_density(Density::Inch { x: dpi as u16, y: dpi as u16 });
+    enc.set_sampling_factor(if subsample { SamplingFactor::F_2_2 } else { SamplingFactor::F_1_1 });
+    enc.encode(px, w as u16, h as u16, ColorType::Rgb).expect("jpeg");
     out
 }
 
