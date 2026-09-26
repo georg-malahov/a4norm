@@ -69,7 +69,13 @@ import regression as R  # noqa: E402  (parse_report, Page, A4 constants)
 
 
 def load_a4norm(path):
-    """The a4norm under test as a module, for its photo-block detector."""
+    """The a4norm under test as a module, for its measuring helpers
+    (_ink_runs). The Rust binary is no module: the script at the root, the
+    reference it was ported from, lends them instead -- they measure the
+    finished page, whoever made it."""
+    with open(path, "rb") as f:
+        if b"\0" in f.read(4096):
+            path = os.path.join(ROOT, "a4norm")
     loader = importlib.machinery.SourceFileLoader("a4norm_mod", path)
     spec = importlib.util.spec_from_loader("a4norm_mod", loader)
     mod = importlib.util.module_from_spec(spec)
