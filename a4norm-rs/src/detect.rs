@@ -1513,9 +1513,202 @@ pub enum EdgeDoc {
     Sheet(Quad, String),
 }
 
-/// What the edges say the document is, when brightness said nothing useful.
+/// What the edges say the document is: an outline of their own when
+/// brightness said nothing useful, or the brightness quad with a side that
+/// took the background along moved in onto the edge beside it.
 pub fn edge_document(img: &dyn Pix, bright: Option<Quad>, o: &Opts, report: &mut Vec<String>) -> Option<EdgeDoc> {
     let (cands, lines, em) = edge_quads(img);
+    if let Some(d) = edge_outline(&cands, &lines, &em, bright, o, report) {
+        return Some(d);
+    }
+    if let Some((q, why)) = long_outline(&cands, &em, bright) {
+        return Some(EdgeDoc::Sheet(q, why));
+    }
+    let (q, why) = pull_in(&em, &lines, bright?)?;
+    Some(EdgeDoc::Sheet(q, why))
+}
+
+/// A till receipt: far longer than any sheet, ID or envelope, a good part
+/// of the frame and outlined by its edges on every side. Receipts measured
+/// 3.0-3.6:1, 28-40% of the frame, 88-97% on edges; the ID outlines that come
+/// closest, 2.6-2.9:1 at 72% or 11% of the frame.
+const LONG_ASPECT: (f64, f64) = (2.5, 6.0);
+/// How the report names one, and how the page knows it has one.
+pub const RECEIPT: &str = "a receipt";
+const LONG_EDGE: f64 = 0.75;
+const LONG_MIN: f64 = 0.15;
+const LONG_HELD: f64 = 0.8;
+const LONG_TIE: f64 = 0.95;
+const LONG_TIE_EDGE: f64 = 0.7;
+const LONG_PART: f64 = 0.6;
+
+/// A receipt found by its edges. Brightness cannot be trusted with
+/// one: a till receipt is often greyer than the desk under it, or crumpled
+/// into the desk's tone at its edge. So the outline wins when brightness
+/// found nothing, or found the same thing: a quad that covers most of the
+/// outline and is not much larger than it.
+fn long_outline(cands: &[Cand], em: &EdgeMap, bright: Option<Quad>) -> Option<(Quad, String)> {
+    let (w, h) = (em.w, em.h);
+    let (sx, sy) = (em.w0 as f64 / w as f64, em.h0 as f64 / h as f64);
+    let long = |c: &&Cand, edge: f64| {
+        let (wd, ht) = quad_sides(&c.quad);
+        let aspect = wd.max(ht) / 1e-6f64.max(wd.min(ht));
+        c.minsup >= edge && c.share >= LONG_MIN && (LONG_ASPECT.0..=LONG_ASPECT.1).contains(&aspect)
+    };
+    let top = cands.iter().find(|c| long(c, LONG_EDGE))?.score;
+    // a crumpled receipt's edge is not quite straight: of the outlines that
+    // score about as well, the outermost keeps the print at its edge
+    let c = cands
+        .iter()
+        .filter(|c| long(c, LONG_TIE_EDGE) && c.score >= LONG_TIE * top)
+        .max_by(|a, b| a.share.partial_cmp(&b.share).unwrap())?;
+    if let Some(bq) = bright {
+        // inside a sheet, a long outline may be a table's column: it must be
+        // a thing of its own
+        if card_run_on(&c.quad, &em.g, w, h) >= CARD_ALONE {
+            return None;
+        }
+        let bq = bq.map(|p| (p.0 / sx, p.1 / sy));
+        // the share of the outline the brightness quad covers
+        let (mut n, mut hit) = (0.0, 0.0);
+        for y in (0..h).step_by(3) {
+            for x in (0..w).step_by(3) {
+                let p = (x as f64, y as f64);
+                if inside(p, &c.quad, 0.0) {
+                    n += 1.0;
+                    hit += inside(p, &bq, 0.0) as u8 as f64;
+                }
+            }
+        }
+        // and it is the thing brightness found, not a part of it
+        if n == 0.0 || hit / n < LONG_HELD || shoelace(&c.quad) < LONG_PART * shoelace(&bq) {
+            return None;
+        }
+    }
+    let (wd, ht) = quad_sides(&c.quad);
+    Some((
+        c.quad.map(|p| (p.0 * sx, p.1 * sy)),
+        format!(
+            "found by its edges: {} of the frame, sides {:.2}:1, outline {}+ edge, {}",
+            pc0(c.share),
+            wd.max(ht) / wd.min(ht),
+            pc0(c.minsup),
+            RECEIPT
+        ),
+    ))
+}
+
+const SIDE_HELD: f64 = 0.5;
+const SIDE_PULL: (f64, f64) = (0.02, 0.35);
+const SIDE_ANGLE: f64 = 15.0;
+const SIDE_EDGE: f64 = 0.5;
+const SIDE_STEP: f64 = 20.0;
+const SIDE_STEP_OFF: f64 = 4.0;
+
+/// The brightness quad, with each side that lies on no edge moved in onto
+/// the strongest edge near it inside the quad, when that edge is a step from
+/// paper to something darker: the brightness took a hand or a pale carpet
+/// for paper. A printed rule, a table's border or a receipt's dashes have
+/// paper on both sides, so no side moves onto them.
+fn pull_in(em: &EdgeMap, lines: &[HLine], bq: Quad) -> Option<(Quad, String)> {
+    let (w, h) = (em.w, em.h);
+    let (sx, sy) = (em.w0 as f64 / w as f64, em.h0 as f64 / h as f64);
+    let q = bq.map(|p| (p.0 / sx, p.1 / sy));
+    let through = |a: Pt, b: Pt| {
+        let l = dist(a, b).max(1e-6);
+        Line::of(a.0, a.1, (b.0 - a.0) / l, (b.1 - a.1) / l)
+    };
+    let mut side: Vec<Line> = (0..4).map(|i| through(q[i], q[(i + 1) % 4])).collect();
+    let cen = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+    let names = ["top", "right", "bottom", "left"];
+    let mut moved = vec![];
+    for i in 0..4 {
+        let (a, b) = (q[i], q[(i + 1) % 4]);
+        if seg_support(em, a, b) >= SIDE_HELD {
+            continue;
+        }
+        let (prev, next) = (&side[(i + 3) % 4], &side[(i + 1) % 4]);
+        let l0 = through(a, b);
+        // the normal pointing into the quad, and how deep the quad is there
+        let (mut nx, mut ny) = (-l0.dy, l0.dx);
+        if (cen.0 - a.0) * nx + (cen.1 - a.1) * ny < 0.0 {
+            nx = -nx;
+            ny = -ny;
+        }
+        let opp = through(q[(i + 2) % 4], q[(i + 3) % 4]);
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let depth = ((opp.cx - mid.0) * -opp.dy + (opp.cy - mid.1) * opp.dx).abs();
+        let mut best: Option<(f64, Line)> = None;
+        for hl in lines {
+            if line_angle(&hl.l, &l0) > SIDE_ANGLE {
+                continue;
+            }
+            let (p, r) = match (cross(&hl.l, prev), cross(&hl.l, next)) {
+                (Some(p), Some(r)) => (p, r),
+                _ => continue,
+            };
+            let m = ((p.0 + r.0) / 2.0, (p.1 + r.1) / 2.0);
+            let d = (m.0 - mid.0) * nx + (m.1 - mid.1) * ny;
+            let sup = hl.support(p, r);
+            if d < SIDE_PULL.0 * depth || d > SIDE_PULL.1 * depth || sup < SIDE_EDGE {
+                continue;
+            }
+            if best.as_ref().map_or(true, |(bs, _)| sup > *bs) {
+                best = Some((sup, hl.l.clone()));
+            }
+        }
+        let Some((_, nl)) = best else { continue };
+        // a sheet's edge is a step: paper on its inner side, something else
+        // on its outer one. A printed rule has paper on both.
+        let step = {
+            let (Some(p), Some(r)) = (cross(&nl, prev), cross(&nl, next)) else { continue };
+            let mut v = vec![];
+            for k in 1..40 {
+                let t = k as f64 / 40.0;
+                let (x, y) = (p.0 + (r.0 - p.0) * t, p.1 + (r.1 - p.1) * t);
+                let at = |o: f64| {
+                    let (xx, yy) = (ops::py_round(x + nx * o), ops::py_round(y + ny * o));
+                    (xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h).then(|| em.g[yy as usize * w + xx as usize] as f64)
+                };
+                if let (Some(i), Some(o)) = (at(SIDE_STEP_OFF), at(-SIDE_STEP_OFF)) {
+                    v.push(i - o);
+                }
+            }
+            if v.is_empty() {
+                continue;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        if step < SIDE_STEP {
+            continue;
+        }
+        side[i] = nl;
+        moved.push(names[i]);
+    }
+    if moved.is_empty() {
+        return None;
+    }
+    let mut nq = q;
+    for i in 0..4 {
+        nq[i] = cross(&side[(i + 3) % 4], &side[i])?;
+    }
+    for i in 0..4 {
+        if !(45.0..=135.0).contains(&angle(nq[(i + 3) % 4], nq[i], nq[(i + 1) % 4])) {
+            return None;
+        }
+    }
+    if shoelace(&nq) <= 0.0 {
+        return None;
+    }
+    let frac = shoelace(&nq) / (w * h) as f64;
+    Some((
+        nq.map(|p| (p.0 * sx, p.1 * sy)),
+        format!("{} of the frame, the {} side moved in onto an edge", pc0(frac), moved.join(" and ")),
+    ))
+}
+
+fn edge_outline(cands: &[Cand], lines: &[HLine], em: &EdgeMap, bright: Option<Quad>, o: &Opts, report: &mut Vec<String>) -> Option<EdgeDoc> {
     let best = cands.first()?;
     let q = best.quad;
     let (w, h) = (em.w, em.h);
