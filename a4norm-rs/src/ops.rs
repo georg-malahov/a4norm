@@ -530,20 +530,98 @@ fn convolve_sep(p: &Plane, k: &[f32]) -> Plane {
     out
 }
 
-/// `-blur 0xS`: horizontal then vertical, edge pixels replicated. A very
-/// wide one (a colour copy's light estimate is a fifth of the page) is
-/// taken on a reduced copy: the Gaussian is far smoother than the steps it
-/// is sampled at, and 1800 taps a pixel over a whole page is not a cost
-/// anybody should pay for a light estimate.
+/// `-blur 0xS`: horizontal then vertical, edge pixels replicated.
 pub fn blur(p: &Plane, sigma: f64) -> Plane {
     if sigma > 24.0 && p.w.min(p.h) > 64 {
-        let f = ((sigma / 8.0).floor() as usize).max(2).min(p.w.min(p.h) / 16).max(2);
-        let (sw, sh) = ((p.w + f - 1) / f, (p.h + f - 1) / f);
-        let small = resize(p, sw, sh, Filter::Box);
-        let b = convolve_sep(&small, &gauss_kernel(sigma / f as f64));
-        return resize(&b, p.w, p.h, Filter::Triangle);
+        return blur_wide(p, sigma);
     }
     convolve_sep(p, &gauss_kernel(sigma))
+}
+
+/// A very wide `-blur` (a colour copy's light estimate: a fifth of the
+/// page, 1800 taps) without 1800 taps a pixel. The kernel hardly changes
+/// across a block of `f` pixels, so each block counts as its mean, weighed
+/// by the kernel's exact sum over it; what lies beyond the edge is the edge
+/// pixel itself, replicated, as ImageMagick does -- with a kernel wider
+/// than the image that is most of the weight, and averaging it into a
+/// block shifted a card's light by nine levels. The result, at the block
+/// centres, is interpolated back up.
+fn blur_wide(p: &Plane, sigma: f64) -> Plane {
+    let k = gauss_kernel(sigma);
+    let r = (k.len() / 2) as isize;
+    let mut pre = vec![0f64; k.len() + 1];
+    for (i, &v) in k.iter().enumerate() {
+        pre[i + 1] = pre[i] + v as f64;
+    }
+    // the kernel's sum over taps [a, b), clipped to it
+    let ksum = |a: isize, b: isize| -> f64 {
+        let (a, b) = (a.clamp(0, k.len() as isize), b.clamp(0, k.len() as isize));
+        if b > a {
+            pre[b as usize] - pre[a as usize]
+        } else {
+            0.0
+        }
+    };
+    let f = ((sigma / 8.0) as usize).clamp(2, 64);
+    // one axis: n values -> the blur at each block centre
+    let pass = |v: &[f64], n: usize| -> Vec<f64> {
+        let nb = n.div_ceil(f);
+        let means: Vec<(isize, isize, f64)> = (0..nb)
+            .map(|b| {
+                let (lo, hi) = (b * f, ((b + 1) * f).min(n));
+                (lo as isize, hi as isize, v[lo..hi].iter().sum::<f64>() / (hi - lo) as f64)
+            })
+            .collect();
+        means
+            .iter()
+            .map(|&(lo, hi, _)| {
+                let x = (lo + hi - 1) / 2;
+                // tap t sits at pixel x + t - r
+                let mut s = v[0] * ksum(0, r - x) + v[n - 1] * ksum(n as isize - x + r, k.len() as isize);
+                for &(a, b, m) in &means {
+                    s += m * ksum(a - x + r, b - x + r);
+                }
+                s
+            })
+            .collect()
+    };
+    let (w, h) = (p.w, p.h);
+    let (cw, ch) = (w.div_ceil(f), h.div_ceil(f));
+    // along the rows, every row
+    let hs: Vec<Vec<f64>> = par_map(h, |y| pass(&p.row(y).iter().map(|&v| v as f64).collect::<Vec<_>>(), w));
+    // down the columns of that
+    let vs: Vec<Vec<f64>> = par_map(cw, |c| pass(&(0..h).map(|y| hs[y][c]).collect::<Vec<_>>(), h));
+    // back up: the block centres are the sample points
+    let centre = |b: usize, n: usize| ((b * f + ((b + 1) * f).min(n) - 1) / 2) as f64;
+    let axis = |n: usize, nb: usize| -> Vec<(usize, usize, f64)> {
+        (0..n)
+            .map(|x| {
+                let xf = x as f64;
+                let mut b = 0;
+                while b + 1 < nb && centre(b + 1, n) <= xf {
+                    b += 1;
+                }
+                if b + 1 >= nb || xf <= centre(0, n) {
+                    let bb = if xf <= centre(0, n) { 0 } else { nb - 1 };
+                    return (bb, bb, 0.0);
+                }
+                let (c0, c1) = (centre(b, n), centre(b + 1, n));
+                (b, b + 1, (xf - c0) / (c1 - c0))
+            })
+            .collect()
+    };
+    let (ax, ay) = (axis(w, cw), axis(h, ch));
+    let mut out = Plane::new(w, h);
+    rows(&mut out.d, w, |y, row| {
+        let (y0, y1, ty) = ay[y];
+        for x in 0..w {
+            let (x0, x1, tx) = ax[x];
+            let top = vs[x0][y0] * (1.0 - tx) + vs[x1][y0] * tx;
+            let bot = vs[x0][y1] * (1.0 - tx) + vs[x1][y1] * tx;
+            row[x] = (top * (1.0 - ty) + bot * ty) as f32;
+        }
+    });
+    out
 }
 
 /// `-statistic StandardDeviation NxN`, as ImageMagick quantizes it: the
