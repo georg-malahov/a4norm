@@ -24,8 +24,8 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Src, Fail> {
     Ok(orient_px(Src { w, h, px }, orient))
 }
 
-/// An EXIF turn applied to RGB bytes.
-fn orient_px(s: Src, o: Orientation) -> Src {
+/// An EXIF turn applied to RGB bytes (Rotate90: a quarter turn clockwise).
+pub fn orient_px(s: Src, o: Orientation) -> Src {
     use Orientation::*;
     if o == NoTransforms {
         return s;
@@ -90,6 +90,16 @@ pub fn encode_jpeg(img: &Img, quality: u8, subsample: bool, dpi: usize) -> Vec<u
     } else {
         return encode_rgb8(&img.to_rgb8(), img.w, img.h, quality, subsample, dpi);
     }
+    out
+}
+
+/// Grey bytes as a one-channel JPEG, as encode_jpeg writes one.
+pub fn encode_luma8(px: &[u8], w: usize, h: usize, quality: u8, dpi: usize) -> Vec<u8> {
+    use jpeg_encoder::{ColorType, Density, Encoder};
+    let mut out = vec![];
+    let mut enc = Encoder::new(&mut out, quality);
+    enc.set_density(Density::Inch { x: dpi as u16, y: dpi as u16 });
+    enc.encode(px, w as u16, h as u16, ColorType::Luma).expect("jpeg");
     out
 }
 

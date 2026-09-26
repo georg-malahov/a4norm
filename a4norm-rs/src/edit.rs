@@ -188,6 +188,26 @@ fn gray_small(src: &Src, w2: usize, h2: usize) -> Plane {
     img::resize_with(&g, w2, h2, ops::Filter::Triangle).c.swap_remove(0)
 }
 
+/// A finished page turned by `quarters` quarter turns clockwise and written
+/// again at `quality`, its dpi kept, a grey page grey.
+pub fn rotate(jpg: &[u8], quarters: i32, quality: u8) -> Result<Vec<u8>, Fail> {
+    use image::metadata::Orientation::*;
+    let src = io::decode(jpg, "page")?;
+    let turned = match quarters.rem_euclid(4) {
+        1 => io::orient_px(src, Rotate90),
+        2 => io::orient_px(src, Rotate180),
+        3 => io::orient_px(src, Rotate270),
+        _ => src,
+    };
+    let dpi = jfif_dpi(jpg).unwrap_or(200);
+    Ok(if is_grey(&turned) {
+        let g: Vec<u8> = turned.px.iter().step_by(3).copied().collect();
+        io::encode_luma8(&g, turned.w, turned.h, quality, dpi)
+    } else {
+        io::encode_rgb8(&turned.px, turned.w, turned.h, quality, false, dpi)
+    })
+}
+
 /// Every pixel neutral: a page written grey, read back as RGB.
 fn is_grey(s: &Src) -> bool {
     s.px.as_chunks::<3>().0.iter().all(|p| p[0] == p[1] && p[1] == p[2])
@@ -222,6 +242,21 @@ mod tests {
         }
         // and the page away from the spot is untouched
         assert!((page.c[0].d[5 * w + 5] - (0.55 + 0.1 * (1.0 - 5.0 / h as f32))).abs() < 0.005);
+    }
+
+    #[test]
+    fn a_quarter_turn_is_clockwise() {
+        // 40x20, dark at the top-left: after a quarter turn clockwise the
+        // page is 20x40 and the dark corner is at its top-right
+        let (w, h) = (40, 20);
+        let px: Vec<u8> = (0..w * h).flat_map(|i| if i % w < 10 && i / w < 10 { [0u8; 3] } else { [255u8; 3] }).collect();
+        let jpg = io::encode_rgb8(&px, w, h, 95, false, 150);
+        let out = rotate(&jpg, 1, 95).unwrap();
+        assert_eq!(jfif_dpi(&out), Some(150));
+        let s = io::decode(&out, "p").unwrap();
+        assert_eq!((s.w, s.h), (20, 40));
+        assert!(s.px[3 * (2 * 20 + 17)] < 60, "top-right should be dark");
+        assert!(s.px[3 * (2 * 20 + 2)] > 200, "top-left should be light");
     }
 
     #[test]
