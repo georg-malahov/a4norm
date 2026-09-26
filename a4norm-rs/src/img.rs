@@ -223,8 +223,9 @@ impl Img {
         self.each(|p| p.map(|v| ((v - lo) / span).clamp(0.0, 1.0)))
     }
     /// `-contrast-stretch B%xW%`: one histogram of the intensity, one map
-    /// for every channel.
-    pub fn contrast_stretch(&mut self, black_clip: f64, white_clip: f64) {
+    /// for every channel. `black_max` (0..1 of the white point) caps how
+    /// light the black point may be taken.
+    pub fn contrast_stretch(&mut self, black_clip: f64, white_clip: f64, black_max: f64) {
         let gray = self.gray();
         let mut hist = vec![0u64; 65536];
         for &v in &gray.d {
@@ -251,6 +252,7 @@ impl Img {
                 break;
             }
         }
+        black = black.min((white as f64 * black_max) as usize);
         if white <= black {
             return;
         }
