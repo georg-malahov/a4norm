@@ -4,10 +4,10 @@ Photos of paper documents into one scanner-grade A4 PDF — **use it at
 [malahov.io/a4norm](https://malahov.io/a4norm)**
 ([Deutsch](https://malahov.io/de/a4norm), [Русский](https://malahov.io/ru/a4norm)).
 
-- **In the browser:** [malahov.io/a4norm](https://malahov.io/a4norm). This
-  script, unchanged, runs inside the page — Python through Pyodide, ImageMagick
-  compiled to WebAssembly. The photos never leave the device, it works offline,
-  and it is free.
+- **In the browser:** [malahov.io/a4norm](https://malahov.io/a4norm). The
+  same Rust code as the command line, compiled to WebAssembly, runs inside the
+  page (threaded where the browser allows). The photos never leave the device,
+  it works offline, and it is free.
 - **As an app:** [malahov.io/a4norm/app](https://malahov.io/a4norm/app)
   installs the same scanner on a phone or a computer (a PWA).
 - **Inside Telegram:** [@a4norm_bot](https://t.me/a4norm_bot) → the
@@ -20,7 +20,7 @@ How-to guides: [malahov.io/a4norm/how-to](https://malahov.io/a4norm/how-to).
 Privacy: [malahov.io/privacy](https://malahov.io/privacy)
 ([the bot](https://malahov.io/privacy#12-a4norm-telegram-bot)).
 
-What follows is for developers: what the script does, and how to run it from
+What follows is for developers: what the tool does, and how to run it from
 the command line, in a container and as an HTTP service.
 
 A photo of a paper document is not a scan. `a4norm` makes it one: the sheet is
@@ -40,8 +40,8 @@ root, which drove ImageMagick and stays here as the reference. The same crate
 builds the WebAssembly the [product page](https://malahov.io/a4norm) runs in
 the browser, threaded where the page allows it. A 12 MP phone photo takes
 about 1.7 s on one core; the script took 11-15 s. A second image,
-`:full`, adds one segmentation model for the photographs the brightness rule
-cannot solve — see **Two images** below. The light image is unchanged by it.
+`:full`, adds one segmentation model for the photographs the brightness and
+edge rules cannot solve — see **Two images** below.
 
 The before/after photos on the [product page](https://malahov.io/a4norm) are
 public examples here too (`examples/landing-*.webp`), under the same tests.
@@ -229,14 +229,16 @@ curl -X POST http://localhost:8080/pages \
 ```
 
 Concurrency is capped at one page at a time by default (`--max-concurrency`):
-a page is tens of seconds of CPU, so an unbounded server is a denial-of-service
-switch. Bodies over 40 MB are refused, a queued request waits 120 s for a slot
+each page uses every core it is given, so an unbounded server is a
+denial-of-service switch. Bodies over 40 MB are refused, a queued request waits 120 s for a slot
 before `503`, and a job is killed after 600 s.
 
 ## Two images
 
-`ghcr.io/georg-malahov/a4norm:latest` is the tool: Alpine, 104 MB, stdlib-only
-Python over ImageMagick and poppler. Nothing about it changed.
+`ghcr.io/georg-malahov/a4norm:latest` is the tool: Alpine, about 39 MB to
+download and 106 MB unpacked. It holds the static Rust binary, which does all
+the image work itself. poppler is there for PDF input, ImageMagick only to
+read HEIC, and Python only for the HTTP front end (`a4norm-serve`).
 
 `ghcr.io/georg-malahov/a4norm:full` is the same a4norm plus `a4norm-seg`, a
 one-file helper that runs U^2-Net through onnxruntime. It exists for one
@@ -245,7 +247,8 @@ than what it lies on**. Measured on real photographs, a grey thermal receipt on
 a marble counter reads as 0–3% paper-like where the true figure is 30–45%, so
 it was classed as a photograph and passed through untouched; a white evacuation
 sign on a white wall left the wall in the output. With segmentation all of them
-rectify.
+rectify. (The light image now also finds a till receipt by its edges, whatever
+its colour, when its outline is clear on every side.)
 
 There is no flag. The model is consulted **only after** the brightness detector
 has already failed, so a page that is the brightest thing in frame never pays
