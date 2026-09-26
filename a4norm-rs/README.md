@@ -97,7 +97,7 @@ web/build.sh                                   # web/dist/{st,mt}
 `web/build.sh` needs `wasm-bindgen-cli` at the version in `Cargo.lock`, and a
 nightly toolchain with `rust-src`, because atomics need a std built with them.
 It also:
-- links the threaded build with a shared, imported memory (max 1 GiB);
+- links the threaded build with a shared, imported memory (max 512 MiB);
 - names the pool worker's module path, which a plain static server needs.
 
 ## Check

@@ -20,11 +20,11 @@ RUSTFLAGS="-C target-feature=+simd128" \
   cargo build --release --lib --target wasm32-unknown-unknown --target-dir target/wasm-st
 wasm-bindgen --target web --out-dir "$OUT/st" --out-name a4norm "target/wasm-st/$BG"
 
-# The shared memory needs a maximum; 1 GiB is four times the peak of a
-# 50 MP photo and reserves nothing up front.
+# The shared memory needs a maximum, and iOS Safari may refuse to reserve a
+# large one for a shared memory: 512 MiB is twice the peak of a 50 MP photo.
 # Atomics alone leave the memory private; the workers need it imported,
 # shared, and the thread-local storage exported for wasm-bindgen to set up.
-LINK="-C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=1073741824"
+LINK="-C link-arg=--shared-memory -C link-arg=--import-memory -C link-arg=--max-memory=536870912"
 LINK="$LINK -C link-arg=--export=__wasm_init_tls -C link-arg=--export=__tls_size"
 LINK="$LINK -C link-arg=--export=__tls_align -C link-arg=--export=__tls_base"
 RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 $LINK" \
