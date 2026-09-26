@@ -790,8 +790,9 @@ pub fn detect_spread(pm: &Pm) -> Result<Spread, String> {
     Ok(Spread { quads: [full(&quads[0]), full(&quads[1])], horiz, why })
 }
 
-/// (horizontal, vertical) ink in long runs: which way the lines of text go.
-pub fn ink_runs(img: &Img, side: usize, thr: f64) -> (usize, usize) {
+/// The page `side` px on its long side, divided by its closed background and
+/// thresholded at `thr`%: ink is 0, paper 255.
+fn ink_map(img: &Img, side: usize, thr: f64) -> (Vec<u8>, usize, usize) {
     let (w0, h0) = (img.w, img.h);
     let (w, h) = long_side(w0, h0, side);
     let g = img.resize_auto(w, h).gray();
@@ -799,7 +800,12 @@ pub fn ink_runs(img: &Img, side: usize, thr: f64) -> (usize, usize) {
     let closed = ops::morph_p(&closed, &ops::octagon(3), false, 1);
     let bg = ops::blur(&closed, 2.0);
     let div = g.zip(&bg, divide);
-    let raw = ops::threshold(&div, thr).bytes();
+    (ops::threshold(&div, thr).bytes(), w, h)
+}
+
+/// (horizontal, vertical) ink in long runs: which way the lines of text go.
+pub fn ink_runs(img: &Img, side: usize, thr: f64) -> (usize, usize) {
+    let (raw, w, h) = ink_map(img, side, thr);
     let minlen = 8.max(ops::py_round(0.025 * w.max(h) as f64) as usize);
     let runs = |n_lines: usize, n_len: usize, at: &dyn Fn(usize, usize) -> usize| -> usize {
         let gap = 2;
@@ -1988,4 +1994,91 @@ pub fn mrz_rows(img: &Img, mm: f64) -> Vec<f64> {
         return vec![];
     }
     best.iter().map(|r| r.0 * mm / h as f64).collect()
+}
+
+// ------------------------------------------------- which way up text reads
+
+const TEXT_SIDE: usize = 1600;
+const TEXT_ACROSS: f64 = 2.5;
+const TEXT_CORE: f64 = 0.4;
+const TEXT_LINE_PX: (usize, usize) = (6, 90);
+const TEXT_LEAN: f64 = 1.3;
+const TEXT_MIN_LINES: usize = 3;
+const TEXT_SURE: f64 = 0.15;
+const TEXT_AGREE: f64 = 0.7;
+
+/// The turn that puts a page's text upright, read off the text itself.
+/// A line of Latin print carries more ink above its lower-case core
+/// (capitals, digits, b d f h k l t) than below it (g j p q y), so a line
+/// upside down has its heavy side at the bottom.
+/// It stays cautious, because a wrong turn is worse than none:
+/// - the lines must run clearly one way;
+/// - most of them must vote, and 70% of the votes must agree;
+/// - a page with a face photo is left to the photo.
+///
+/// Handwriting, all capitals and Cyrillic (heavy below: д р у ф) mostly split
+/// the vote and are left as shot. Ok(turn) or Err(why not).
+pub fn text_turn(img: &Img, receipt: bool) -> Result<(i32, String), String> {
+    // an ID's face photo says which way up it is, and its print, mostly
+    // capitals and Cyrillic, leans either way (a receipt has none: what looks
+    // like one is a crumple)
+    if !receipt && find_photo_block(img, None, None, None, None).is_some() {
+        return Err("a face photo on the page".into());
+    }
+    let (hr, vr) = ink_runs(img, 600, 75.0);
+    let ratio = hr as f64 / vr.max(1) as f64;
+    let base = if ratio >= TEXT_ACROSS {
+        0
+    } else if ratio <= 1.0 / TEXT_ACROSS {
+        90
+    } else {
+        return Err(format!("text direction unclear (runs across/along {:.2})", ratio));
+    };
+    let turned = if base == 0 { img.clone() } else { img.rotate(base) };
+    let (m, w, h) = ink_map(&turned, TEXT_SIDE, 75.0);
+    let prof: Vec<f64> = (0..h).map(|y| m[y * w..(y + 1) * w].iter().filter(|&&v| v < 128).count() as f64).collect();
+    let floor = 0.005 * w as f64;
+    let (mut above, mut below, mut up, mut down, mut lines) = (0.0, 0.0, 0, 0, 0);
+    let mut y = 0;
+    while y < h {
+        if prof[y] <= floor {
+            y += 1;
+            continue;
+        }
+        let top = y;
+        while y < h && prof[y] > floor {
+            y += 1;
+        }
+        let band = &prof[top..y];
+        if !(TEXT_LINE_PX.0..=TEXT_LINE_PX.1).contains(&band.len()) {
+            continue;
+        }
+        let peak = band.iter().cloned().fold(0.0, f64::max);
+        let core: Vec<usize> = (0..band.len()).filter(|&i| band[i] >= TEXT_CORE * peak).collect();
+        let (c0, c1) = (core[0], *core.last().unwrap());
+        let a: f64 = band[..c0].iter().sum();
+        let b: f64 = band[c1 + 1..].iter().sum();
+        above += a;
+        below += b;
+        lines += 1;
+        if a > TEXT_LEAN * b {
+            up += 1;
+        } else if b > TEXT_LEAN * a {
+            down += 1;
+        }
+    }
+    if std::env::var_os("A4DBG").is_some() {
+        eprintln!("text_turn base {} ratio {:.2} lines {} up {} down {} above {:.0} below {:.0}", base, ratio, lines, up, down, above, below);
+    }
+    let votes = up + down;
+    if lines < TEXT_MIN_LINES || (votes as f64) < 0.5 * lines as f64 {
+        return Err(format!("too few lines of text to tell up from down ({})", lines));
+    }
+    let lean = (above - below) / (above + below).max(1.0);
+    let agree = up.max(down) as f64 / votes as f64;
+    if lean.abs() < TEXT_SURE || agree < TEXT_AGREE || (lean > 0.0) != (up > down) {
+        return Err(format!("text reads either way up ({} lines, {} lean up, {} down)", lines, up, down));
+    }
+    let turn = if lean > 0.0 { base } else { (base + 180) % 360 };
+    Ok((turn, format!("{} of {} lines of text read upright when turned {}°", up.max(down), lines, turn)))
 }

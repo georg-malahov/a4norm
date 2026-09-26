@@ -556,6 +556,18 @@ def upside_down_back_checks():
     ]
 
 
+def upside_down_invoice_checks():
+    def turned(rep, page):
+        if not any(l.startswith("rotated 180°: ") and "lines of text read upright" in l
+                   for l in rep["lines"]):
+            raise Fail("the invoice, shot upside down, was not turned upright by "
+                       "its text. Report:\n    " + "\n    ".join(rep["lines"]))
+
+    # and then it must be the same page as the upright invoice
+    return [("the upside-down page is turned upright by its text", turned)] \
+        + landing_invoice_checks()
+
+
 # The landing page's own demo photos (malahov.io/products/a4norm). They are
 # NOT the same photos as notebook-photo / sample-photo: the landing notebook
 # lost its page to an edge outline around the page and a band of desk above
@@ -574,6 +586,9 @@ CASES = [
      specimen_card_checks),
     # the same back, photographed upside down: it has no face photo, so only
     # its machine-readable zone tells up from down
+    # the landing invoice photographed upside down: only its text tells
+    ("landing-invoice-upside-down", "landing-invoice-upside-down.webp",
+     upside_down_invoice_checks),
     ("specimen-card-upside-down", ["specimen-card-front.jpg",
                                    "specimen-card-back-upside-down.jpg"],
      upside_down_back_checks),

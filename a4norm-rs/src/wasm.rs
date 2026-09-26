@@ -13,6 +13,8 @@
 //! // size control: every page written again, in parallel
 //! const small = recompress(jpgs, { dpi: 150, quality: 60, gray: false });
 //! // small = [{ jpg: Uint8Array, dpi }, ...]
+//! // the Edit panel's rotate: quarter turns clockwise
+//! const turned = rotate(jpg, 1, 88);
 //! ```
 
 use crate::{encode_page, io, parse_args, run, Source};
@@ -128,4 +130,14 @@ pub fn recompress(jpgs: Array, opts: JsValue) -> Result<Array, JsValue> {
         }
     }
     Ok(out)
+}
+
+/// A finished page turned by `quarter_turns` quarter turns clockwise (1 =
+/// 90°, 2 = 180°, 3 = 270°), written again at `quality` (default: the pages'
+/// own) with its dpi kept; a grey page stays grey.
+#[wasm_bindgen]
+pub fn rotate(jpg: Vec<u8>, quarter_turns: i32, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
+    let q = quality.unwrap_or(crate::Opts::default().quality);
+    let out = crate::edit::rotate(&jpg, quarter_turns, q).map_err(|e| JsValue::from_str(&e.0))?;
+    Ok(Uint8Array::from(out.as_slice()))
 }

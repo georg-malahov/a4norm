@@ -1058,7 +1058,7 @@ fn erase_outside(job: &mut Job, w: usize, h: usize) {
     }
 }
 
-fn orient(job: &mut Job, spread: Option<&d::Spread>) {
+fn orient(job: &mut Job, spread: Option<&d::Spread>, receipt: bool) {
     let o = job.o;
     if o.rotate != "auto" && o.rotate != "0" {
         let deg: i32 = o.rotate.parse().unwrap_or(0);
@@ -1069,6 +1069,16 @@ fn orient(job: &mut Job, spread: Option<&d::Spread>) {
         if turn != 0 {
             job.cur = job.cur.rotate(turn);
             job.say(format!("rotated {}°", turn));
+        }
+    } else if o.rotate == "auto" {
+        // a page shot upside down or on its side: its text says which way up
+        match d::text_turn(&job.cur, receipt) {
+            Ok((0, _)) => {}
+            Ok((turn, why)) => {
+                job.cur = job.cur.rotate(turn);
+                job.say(format!("rotated {}°: {}", turn, why));
+            }
+            Err(_) => {}
         }
     }
 }
@@ -1379,7 +1389,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         erase_outside(&mut job, wh.0, wh.1);
         step("border");
     }
-    orient(&mut job, spread.as_ref());
+    orient(&mut job, spread.as_ref(), receipt);
     let mut t = if rectified { Trim { flags: [false; 4], span: (0, 0), shave: (0, 0) } } else { trim_border(&mut job) };
     let copy = spread.is_some() && !o.spread_scan;
     if copy {

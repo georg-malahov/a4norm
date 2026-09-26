@@ -78,6 +78,15 @@ Some things depart from the script on purpose:
   glyph-sized marks at one even pitch (OCR-B, 2.54 mm on a real card), over
   most of the width and a line apart. If they sit in the upper half, the card
   turns 180°. A back without an MRZ (a driving licence) stays as shot.
+- **A page shot upside down or on its side is turned upright by its text.**
+  A line of Latin print carries more ink above its lower-case core
+  (capitals, digits, b d f h k l t) than below it (g j p q y); the lines vote.
+  It stays cautious: the lines must run clearly one way (2.5:1), most must
+  vote, 70% of votes must agree, and a page with a face photo is left to the
+  photo. Printed Latin text turns reliably. Handwriting, all capitals and
+  Cyrillic (heavy below: д р у ф) mostly split the vote and stay as shot.
+  Over 44 rotations of 11 pages, 11 were turned right, none wrong; over the
+  corpus, nothing changed.
 - **A spread's pages must be page-shaped** (1.1-2:1). A card whose MRZ band
   and tinted top split into two light regions is no longer taken for a
   passport spread.
@@ -168,6 +177,8 @@ const r = m.process([{ bytes, name }], ['--format', 'jpg', '--dpi', '200'],
 // r.report: the command line's stdout, "card: 1 ID-1 card ..." included
 const pdf = m.pack(jpgs, new Uint32Array(dpis), gray);
 
+// the Edit panel's rotate: quarter turns clockwise, dpi kept
+const turned = m.rotate(jpg, 1, 88);
 // the Edit panel's eraser: round spots filled from what surrounds them
 const jpg2 = m.inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
 // the size control: pages written again, four at a time in parallel
