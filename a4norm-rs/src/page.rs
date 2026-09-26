@@ -1349,6 +1349,8 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         Found::Frame => (None, None),
     };
     let rectified = spread.is_some() || sheet.is_some();
+    // a receipt carries no face photo: what looks like one is a crumple
+    let receipt = sheet.as_ref().map_or(false, |(_, why)| why.ends_with(d::RECEIPT));
     // the frame path works on the whole photo; a rectify makes its own page
     let cur = if rectified { Img::solid(1, 1, [1.0; 3]) } else { src.to_img() };
     let mut job = Job { cur, page: (0, 0), o, report: std::mem::take(report) };
@@ -1374,7 +1376,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         job.cur = c;
         job.say("colour copy: light evened, tint and security print kept, nothing whitened".into());
     }
-    let mut keep = if o.no_keep_photo || copy { None } else { keep_face_photo(&mut job, spread.is_some()) };
+    let mut keep = if o.no_keep_photo || copy || receipt { None } else { keep_face_photo(&mut job, spread.is_some()) };
     if !copy {
         finish::flat_field(&mut job.cur, o);
         step("flat");
