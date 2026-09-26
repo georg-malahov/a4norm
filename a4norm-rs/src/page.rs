@@ -524,7 +524,7 @@ pub fn copy_tone(img: &Img, width: usize, inside: Option<&Plane>) -> Img {
     // "%[fx:mean]" prints six digits, the script passes four
     let mean: f32 = format!("{:.4}", format!("{:.6}", mean).parse::<f64>().unwrap()).parse().unwrap();
     let mut out = img.each(|p| p.map(|v| (v * mean).min(1.0)).zip(&bg, d::divide));
-    out.contrast_stretch(0.3, 0.3);
+    out.contrast_stretch(0.3, 0.3, 1.0);
     out
 }
 

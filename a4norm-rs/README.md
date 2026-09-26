@@ -41,12 +41,18 @@ Two things are knowingly not reproduced exactly:
 - **`-blur` wider than the page.** The colour copy's light estimate is taken
   over blocks, with the replicated edge pixels exact (60 dB against ImageMagick).
 
-One thing departs from the script on purpose:
+Two things depart from the script on purpose:
 - **A card's colour copy takes its light from the card alone.** The script
   blurred the whole rectified rectangle, so the desk in the rounded corners
   darkened the estimate there and the division left a glow in the corners.
   The estimate is now a blur normalized by the card's rounded shape, set in
   by a hundredth of its width.
+- **A blank page stays blank.** The tone stretch takes its black point from
+  the darkest 0.1% of the page, meant to be ink. On a sheet with no ink (the
+  back of an envelope) that is a crease at ~0.89, and the script stretched the
+  paper ninefold into grey stains. The black point is now taken no lighter
+  than half the paper; every inked page seen, a pencil notebook included,
+  already sits at or below that, so they do not change.
 
 The goal is pages that cannot be told apart by eye or in print, not
 bit-identity.

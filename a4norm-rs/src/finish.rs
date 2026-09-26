@@ -115,7 +115,13 @@ pub fn paper_screen(img: &mut Img, paper_thr: f64) {
 /// Tone, haze and paper-flattening, as the script's tone() does them.
 pub fn tone(img: &mut Img, o: &Opts) {
     let (w, h) = (img.w, img.h);
-    img.contrast_stretch(o.black_clip, o.white_clip);
+    // The black point is meant to land on ink. A page with none (the back of
+    // an envelope, a blank sheet) has only a crease or a shadow in its darkest
+    // tenth of a percent, and stretching that to black blows the paper's grain
+    // up into grey stains. After the flat-field every ink seen is darker than
+    // half the paper (a pencil notebook is the lightest, at 0.51), so the
+    // black point is taken no lighter than that.
+    img.contrast_stretch(o.black_clip, o.white_clip, 0.5);
     if !o.no_haze {
         let g = img.gray();
         let sd = stddev(&g, 7);
@@ -134,4 +140,28 @@ pub fn tone(img: &mut Img, o: &Opts) {
         paper_screen(img, o.paper_thr);
     }
     img.q8();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_sheet_stays_white() {
+        // paper at 0.97 with a grain of ±0.02 and a crease at 0.87: no ink,
+        // so tone must not stretch the crease to black and the grain to stains
+        let (w, h) = (300, 200);
+        let mut seed = 1u32;
+        let mut p = Plane::new(w, h);
+        for (i, v) in p.d.iter_mut().enumerate() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let grain = (seed >> 8) as f32 / (1 << 24) as f32 * 0.04 - 0.02;
+            *v = if i % w == 150 { 0.87 } else { 0.97 + grain };
+        }
+        let mut img = Img::from_planes(vec![p.clone(), p.clone(), p]);
+        img.q8();
+        tone(&mut img, &Opts::default());
+        let white = img.c[0].d.iter().filter(|&&v| v == 1.0).count();
+        assert!(white as f64 > 0.99 * (w * h) as f64, "{white} of {}", w * h);
+    }
 }
