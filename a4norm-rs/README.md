@@ -61,6 +61,16 @@ Some things depart from the script on purpose:
   covered by a finger or sagging, bends by 11-18° and leaves a gap of ~10% of
   the short side; a booklet's fold bends a few degrees and the halves meet.
   A kink over 15° or with a gap over 5% no longer splits a sheet into a spread.
+- **Edges correct brightness.** A side of the brightness quad that lies on no
+  edge moves in onto the strongest edge near it, if that edge is a step down
+  from paper to something darker. This catches a hand or a pale carpet that
+  was taken for paper. A printed rule has paper on both sides and does not
+  qualify.
+- **Receipts are found by their edges.** A receipt (2.5-6:1, 15%+ of the frame,
+  75%+ of its outline on edges) is often greyer than the desk under it. It is
+  taken by its outline whatever its colour. Of near-equal outlines, the
+  outermost is used, so print at a crumpled edge is kept. A receipt gets no
+  face photo.
 
 The goal is pages that cannot be told apart by eye or in print, not
 bit-identity.
