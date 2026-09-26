@@ -501,15 +501,28 @@ fn card_face(img: &Img) -> Option<&'static str> {
 
 /// A colour copy: light evened by a very wide blur of the brightness, the
 /// same factor on every channel, then a gentle stretch (copy_tone_args).
-pub fn copy_tone(img: &Img, width: usize) -> Img {
+/// `inside` (0..1) marks what is the document: the light is then taken from
+/// it alone, a blur normalized by the blurred mask, so the desk in a card's
+/// rounded corners and along a loose edge cannot darken the estimate there
+/// and leave a glow in the corner.
+pub fn copy_tone(img: &Img, width: usize, inside: Option<&Plane>) -> Img {
     let sig = py_round(width as f64 / 5.0) as f64;
-    let mut mean = img.mean();
+    let g = img.gray();
+    let (bg, mut mean) = match inside {
+        None => (ops::blur(&g, sig), img.mean()),
+        Some(m) => {
+            let lit = ops::blur(&g.zip(m, |v, a| v * a), sig);
+            let bg = lit.zip(&ops::blur(m, sig), |v, a| if a > 1e-6 { v / a } else { v });
+            let area: f64 = m.d.iter().map(|&a| a as f64).sum();
+            let sum: f64 = img.c.iter().flat_map(|p| p.d.iter().zip(&m.d)).map(|(&v, &a)| (v * a) as f64).sum();
+            (bg, sum / (area * img.c.len() as f64).max(1.0))
+        }
+    };
     if mean == 0.0 {
         mean = 0.5;
     }
     // "%[fx:mean]" prints six digits, the script passes four
     let mean: f32 = format!("{:.4}", format!("{:.6}", mean).parse::<f64>().unwrap()).parse().unwrap();
-    let bg = ops::blur(&img.gray(), sig);
     let mut out = img.each(|p| p.map(|v| (v * mean).min(1.0)).zip(&bg, d::divide));
     out.contrast_stretch(0.3, 0.3);
     out
@@ -534,6 +547,11 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
         if quads.len() > 1 { "s" } else { "" },
         why
     ));
+    // the card for the light estimate: its rounded shape, a hundredth of its
+    // width in from the rectified edge, which may hold a sliver of desk
+    let inset = py_round(cw_px as f64 / 100.0).max(1) as usize;
+    let mut inside = Plane::new(cw_px, ch_px);
+    inside.paste(&img::round_rect(cw_px - 2 * inset, ch_px - 2 * inset, radius, 0.0), inset as isize, inset as isize);
     let mut cards = vec![];
     for (k, q) in quads.iter().enumerate() {
         let wide = dist(q[0], q[1]) + dist(q[3], q[2]) >= dist(q[0], q[3]) + dist(q[1], q[2]);
@@ -553,7 +571,7 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
             raw = raw.rotate(180);
         }
         let front = side.is_some();
-        let toned = copy_tone(&raw, cw_px);
+        let toned = copy_tone(&raw, cw_px, Some(&inside));
         let mut sharp = toned.each(|p| ops::unsharp(p, 1.0, o.sharpen as f32, 0.02));
         // rounded ID-1 corners on white, and a gray70 hairline
         let alpha = img::round_rect(cw_px, ch_px, radius, 0.0);
@@ -1351,7 +1369,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     let copy = spread.is_some() && !o.spread_scan;
     if copy {
         let w = job.cur.w;
-        let mut c = copy_tone(&job.cur, w);
+        let mut c = copy_tone(&job.cur, w, None);
         c.q8();
         job.cur = c;
         job.say("colour copy: light evened, tint and security print kept, nothing whitened".into());
