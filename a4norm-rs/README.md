@@ -157,4 +157,31 @@ const r = m.process([{ bytes, name }], ['--format', 'jpg', '--dpi', '200'],
 // r.pages: [{ jpg, dpi }] (dpi also in each JPEG's JFIF header)
 // r.report: the command line's stdout, "card: 1 ID-1 card ..." included
 const pdf = m.pack(jpgs, new Uint32Array(dpis), gray);
+
+// the Edit panel's eraser: round spots filled from what surrounds them
+const jpg2 = m.inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
+// the size control: pages written again, four at a time in parallel
+const small = m.recompress(jpgs, { dpi: 150, quality: 60, gray: false });
+// small: [{ jpg, dpi }]; dpi only ever goes down
 ```
+
+- **`inpaint`** fills the spots by push-pull. The known pixels are averaged
+  down a pyramid until the holes close, then brought back up. The fill is a
+  smooth membrane through the colours at the spots' rim, so it takes the
+  page's own tone, white or a passport's grey or blue, shading included. Only
+  a box round the spots is touched: a stroke of 11 dots of radius 70 takes
+  5 ms. The page is written again at `quality` (default 88) with its dpi kept,
+  and a grey page stays grey.
+- **`recompress`** brings a page down to `dpi` (triangle filter) and writes it
+  at `quality`. Colour goes 4:2:0 once the quality or the dpi drops. At
+  today's settings the size is today's, so "normal" can stay the original
+  bytes. The size presets, measured on an invoice, a notebook and a card
+  page:
+
+| preset | settings | size vs today | small print |
+|---|---|---|---|
+| normal | the page as made (200 dpi, quality 88) | 100% | — |
+| smaller | `{ dpi: 200, quality: 70 }` | 57-62% | unchanged to the eye |
+| minimum | `{ dpi: 150, quality: 60 }` | 32-37% | 6 pt still reads |
+
+  Three pages take 0.12 s (smaller) and 0.18 s (minimum) in `st` on an M4.
