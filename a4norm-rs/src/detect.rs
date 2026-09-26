@@ -563,6 +563,12 @@ pub fn page_lines(b: &Blob, w: usize, h: Option<usize>) -> Option<Sides> {
 const FOLD_ANGLE: f64 = 1.5;
 const FOLD_STEP: f64 = 1.0;
 const FOLD_GAIN: f64 = 0.6;
+// A booklet's fold bends its edge a little and the two halves still meet
+// (the one folded spread seen: 3-6°, 1% of the short side). A finger over the
+// edge or a sheet sagging in the hand bends it more and leaves a gap
+// (11-18°, 9-10%).
+const FOLD_ANGLE_MAX: f64 = 15.0;
+const FOLD_STEP_MAX: f64 = 5.0;
 
 fn kink(pts: &[Pt], p: Pt, q: Pt, short: f64) -> Option<(f64, Pt)> {
     let l = dist(p, q);
@@ -597,7 +603,11 @@ fn kink(pts: &[Pt], p: Pt, q: Pt, short: f64) -> Option<(f64, Pt)> {
     let at = |ln: &Line| cross(ln, &Line::of(x.0, x.1, -uy, ux)).unwrap_or(x);
     let (pa, pb) = (at(&la), at(&lb));
     let step = dist(pa, pb);
-    if line_angle(&la, &lb) < FOLD_ANGLE && step < FOLD_STEP / 100.0 * short {
+    let bend = line_angle(&la, &lb);
+    if bend < FOLD_ANGLE && step < FOLD_STEP / 100.0 * short {
+        return None;
+    }
+    if bend > FOLD_ANGLE_MAX || step > FOLD_STEP_MAX / 100.0 * short {
         return None;
     }
     Some((t, ((pa.0 + pb.0) / 2.0, (pa.1 + pb.1) / 2.0)))
@@ -1088,6 +1098,15 @@ const CARD_FILL: f64 = 0.6;
 pub const CARD_OF_SPREAD: f64 = 0.7;
 const CARD_GAP: f64 = 4.0;
 
+const CARD_BORDER: f64 = 1.5;
+
+/// Both ends of a-b within CARD_BORDER% of the same side of the frame.
+fn on_frame(a: Pt, b: Pt, w: usize, h: usize) -> bool {
+    let (tx, ty) = (CARD_BORDER / 100.0 * w as f64, CARD_BORDER / 100.0 * h as f64);
+    let (w, h) = ((w - 1) as f64, (h - 1) as f64);
+    (a.0 <= tx && b.0 <= tx) || (a.0 >= w - tx && b.0 >= w - tx) || (a.1 <= ty && b.1 <= ty) || (a.1 >= h - ty && b.1 >= h - ty)
+}
+
 fn card_quad(b: &Blob, w: usize, h: usize) -> Option<(Quad, f64)> {
     let lines = page_lines(b, w, Some(h)).or_else(|| page_lines(b, w, None))?;
     let q = [
@@ -1103,6 +1122,14 @@ fn card_quad(b: &Blob, w: usize, h: usize) -> Option<(Quad, f64)> {
     }
     let (top, bot, lef, rig) = (dist(q[0], q[1]), dist(q[3], q[2]), dist(q[0], q[3]), dist(q[1], q[2]));
     if top.max(bot) > 1.35 * top.min(bot) || lef.max(rig) > 1.35 * lef.min(rig) {
+        return None;
+    }
+    // A side along the frame's border is where the region leaves the picture,
+    // not an edge of it, so its shape is not known: a light background
+    // flooded together with the thing on it. Only a picture cropped to the
+    // card itself has its sides there, and then all four.
+    let on_border = (0..4).filter(|&i| on_frame(q[i], q[(i + 1) % 4], w, h)).count();
+    if (1..4).contains(&on_border) {
         return None;
     }
     let area = shoelace(&q);
@@ -1647,3 +1674,24 @@ pub fn deskew_angle(img: &Img) -> f64 {
     ops::deskew_angle(&[&g], ops::pct_thr(40.0))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(w: usize, x0: usize, y0: usize, rw: usize, rh: usize) -> Blob {
+        let comp = (y0..y0 + rh).flat_map(|y| (x0..x0 + rw).map(move |x| y * w + x)).collect();
+        Blob::new(comp, w)
+    }
+
+    #[test]
+    fn card_needs_its_own_edges() {
+        let (w, h) = (400, 300);
+        // a card-shaped region in the open is a card
+        assert!(card_quad(&rect(w, 100, 80, 160, 100), w, h).is_some());
+        // the same region run into the frame's corner is background
+        assert!(card_quad(&rect(w, 0, 0, 160, 100), w, h).is_none());
+        // a picture cropped to the card is still one
+        assert!(card_quad(&rect(254, 0, 0, 254, 160), 254, 160).is_some());
+    }
+}

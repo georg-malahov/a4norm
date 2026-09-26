@@ -41,7 +41,7 @@ Two things are knowingly not reproduced exactly:
 - **`-blur` wider than the page.** The colour copy's light estimate is taken
   over blocks, with the replicated edge pixels exact (60 dB against ImageMagick).
 
-Two things depart from the script on purpose:
+Some things depart from the script on purpose:
 - **A card's colour copy takes its light from the card alone.** The script
   blurred the whole rectified rectangle, so the desk in the rounded corners
   darkened the estimate there and the division left a glow in the corners.
@@ -53,6 +53,14 @@ Two things depart from the script on purpose:
   paper ninefold into grey stains. The black point is now taken no lighter
   than half the paper; every inked page seen, a pencil notebook included,
   already sits at or below that, so they do not change.
+- **A card must show its own edges.** A card-shaped region with one to three
+  sides along the frame's border is a light background flooded together with
+  what lies on it (a window envelope on a pale carpet), not a card. A picture
+  cropped to a card, with all four sides there, still is one.
+- **A fold is where two pages meet.** A sheet held in the hand, its edge
+  covered by a finger or sagging, bends by 11-18° and leaves a gap of ~10% of
+  the short side; a booklet's fold bends a few degrees and the halves meet.
+  A kink over 15° or with a gap over 5% no longer splits a sheet into a spread.
 
 The goal is pages that cannot be told apart by eye or in print, not
 bit-identity.
