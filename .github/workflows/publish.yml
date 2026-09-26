@@ -59,6 +59,13 @@ jobs:
       - name: Run the examples through it
         run: tests/run-in-docker.sh a4norm:test --flavor ${{ matrix.flavor }} --artifacts regression-out
 
+      # a4norm in the image is the Rust port (a4norm-rs/); the examples above
+      # ran through it. Its own unit tests pin the ImageMagick geometry it
+      # reproduces (kernels, Gaussian widths, sample offsets).
+      - name: Rust unit tests
+        if: matrix.flavor == 'light'
+        run: cd a4norm-rs && cargo test --release --locked
+
       - name: Keep the PDFs and renders of a failed run
         if: failure()
         uses: actions/upload-artifact@v4

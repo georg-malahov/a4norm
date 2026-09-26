@@ -7,3 +7,9 @@ tests/corpus/
 
 # Test run output and the local report (tests/run.sh). Never committed.
 tests/out/
+
+# Rust build output
+a4norm-rs/target*/
+web/dist/
+a4norm-rs/web/dist/
+a4norm-rs/web/check/node_modules

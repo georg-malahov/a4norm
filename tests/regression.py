@@ -621,8 +621,11 @@ def run_case(name, src, checks, a4norm, update, artifacts, golden_dir):
 # interface change: update the consumer named beside it first.
 REPORT_CONTRACT = [
     # malahov.io browser demo, oneCard(): /^card: 1 ID-1 card /
-    ("card: 1 ID-1 card", 'report.append(f"card: {len(quads)} ID-1 card'),
+    # (the line, the code that writes it in the script, and in the Rust port)
+    ("card: 1 ID-1 card", 'report.append(f"card: {len(quads)} ID-1 card',
+     '"card: {} ID-1 card{} in the frame ({})"'),
 ]
+RUST_SOURCE = os.path.join(ROOT, "a4norm-rs", "src", "page.rs")
 
 
 def check_report_contract(a4norm):
@@ -632,13 +635,22 @@ def check_report_contract(a4norm):
     a run; the source is checked instead, the same way the demo's sync
     script checks it before it takes a new version.
     """
+    rust = False
     try:
         src = open(a4norm, encoding="utf-8").read()
+    except UnicodeDecodeError:
+        # the Rust binary: its source is in the checkout
+        rust = True
+        try:
+            src = open(RUST_SOURCE, encoding="utf-8").read()
+        except OSError as e:
+            return [f"cannot read {RUST_SOURCE} to check the report contract: {e}"]
     except OSError as e:
         return [f"cannot read {a4norm} to check the report contract: {e}"]
     return [f"report line {line!r} is no longer written (expected the code "
             f"{code!r}) -- a program parses it, see REPORT_CONTRACT"
-            for line, code in REPORT_CONTRACT if code not in src]
+            for line, py, rs in REPORT_CONTRACT
+            for code in [rs if rust else py] if code not in src]
 
 
 def main():

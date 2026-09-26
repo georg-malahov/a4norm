@@ -34,8 +34,12 @@ A frame that holds no document is recognised as such and left alone: the
 picture is fitted onto the page as shot, without any of the scanner treatment.
 So the same command also just turns a handful of snapshots into a PDF.
 
-No OpenCV, no NumPy, no ML, no ghostscript. The tool is stdlib-only Python
-driving ImageMagick and poppler, and the container is 104 MB. A second image,
+No OpenCV, no NumPy, no ML, no ghostscript. The tool is one Rust binary
+([a4norm-rs/](a4norm-rs/)), ported from the stdlib-only Python script at the
+root, which drove ImageMagick and stays here as the reference. The same crate
+builds the WebAssembly the [product page](https://malahov.io/a4norm) runs in
+the browser, threaded where the page allows it. A 12 MP phone photo takes
+about 1.7 s on one core; the script took 11-15 s. A second image,
 `:full`, adds one segmentation model for the photographs the brightness rule
 cannot solve — see **Two images** below. The light image is unchanged by it.
 
@@ -158,7 +162,16 @@ docker run --rm -v "$PWD:/work" ghcr.io/georg-malahov/a4norm:latest \
   --dry-run /work/photo.HEIC
 ```
 
-**Locally**, if you already have the dependencies:
+**Locally**, the Rust binary (poppler only for PDF input, a HEIC converter
+such as `magick` or `heif-convert` only for HEIC):
+
+```bash
+cargo install --path a4norm-rs --features par
+a4norm --preview photo.HEIC
+```
+
+Or the Python script it was ported from, if you already have its
+dependencies:
 
 ```bash
 brew install imagemagick poppler                                             # macOS

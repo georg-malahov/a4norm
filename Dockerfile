@@ -4,6 +4,23 @@
 # HEIC support is a line in the install list rather than a hope about how a
 # distro happened to build its binary. (PNG needs no delegate package — it is in
 # the base imagemagick build.)
+# a4norm itself is the Rust port (a4norm-rs/): one static binary, built on
+# the build machine for the target's architecture -- no emulator in the
+# loop -- and the same binary for the Alpine and the Debian image. The crate
+# is pure Rust, so rust-lld links it for either musl target.
+FROM --platform=$BUILDPLATFORM rust:1-alpine3.21 AS build
+ARG TARGETARCH
+RUN case "$TARGETARCH" in arm64) t=aarch64-unknown-linux-musl ;; *) t=x86_64-unknown-linux-musl ;; esac \
+    && echo "$t" > /target && rustup target add "$t"
+WORKDIR /src
+COPY a4norm-rs/Cargo.toml a4norm-rs/Cargo.lock ./
+COPY a4norm-rs/src ./src
+RUN t=$(cat /target) \
+    && CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+       cargo build --release --locked --features par --bin a4norm --target "$t" \
+    && cp "target/$t/release/a4norm" /a4norm
+
 FROM alpine:3.21
 
 RUN apk add --no-cache \
@@ -20,7 +37,8 @@ RUN apk add --no-cache \
 # boilerplate — so the image stays at ImageMagick + poppler. ImageMagick never
 # READS a PDF here either; poppler does that.
 
-COPY a4norm a4norm-serve /usr/local/bin/
+COPY --from=build /a4norm /usr/local/bin/a4norm
+COPY a4norm-serve /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/a4norm /usr/local/bin/a4norm-serve \
              /usr/local/bin/entrypoint.sh
