@@ -524,6 +524,38 @@ def specimen_card_checks():
     ]
 
 
+def upside_down_back_checks():
+    def turned(rep, page):
+        backs = [l for l in rep["lines"] if re.match(r"card \d+: rectified", l)
+                 and "— back" in l]
+        if len(backs) != 1 or "turned 180°" not in backs[0] \
+                or "machine-readable zone below" not in backs[0]:
+            raise Fail("the back, shot upside down, was not turned upright by "
+                       "its machine-readable zone. Report:\n    "
+                       + "\n    ".join(rep["lines"]))
+
+    def mrz_low(rep, page):
+        # the lower card is the back; its MRZ, three full lines of print,
+        # outweighs the address above it: more ink in its lower half
+        # (upright 318 dark px against 246 above at 50 dpi; upside down
+        # 247 against 305)
+        rows = [sum(1 for x in range(page.w) if page.lum[y * page.w + x] < 110)
+                for y in range(page.h // 2, page.h)]
+        ink = [y for y, n in enumerate(rows) if n > 0]
+        if not ink:
+            raise Fail("no ink on the lower half of the page")
+        mid = (ink[0] + ink[-1]) // 2
+        upper, lower = sum(rows[ink[0]:mid]), sum(rows[mid:ink[-1] + 1])
+        if lower < 1.1 * upper:
+            raise Fail(f"the back's print weighs more in its upper half "
+                       f"({upper} dark px above, {lower} below): upside down")
+
+    return specimen_card_checks() + [
+        ("the upside-down back is turned upright by its MRZ", turned),
+        ("the back's MRZ is at its bottom on the page", mrz_low),
+    ]
+
+
 # The landing page's own demo photos (malahov.io/products/a4norm). They are
 # NOT the same photos as notebook-photo / sample-photo: the landing notebook
 # lost its page to an edge outline around the page and a band of desk above
@@ -540,6 +572,11 @@ CASES = [
     # (made by the malahov.io session): the only card path in CI
     ("specimen-card", ["specimen-card-front.jpg", "specimen-card-back.jpg"],
      specimen_card_checks),
+    # the same back, photographed upside down: it has no face photo, so only
+    # its machine-readable zone tells up from down
+    ("specimen-card-upside-down", ["specimen-card-front.jpg",
+                                   "specimen-card-back-upside-down.jpg"],
+     upside_down_back_checks),
 ]
 
 

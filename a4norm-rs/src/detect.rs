@@ -290,6 +290,8 @@ pub fn quad_from_mask(pm: &Pm) -> (Option<Quad>, String, f64) {
 pub const SPREAD_MIN: f64 = 10.0;
 pub const SPREAD_BALANCE: f64 = 0.6;
 pub const SPREAD_FILL: f64 = 0.45;
+/// A booklet's page, 1.42:1 for a passport, give or take perspective.
+const SPREAD_PAGE: (f64, f64) = (1.1, 2.0);
 pub const EDGE_FRAME: f64 = 8.0;
 const RIM: usize = 4;
 
@@ -771,6 +773,11 @@ pub fn detect_spread(pm: &Pm) -> Result<Spread, String> {
         let (s01, s32, s03, s12) = (dist(q[0], q[1]), dist(q[3], q[2]), dist(q[0], q[3]), dist(q[1], q[2]));
         if s01.max(s32) > 1.8 * s01.min(s32) || s03.max(s12) > 1.8 * s03.min(s12) {
             return Err("opposite page edges differ too much to be one flat page".into());
+        }
+        let (pw, ph) = ((s01 + s32) / 2.0, (s03 + s12) / 2.0);
+        let aspect = pw.max(ph) / pw.min(ph).max(1e-6);
+        if !(SPREAD_PAGE.0..=SPREAD_PAGE.1).contains(&aspect) {
+            return Err(format!("a page region is {:.2}:1, not shaped like a booklet's page", aspect));
         }
         quads.push(q);
     }
@@ -1653,8 +1660,8 @@ fn pull_in(em: &EdgeMap, lines: &[HLine], bq: Quad) -> Option<(Quad, String)> {
             if d < SIDE_PULL.0 * depth || d > SIDE_PULL.1 * depth || sup < SIDE_EDGE {
                 continue;
             }
-            if best.as_ref().map_or(true, |(bs, _)| sup > *bs) {
-                best = Some((sup, hl.l.clone()));
+            if best.as_ref().is_none_or(|(bs, _)| sup > *bs) {
+                best = Some((sup, hl.l));
             }
         }
         let Some((_, nl)) = best else { continue };
@@ -1738,7 +1745,7 @@ fn edge_outline(cands: &[Cand], lines: &[HLine], em: &EdgeMap, bright: Option<Qu
         let bq = bq.map(|p| (p.0 / sx, p.1 / sy));
         let slack = 0.02 * w.max(h) as f64;
         let bsup = || {
-            let mut s: Vec<f64> = (0..4).map(|i| seg_support(&em, bq[i], bq[(i + 1) % 4])).collect();
+            let mut s: Vec<f64> = (0..4).map(|i| seg_support(em, bq[i], bq[(i + 1) % 4])).collect();
             s.sort_by(|a, b| a.partial_cmp(b).unwrap());
             s
         };
@@ -1760,7 +1767,7 @@ fn edge_outline(cands: &[Cand], lines: &[HLine], em: &EdgeMap, bright: Option<Qu
         only_spread = true;
     }
     if o.spread != "off" {
-        if let Some((f1, f2, horiz)) = edge_fold(&q, &lines) {
+        if let Some((f1, f2, horiz)) = edge_fold(&q, lines) {
             let [tl, tr, br, bl] = q;
             let (qa, qb) = if !horiz { ([tl, tr, f2, f1], [f1, f2, br, bl]) } else { ([tl, f1, f2, bl], [f1, tr, br, f2]) };
             let ok = [qa, qb].iter().all(|pq| {
@@ -1887,4 +1894,98 @@ mod tests {
         // a picture cropped to the card is still one
         assert!(card_quad(&rect(254, 0, 0, 254, 160), 254, 160).is_some());
     }
+}
+
+// ------------------------------------------------------------- the MRZ
+
+const MRZ_GLYPH_H: (f64, f64) = (1.2, 3.6);
+const MRZ_GLYPH_W: (f64, f64) = (0.15, 2.8);
+const MRZ_MIN_GLYPHS: usize = 15;
+const MRZ_MIN_SPAN_MM: f64 = 40.0;
+const MRZ_PITCH_MM: (f64, f64) = (1.5, 3.2);
+const MRZ_EVEN: f64 = 0.75;
+const MRZ_ROW_GAP_MM: (f64, f64) = (2.5, 6.0);
+const MRZ_INK: f64 = 0.5;
+
+/// The rows of a machine-readable zone on a card rectified to its true size
+/// (`mm` pixels per millimetre): two or three lines of glyph-sized dark marks
+/// at one even pitch (OCR-B, monospaced; 2.54 mm on a real card) over most of
+/// the card's width, stacked a line apart. One such line alone is not taken:
+/// a line of print can happen to be even. Returns each row's centre as a
+/// share of the height, or nothing.
+pub fn mrz_rows(img: &Img, mm: f64) -> Vec<f64> {
+    let (w, h) = (img.w, img.h);
+    let g = img.gray();
+    let mut v: Vec<f32> = g.d.clone();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let paper = v[(0.9 * (v.len() - 1) as f64) as usize];
+    let thr = paper * MRZ_INK as f32;
+    let m: Vec<u8> = g.d.iter().map(|&x| (x < thr) as u8).collect();
+    // glyph-sized marks: (x centre, y centre), in mm
+    let mut marks = vec![];
+    for comp in components(&m, w, h) {
+        let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
+        for &i in &comp {
+            let (x, y) = (i % w, i / w);
+            x0 = x0.min(x);
+            x1 = x1.max(x);
+            y0 = y0.min(y);
+            y1 = y1.max(y);
+        }
+        let (bw, bh) = ((x1 - x0 + 1) as f64 / mm, (y1 - y0 + 1) as f64 / mm);
+        if (MRZ_GLYPH_H.0..=MRZ_GLYPH_H.1).contains(&bh) && (MRZ_GLYPH_W.0..=MRZ_GLYPH_W.1).contains(&bw) {
+            marks.push(((x0 + x1) as f64 / 2.0 / mm, (y0 + y1) as f64 / 2.0 / mm));
+        }
+    }
+    marks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    // lines: marks whose centres lie within a millimetre of each other
+    let mut lines: Vec<Vec<(f64, f64)>> = vec![];
+    for p in marks {
+        match lines.last_mut() {
+            Some(r) if p.1 - r[r.len() / 2].1 <= 1.0 => r.push(p),
+            _ => lines.push(vec![p]),
+        }
+    }
+    // the even ones: (centre y, pitch)
+    let mut even = vec![];
+    for mut r in lines {
+        if r.len() < MRZ_MIN_GLYPHS {
+            continue;
+        }
+        r.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        if r.last().unwrap().0 - r[0].0 < MRZ_MIN_SPAN_MM {
+            continue;
+        }
+        let mut steps: Vec<f64> = r.windows(2).map(|p| p[1].0 - p[0].0).collect();
+        let n = steps.len() as f64;
+        steps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pitch = steps[steps.len() / 2];
+        if !(MRZ_PITCH_MM.0..=MRZ_PITCH_MM.1).contains(&pitch) {
+            continue;
+        }
+        let on = steps.iter().filter(|&&s| (s - pitch).abs() <= 0.2 * pitch).count() as f64;
+        if on / n >= MRZ_EVEN {
+            even.push((r.iter().map(|p| p.1).sum::<f64>() / r.len() as f64, pitch));
+        }
+    }
+    // stacked a line apart at the same pitch
+    let mut best: Vec<(f64, f64)> = vec![];
+    let mut run: Vec<(f64, f64)> = vec![];
+    for e in even {
+        let joins = run.last().is_some_and(|l: &(f64, f64)| {
+            let gap = e.0 - l.0;
+            (MRZ_ROW_GAP_MM.0..=MRZ_ROW_GAP_MM.1).contains(&gap) && (e.1 - l.1).abs() <= 0.1 * l.1
+        });
+        if !joins {
+            run.clear();
+        }
+        run.push(e);
+        if run.len() > best.len() {
+            best = run.clone();
+        }
+    }
+    if best.len() < 2 {
+        return vec![];
+    }
+    best.iter().map(|r| r.0 * mm / h as f64).collect()
 }

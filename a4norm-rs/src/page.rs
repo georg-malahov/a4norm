@@ -571,6 +571,19 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
             raw = raw.rotate(180);
         }
         let front = side.is_some();
+        // a back has no face photo to go by; its machine-readable zone, when
+        // it has one, is printed along its lower edge
+        let mut mrz = "";
+        if !front {
+            let rows = d::mrz_rows(&raw, cw_px as f64 / d::CARD_MM.0);
+            if !rows.is_empty() {
+                if rows.iter().sum::<f64>() / (rows.len() as f64) < 0.5 {
+                    turn = (turn + 180) % 360;
+                    raw = raw.rotate(180);
+                }
+                mrz = ", machine-readable zone below";
+            }
+        }
         let toned = copy_tone(&raw, cw_px, Some(&inside));
         let mut sharp = toned.each(|p| ops::unsharp(p, 1.0, o.sharpen as f32, 0.02));
         // rounded ID-1 corners on white, and a gray70 hairline
@@ -590,8 +603,8 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
             d::CARD_MM.0,
             d::CARD_MM.1,
             turn,
-            if front { "face photo on the left — front" } else { "no face photo — back" }
-        ));
+            if front { "face photo on the left — front" } else { "no face photo — back" },
+        ) + mrz);
         cards.push(Card { img: card, front });
     }
     cards
@@ -1350,7 +1363,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     };
     let rectified = spread.is_some() || sheet.is_some();
     // a receipt carries no face photo: what looks like one is a crumple
-    let receipt = sheet.as_ref().map_or(false, |(_, why)| why.ends_with(d::RECEIPT));
+    let receipt = sheet.as_ref().is_some_and(|(_, why)| why.ends_with(d::RECEIPT));
     // the frame path works on the whole photo; a rectify makes its own page
     let cur = if rectified { Img::solid(1, 1, [1.0; 3]) } else { src.to_img() };
     let mut job = Job { cur, page: (0, 0), o, report: std::mem::take(report) };
