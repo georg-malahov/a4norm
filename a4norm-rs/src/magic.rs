@@ -166,13 +166,9 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     };
     let (hl, vl) = (along(true), along(false));
     let lift = ((2 * LINE_REACH + 1) as f32).sqrt();
+    let mut rules = vec![0u8; w * h];
     let ink: Vec<u8> = (0..w * h)
         .map(|i| {
-            // a rule is dark along itself and light across: a stain is dark
-            // both ways
-            let step = (LINE_K * grain[i] / lift).max(LINE_MIN);
-            let (dh, dv) = (hl[i] < level[i] - step, vl[i] < level[i] - step);
-            let rule = (dh != dv) && n.d[i] < level[i] - step;
             // coloured ink (a stamp, a blue pen) is kept however pale: a
             // shadow is grey
             let tint = if img.c.len() == 3 {
@@ -181,9 +177,32 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
             } else {
                 false
             };
-            ((n.d[i] < thr[i] && near[i] != 0) || rule || tint) as u8
+            ((n.d[i] < thr[i] && near[i] != 0) || tint) as u8
         })
         .collect();
+    // a rule is dark along itself and light across: a stain is dark both ways
+    for i in 0..w * h {
+        let step = (LINE_K * grain[i] / lift).max(LINE_MIN);
+        let (dh, dv) = (hl[i] < level[i] - step, vl[i] < level[i] - step);
+        rules[i] = ((dh != dv) && n.d[i] < level[i] - step) as u8;
+    }
+    // a rule runs on: short bits of it are a shade's edge or the grain
+    let long = (w.min(h) as f64 * RULE_LONG) as usize;
+    let mut ink = ink;
+    for comp in crate::detect::components(&rules, w, h) {
+        let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
+        for &i in &comp {
+            x0 = x0.min(i % w);
+            x1 = x1.max(i % w);
+            y0 = y0.min(i / w);
+            y1 = y1.max(i / w);
+        }
+        if (x1 - x0).max(y1 - y0) >= long {
+            for i in comp {
+                ink[i] = 1;
+            }
+        }
+    }
     drop((near, hl, vl));
     // solid ink, dark all through: joined to the edged ink it touches
     let core: Vec<u8> = n.d.iter().map(|&v| (v < SOLID) as u8).collect();
@@ -193,6 +212,32 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     let speck = (w.min(h) / SPECK_DIV).max(2);
     for comp in crate::detect::components(&ink, w, h) {
         if comp.len() <= speck {
+            for i in comp {
+                ink[i] = 0;
+            }
+        }
+    }
+    // what lies along the page's own edge, thin across it: the sheet's rim,
+    // a curl, a shadow line the rectify left
+    let band = (w.min(h) as f64 * EDGE_BAND) as usize;
+    for comp in crate::detect::components(&ink, w, h) {
+        let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
+        for &i in &comp {
+            x0 = x0.min(i % w);
+            x1 = x1.max(i % w);
+            y0 = y0.min(i / w);
+            y1 = y1.max(i / w);
+        }
+        // a rim runs along the side: long along it, thin across (a line of
+        // small print at the foot is neither)
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        let along_v = bh >= RIM_LONG * bw;
+        let along_h = bw >= RIM_LONG * bh;
+        let thin_left = along_v && x0 <= band && x1 <= 2 * band;
+        let thin_right = along_v && x1 + band >= w - 1 && x0 + 2 * band >= w - 1;
+        let thin_top = along_h && y0 <= band && y1 <= 2 * band;
+        let thin_bottom = along_h && y1 + band >= h - 1 && y0 + 2 * band >= h - 1;
+        if thin_left || thin_right || thin_top || thin_bottom {
             for i in comp {
                 ink[i] = 0;
             }
@@ -241,6 +286,14 @@ const LINE_K: f32 = 3.0;
 const TINT: f32 = 0.12;
 /// Ink blobs of at most short side / SPECK_DIV pixels are grain.
 const SPECK_DIV: usize = 250;
+/// A rule is at least this share of the page long.
+const RULE_LONG: f64 = 0.05;
+/// Ink inside this share of the page from its edge, and no deeper than
+/// twice that, is the sheet's rim.
+const EDGE_BAND: f64 = 0.015;
+const RIM_LONG: usize = 4;
+/// The strip along a side where cut print is looked for.
+const EDGE_INK: f64 = 0.02;
 
 /// Lines of text on a sheet bent in the hand, made straight again. The ink
 /// of each line is smeared along it into one long thin blob; the middle of
@@ -251,13 +304,30 @@ const SPECK_DIV: usize = 250;
 /// enough lines over enough of the page to say what the bend is, and the
 /// bend it finds is modest; otherwise the page is left as it is. Returns the
 /// largest shift, in pixels, and the number of lines it went by.
-pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
+/// The lines of text on a page, sampled along their middles: (line, x, y) in
+/// parts of the page, the number of lines, the band of the page they cover,
+/// and the median line height and the size of the copy they were read on.
+pub struct Lines {
+    pub samples: Vec<(usize, f64, f64)>,
+    pub lines: usize,
+    pub cover: f64,
+    pub hmed: usize,
+    pub h: usize,
+}
+
+pub fn text_lines(img: &Img, min_lines: usize) -> Option<Lines> {
     let (w0, h0) = (img.w, img.h);
     // the lines are found on a copy about 1200 px wide
     let k = (w0 as f64 / DW_SIDE).max(1.0);
     let (w, h) = ((w0 as f64 / k).round() as usize, (h0 as f64 / k).round() as usize);
     let g = crate::img::resize_any(img, w, h).gray();
-    let ink: Vec<u8> = g.d.iter().map(|&v| (v < DW_INK) as u8).collect();
+    // against the paper around it, so a page not yet cleaned reads the same
+    // the paper's light, read on a quarter-size copy: it is smooth
+    let (qw, qh) = ((w / 4).max(8), (h / 4).max(8));
+    let small = ops::resize(&g, qw, qh, Filter::Triangle);
+    let bg = Plane { w: qw, h: qh, d: morph_k(&small.d, qw, qh, &ops::square(3), true) };
+    let bg = ops::resize(&blur(&bg, 2.0), w, h, Filter::Triangle);
+    let ink: Vec<u8> = g.d.iter().zip(&bg.d).map(|(&v, &b)| (v < DW_INK * b.max(0.05)) as u8).collect();
     let kx = (w / 120).max(7) as usize;
     let rect = |half: usize, rows: isize| -> ops::Kernel { (-rows..=rows).map(|dy| (dy, half)).collect() };
     let c = morph_k(&morph_k(&ink, w, h, &rect(kx, 1), true), w, h, &rect(kx, 1), false);
@@ -278,7 +348,7 @@ pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
         })
         .filter(|b| b.1 as f64 >= DW_LINE_LEN * w as f64 && b.1 >= 8 * b.3)
         .collect();
-    if boxes.len() < DW_MIN_LINES {
+    if boxes.len() < min_lines {
         return None;
     }
     let mut hs: Vec<usize> = boxes.iter().map(|b| b.3).collect();
@@ -313,7 +383,70 @@ pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
             lines += 1;
         }
     }
-    if lines < DW_MIN_LINES || ymax - ymin < DW_COVER {
+    Some(Lines { samples, lines, cover: ymax - ymin, hmed, h })
+}
+
+/// How far the lines of text are from level, in the upper and the lower half
+/// of the page: the median, over the lines there, of each line's spread off
+/// its own mean height, in line heights.
+pub fn bend(img: &Img) -> Option<[f64; 2]> {
+    let l = text_lines(img, 3)?;
+    let mut per: Vec<Vec<(f64, f64)>> = vec![vec![]; l.lines];
+    for &(i, x, y) in &l.samples {
+        per[i].push((x, y * l.h as f64));
+    }
+    let mut halves: [Vec<f64>; 2] = [vec![], vec![]];
+    for pts in per.iter().filter(|p| p.len() >= 6) {
+        let n = pts.len() as f64;
+        let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        // off level: a line of a flat page runs straight across it, so its
+        // tilt counts as much as its bend
+        let rms = (pts.iter().map(|p| (p.1 - my).powi(2)).sum::<f64>() / n).sqrt();
+        halves[(my / l.h as f64 >= 0.5) as usize].push(rms / l.hmed.max(1) as f64);
+    }
+    let med = |v: &mut Vec<f64>| -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    Some([med(&mut halves[0]), med(&mut halves[1])])
+}
+
+/// How much print touches each side of the page (left, right, top, bottom):
+/// the share of dark pixels in the outermost EDGE_INK of it, against the
+/// paper around them. Print running off a side means that side cut into it.
+pub fn edge_ink(img: &Img) -> [f64; 4] {
+    let k = (img.w as f64 / 600.0).max(1.0);
+    let (w, h) = ((img.w as f64 / k).round() as usize, (img.h as f64 / k).round() as usize);
+    let g = crate::img::resize_any(img, w, h).gray();
+    let (qw, qh) = ((w / 4).max(8), (h / 4).max(8));
+    let small = ops::resize(&g, qw, qh, Filter::Triangle);
+    let bg = ops::resize(&blur(&Plane { w: qw, h: qh, d: morph_k(&small.d, qw, qh, &ops::square(2), true) }, 1.5), w, h, Filter::Triangle);
+    let dark = |x: usize, y: usize| (g.d[y * w + x] < 0.6 * bg.d[y * w + x]) as u8 as f64;
+    let b = ((w.min(h) as f64 * EDGE_INK) as usize).max(2);
+    let mut out = [0.0; 4];
+    for y in h / 20..h - h / 20 {
+        for x in 0..b {
+            out[0] += dark(x, y);
+            out[1] += dark(w - 1 - x, y);
+        }
+    }
+    for x in w / 20..w - w / 20 {
+        for y in 0..b {
+            out[2] += dark(x, y);
+            out[3] += dark(x, h - 1 - y);
+        }
+    }
+    let (nv, nh) = ((b * (h - h / 10)) as f64, (b * (w - w / 10)) as f64);
+    [out[0] / nv, out[1] / nv, out[2] / nh, out[3] / nh]
+}
+
+pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
+    let (w0, h0) = (img.w, img.h);
+    let Lines { samples, lines, cover, hmed, h } = text_lines(img, DW_MIN_LINES)?;
+    if lines < DW_MIN_LINES || cover < DW_COVER {
         return None;
     }
     // y = D(x, y) + c_line, least squares over the terms and one offset a line
@@ -401,3 +534,217 @@ const DW_MIN_LINES: usize = 10;
 const DW_COVER: f64 = 0.5;
 const DW_RMS: f64 = 0.35;
 const DW_MAX: f64 = 0.05;
+
+// ------------------------------------------------------- a sheet's own edges
+
+type Pt = (f64, f64);
+
+/// One side of the sheet: the straight chord between its corners and a bow
+/// off it, zero at both corners: e(t) = t(1-t)(a + b(2t-1) + c(2t-1)^2).
+struct Side {
+    a: Pt,
+    b: Pt,
+    bow: [f64; 3],
+}
+
+impl Side {
+    fn normal(&self) -> Pt {
+        let (dx, dy) = (self.b.0 - self.a.0, self.b.1 - self.a.1);
+        let l = dx.hypot(dy).max(1e-9);
+        (-dy / l, dx / l)
+    }
+    fn at(&self, t: f64) -> Pt {
+        let s = 2.0 * t - 1.0;
+        let e = t * (1.0 - t) * (self.bow[0] + self.bow[1] * s + self.bow[2] * s * s);
+        let n = self.normal();
+        (self.a.0 + (self.b.0 - self.a.0) * t + n.0 * e, self.a.1 + (self.b.1 - self.a.1) * t + n.1 * e)
+    }
+    fn len(&self) -> f64 {
+        let mut l = 0.0;
+        let mut p = self.at(0.0);
+        for k in 1..=32 {
+            let q = self.at(k as f64 / 32.0);
+            l += (q.0 - p.0).hypot(q.1 - p.1);
+            p = q;
+        }
+        l
+    }
+}
+
+/// The bow of one side, fitted to the paper's outline points near its chord.
+/// A finger or a shadow bites into the paper, so points well inside the fit
+/// are dropped and it is fitted again.
+fn fit_side(a: Pt, b: Pt, pts: &[Pt], inward: Pt) -> Option<[f64; 3]> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let l2 = dx * dx + dy * dy;
+    let l = l2.sqrt();
+    let n = (-dy / l, dx / l);
+    let mut obs: Vec<(f64, f64)> = pts
+        .iter()
+        .filter_map(|p| {
+            let t = ((p.0 - a.0) * dx + (p.1 - a.1) * dy) / l2;
+            let e = (p.0 - a.0) * n.0 + (p.1 - a.1) * n.1;
+            ((SIDE_T.0..=SIDE_T.1).contains(&t) && e.abs() < SIDE_BAND * l).then_some((t, e))
+        })
+        .collect();
+    // which way along the normal is into the sheet
+    let into = if n.0 * inward.0 + n.1 * inward.1 > 0.0 { 1.0 } else { -1.0 };
+    let mut coef = [0.0; 3];
+    for _ in 0..4 {
+        if obs.len() < SIDE_MIN_PTS {
+            return None;
+        }
+        // the edge must be seen along all of the side, or its bow is a guess
+        let mut thirds = [0usize; 3];
+        for &(t, _) in &obs {
+            thirds[((t * 3.0) as usize).min(2)] += 1;
+        }
+        if thirds.iter().any(|&c| c < obs.len() / 6) {
+            return None;
+        }
+        let mut m = vec![vec![0.0; 3]; 3];
+        let mut r = vec![0.0; 3];
+        for &(t, e) in &obs {
+            let s = 2.0 * t - 1.0;
+            let base = t * (1.0 - t);
+            let f = [base, base * s, base * s * s];
+            for i in 0..3 {
+                r[i] += f[i] * e;
+                for j in 0..3 {
+                    m[i][j] += f[i] * f[j];
+                }
+            }
+        }
+        let c = crate::img::solve(m, r)?;
+        coef = [c[0], c[1], c[2]];
+        // a sheet's edge bows once, maybe lopsided; a wave is the background
+        if coef[2].abs() > coef[0].abs() + SIDE_WAVE * l || coef[1].abs() > 2.0 * coef[0].abs() + SIDE_WAVE * l {
+            return None;
+        }
+        let res: Vec<f64> = obs
+            .iter()
+            .map(|&(t, e)| {
+                let s = 2.0 * t - 1.0;
+                (e - t * (1.0 - t) * (coef[0] + coef[1] * s + coef[2] * s * s)) * into
+            })
+            .collect();
+        let mut abs: Vec<f64> = res.iter().map(|v| v.abs()).collect();
+        abs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let sigma = (abs[abs.len() / 2] * 1.5).max(1.0);
+        let keep: Vec<(f64, f64)> = obs.iter().zip(&res).filter(|(_, &r)| r < 2.5 * sigma).map(|(o, _)| *o).collect();
+        if keep.len() == obs.len() {
+            break;
+        }
+        obs = keep;
+    }
+    Some(coef)
+}
+
+/// A sheet whose edges bow (held in the hand, curling off the table) mapped
+/// flat by its four edge curves, a Coons patch: every straight line of print
+/// that ran parallel to an edge comes out straight. The quad gives the
+/// corners, the paper's outline the bow of each side. None when no side bows
+/// by more than a hair, or the outline cannot be read.
+pub fn curved_sheet(src: &crate::img::Src, quad: [Pt; 4]) -> Option<(Img, f64)> {
+    use crate::img::Pix;
+    let vc = crate::detect::vc(src, CURVE_SIDE);
+    let pm = crate::detect::paper_mask(&vc, crate::detect::Mode::Paper);
+    let (w, h) = (pm.w, pm.h);
+    let comps = crate::detect::components(&pm.mask, w, h);
+    let best = comps.first()?;
+    let mut inside = vec![0u8; w * h];
+    for &i in best {
+        inside[i] = 1;
+    }
+    let (sx, sy) = (w as f64 / pm.w0 as f64, h as f64 / pm.h0 as f64);
+    let q: Vec<Pt> = quad.iter().map(|p| (p.0 * sx, p.1 * sy)).collect();
+    let c = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+    // sides: top tl->tr, right tr->br, bottom bl->br, left tl->bl
+    let pairs = [(0, 1), (1, 2), (3, 2), (0, 3)];
+    let mut sides = vec![];
+    let mut worst: f64 = 0.0;
+    for &(i, j) in &pairs {
+        let (a, b) = (q[i], q[j]);
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        // the outer edge only: along each normal, from outside in, the first
+        // paper pixel (the outlines of the print's holes are not the edge)
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l = dx.hypot(dy);
+        let mut n = (-dy / l, dx / l);
+        if n.0 * (c.0 - mid.0) + n.1 * (c.1 - mid.1) < 0.0 {
+            n = (-n.0, -n.1);
+        }
+        let band = SIDE_BAND * l;
+        let mut rim = vec![];
+        let steps = (l as usize).max(10);
+        for k in 0..steps {
+            let t = k as f64 / steps as f64;
+            let base = (a.0 + dx * t, a.1 + dy * t);
+            let mut e = -band;
+            while e < band {
+                let (x, y) = (base.0 + n.0 * e, base.1 + n.1 * e);
+                if x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h && inside[y as usize * w + x as usize] != 0 {
+                    rim.push((x, y));
+                    break;
+                }
+                e += 0.5;
+            }
+        }
+        let bow = fit_side(a, b, &rim, (c.0 - mid.0, c.1 - mid.1)).unwrap_or([0.0; 3]);
+        let side = Side { a: (a.0 / sx, a.1 / sy), b: (b.0 / sx, b.1 / sy), bow: bow.map(|v| v / sx) };
+        for k in 1..16 {
+            let t = k as f64 / 16.0;
+            let s = 2.0 * t - 1.0;
+            worst = worst.max((t * (1.0 - t) * (bow[0] + bow[1] * s + bow[2] * s * s)).abs() / sx);
+        }
+        sides.push(side);
+    }
+    let diag = ((q[0].0 - q[2].0).hypot(q[0].1 - q[2].1) / sx).max(1.0);
+    if worst < CURVE_MIN * diag || worst > CURVE_MAX * diag {
+        return None;
+    }
+    let ow = ((sides[0].len() + sides[2].len()) / 2.0).round().max(50.0) as usize;
+    let oh = ((sides[1].len() + sides[3].len()) / 2.0).round().max(50.0) as usize;
+    let corners = [sides[0].a, sides[0].b, sides[2].b, sides[2].a];
+    let nc = src.nc();
+    let (sw, sh) = src.dims();
+    let img = crate::img::warp(ow, oh, nc, |j, row: &mut [&mut [f32]]| {
+        let v = (j as f64 + 0.5) / oh as f64;
+        let (l, r) = (sides[3].at(v), sides[1].at(v));
+        for i in 0..ow {
+            let u = (i as f64 + 0.5) / ow as f64;
+            let (t, b) = (sides[0].at(u), sides[2].at(u));
+            let bil = |k: usize| {
+                let p = [corners[0], corners[1], corners[2], corners[3]];
+                let g = |c: Pt| if k == 0 { c.0 } else { c.1 };
+                (1.0 - u) * (1.0 - v) * g(p[0]) + u * (1.0 - v) * g(p[1]) + u * v * g(p[2]) + (1.0 - u) * v * g(p[3])
+            };
+            let x = (1.0 - v) * t.0 + v * b.0 + (1.0 - u) * l.0 + u * r.0 - bil(0);
+            let y = (1.0 - v) * t.1 + v * b.1 + (1.0 - u) * l.1 + u * r.1 - bil(1);
+            let (x, y) = ((x - 0.5).clamp(0.0, sw as f64 - 1.001), (y - 0.5).clamp(0.0, sh as f64 - 1.001));
+            let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+            let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+            for (k, p) in row.iter_mut().enumerate() {
+                let at = |xx: usize, yy: usize| src.at(k, yy * sw + xx);
+                p[i] = (at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx) * (1.0 - fy) + (at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+            }
+        }
+    });
+    let mut img = img;
+    img.q8();
+    Some((img, worst))
+}
+
+/// The outline is read at this size; a side's points lie within SIDE_BAND of
+/// its length off the chord, away from the corners.
+const CURVE_SIDE: usize = 800;
+const SIDE_BAND: f64 = 0.08;
+const SIDE_T: (f64, f64) = (0.04, 0.96);
+const SIDE_MIN_PTS: usize = 40;
+/// Higher bow terms larger than this share of the side, beyond the plain
+/// bow, are not a sheet's edge.
+const SIDE_WAVE: f64 = 0.02;
+/// A bow worth mapping out, and one too large to be the sheet's own edge,
+/// as shares of the sheet's diagonal.
+const CURVE_MIN: f64 = 0.004;
+const CURVE_MAX: f64 = 0.08;

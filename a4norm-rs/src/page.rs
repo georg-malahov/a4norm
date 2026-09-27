@@ -344,12 +344,26 @@ const FINGER_DEPTH: f64 = 15.0;
 const FINGER_OVER: u8 = 25;
 const FINGER_STD: u8 = 12;
 pub const FINGER_MAX: f64 = 6.0;
+/// On a rectified sheet a finger may start this far in from its edge.
+const FINGER_BAND: usize = 16;
+/// A curved mapping may leave a half's lines this much more bent than the
+/// plain quad and still be kept.
+const CURVE_WORSE: f64 = 1.5;
+const CURVE_SLACK: f64 = 0.05;
+/// Print along a side, a share of the strip, more than the quad leaves there.
+const CURVE_CUT: f64 = 0.01;
 const SPINE_BAND: f64 = 8.0;
 
 /// Repaint a finger holding the booklet open, in its page's own tone.
 /// `axis`: Some(true) pages side by side, Some(false) stacked, None a card.
 /// Returns whether a finger was repainted, in place, and its share.
 pub fn erase_fingers(img: &mut Img, axis: Option<bool>) -> (bool, f64) {
+    erase_fingers_within(img, axis, 0)
+}
+
+/// The same, a finger starting up to `band` px (at 520 px) in from the edge:
+/// a rectified sheet's edge is a thin line of its own.
+pub fn erase_fingers_within(img: &mut Img, axis: Option<bool>, band: usize) -> (bool, f64) {
     let side = 520;
     let (w0, h0) = (img.w, img.h);
     let w = side;
@@ -383,21 +397,13 @@ pub fn erase_fingers(img: &mut Img, axis: Option<bool>) -> (bool, f64) {
     let depth = 3.max((w.min(h) as f64 * FINGER_DEPTH / 100.0) as usize);
     let mut reach = vec![0u8; n];
     let mut q = VecDeque::new();
-    for x in 0..w {
-        for y in [0, h - 1] {
+    for y in 0..h {
+        for x in 0..w {
+            let edge = x.min(w - 1 - x).min(y).min(h - 1 - y) <= band;
             let i = y * w + x;
-            if skin[i] != 0 && !spine(x, y) && reach[i] == 0 {
+            if edge && skin[i] != 0 && !spine(x, y) && reach[i] == 0 {
                 reach[i] = 1;
                 q.push_back((i, 0usize));
-            }
-        }
-    }
-    for y in 0..h {
-        for x in [0, w - 1] {
-            let i = y * w + x;
-            if skin[i] != 0 && !spine(x, y) && reach[i] == 0 {
-                reach[i] = 1;
-                q.push_back((i, 0));
             }
         }
     }
@@ -419,13 +425,22 @@ pub fn erase_fingers(img: &mut Img, axis: Option<bool>) -> (bool, f64) {
             }
         }
     }
+    if std::env::var_os("A4DBG").is_some() {
+        let pts: Vec<(usize, usize)> = (0..n).filter(|&i| skin[i] != 0).map(|i| (i % w, i / w)).collect();
+        let xs: Vec<usize> = pts.iter().map(|p| p.0).collect();
+        eprintln!("finger pre-std: reach {} skin x range {:?} {:?} w {} h {}", reach.iter().map(|&v| v as usize).sum::<usize>(), xs.iter().min(), xs.iter().max(), w, h);
+        let mut hist = std::collections::BTreeMap::new();
+        for p in &pts { *hist.entry(p.0 / 20).or_insert(0) += 1; }
+        eprintln!("  x/20 hist {:?}", hist);
+    }
     if reach.iter().any(|&r| r != 0) {
         let g = img.resize_auto(w, h).gray();
         let sd = ops::stddev(&g, 5).bytes();
         for comp in d::components(&reach, w, h) {
             let mut vals: Vec<u8> = comp.iter().map(|&i| sd[i]).collect();
             vals.sort_unstable();
-            if vals[vals.len() / 2] > FINGER_STD {
+            // on a sheet a finger is often a sliver along the sheet's dark edge
+            if vals[vals.len() / 2] > if band > 0 { 2 * FINGER_STD } else { FINGER_STD } {
                 for &i in &comp {
                     reach[i] = 0;
                 }
@@ -433,6 +448,7 @@ pub fn erase_fingers(img: &mut Img, axis: Option<bool>) -> (bool, f64) {
         }
     }
     let share = 100.0 * reach.iter().map(|&r| r as f64).sum::<f64>() / n as f64;
+    if std::env::var_os("A4DBG").is_some() { eprintln!("finger: c_min {} skin {} share {:.2}", c_min, skin.iter().map(|&v| v as usize).sum::<usize>(), share); }
     if !(0.05..=FINGER_MAX).contains(&share) {
         return (false, share);
     }
@@ -1376,7 +1392,7 @@ pub type Progress<'a> = &'a dyn Fn(&str);
 pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress) -> Result<Processed, Fail> {
     let found = locate(&src, o, report)?;
     step("locate");
-    let (spread, sheet) = match found {
+    let (mut spread, sheet) = match found {
         Found::Photo => return Ok(Processed::Page(fit_photo_page(&src, o, report))),
         Found::Cards(q, why) => {
             let c = process_cards(&src, &q, &why, o, report);
@@ -1394,7 +1410,64 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     let cur = if rectified { Img::solid(1, 1, [1.0; 3]) } else { src.to_img() };
     let mut job = Job { cur, page: (0, 0), o, report: std::mem::take(report) };
     let mut wh = (0, 0);
-    if let Some(s) = &spread {
+    // a white sheet bent in the hand reads as one paper region folded in the
+    // middle: under --magic it is a sheet, mapped flat by its own bowed edges
+    let bent_sheet = o.magic && spread.as_ref().is_some_and(|s| s.why.contains("folded in the middle") && !s.why.contains("paper mask"));
+    let outer = |s: &d::Spread| {
+        let pts: Vec<(f64, f64)> = s.quads.iter().flatten().copied().collect();
+        let pick = |f: &dyn Fn(&(f64, f64)) -> f64, max: bool| {
+            *pts.iter().max_by(|a, b| if max { f(a).partial_cmp(&f(b)).unwrap() } else { f(b).partial_cmp(&f(a)).unwrap() }).unwrap()
+        };
+        [pick(&|p| p.0 + p.1, false), pick(&|p| p.0 - p.1, true), pick(&|p| p.0 + p.1, true), pick(&|p| p.0 - p.1, false)]
+    };
+    let curve_quad = if !o.magic || receipt {
+        None
+    } else if bent_sheet {
+        spread.as_ref().map(outer)
+    } else if spread.is_none() {
+        sheet.as_ref().map(|(q, _)| *q)
+    } else {
+        None
+    };
+    let mut curved = curve_quad.and_then(|q| crate::magic::curved_sheet(&src, q));
+    // kept only when it leaves the lines of text straighter than the plain
+    // quad does, in both halves of the page
+    if let (Some((img, _)), Some(q)) = (&curved, curve_quad) {
+        let (plain, _, _) = rectify(&src, &q, o.rect_inset, None, false, None);
+        let (a, b) = (crate::magic::bend(img), crate::magic::bend(&plain));
+        let better = match (a, b) {
+            (Some(a), Some(b)) => (0..2).all(|k| a[k].is_nan() || b[k].is_nan() || a[k] <= b[k] * CURVE_WORSE + CURVE_SLACK),
+            _ => false,
+        };
+        // and it must not cut into the print along a side the quad kept
+        let (ea, eb) = (crate::magic::edge_ink(img), crate::magic::edge_ink(&plain));
+        let cuts = (0..4).any(|k| ea[k] > eb[k] * 2.0 + CURVE_CUT);
+        if std::env::var_os("A4DBG").is_some() {
+            eprintln!("edge ink curved {:?} plain {:?}", ea, eb);
+        }
+        let why = if !better { "the lines would not come out straighter" } else { "it would cut into the print along a side" };
+        let better = better && !cuts;
+        if std::env::var_os("A4DBG").is_some() {
+            eprintln!("curved bend {:?} plain bend {:?} -> {}", a, b, better);
+        }
+        if !better {
+            job.say(format!("the sheet's bowed edges were not followed: {}", why));
+            curved = None;
+        }
+    }
+    if let Some((img, bow)) = curved {
+        wh = (img.w, img.h);
+        job.cur = img;
+        job.say(format!("mapped flat by the sheet's own edges, which bow by up to {:.0} px -> {}x{}", bow, wh.0, wh.1));
+        if bent_sheet {
+            // one sheet now, not two pages
+            spread = None;
+        }
+    } else if let (true, Some(q)) = (bent_sheet, curve_quad) {
+        // one sheet held bent: its outer corners, never two pages
+        wh = rectify_sheet(&mut job, &src, &q, "the outer corners of a sheet bent in the hand");
+        spread = None;
+    } else if let Some(s) = &spread {
         wh = rectify_spread(&mut job, &src, s);
     } else if let Some((q, w)) = &sheet {
         wh = rectify_sheet(&mut job, &src, q, w);
@@ -1407,9 +1480,6 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     }
     orient(&mut job);
     let mut t = if rectified { Trim { flags: [false; 4], span: (0, 0), shave: (0, 0) } } else { trim_border(&mut job) };
-    // a white sheet bent in the hand reads as one paper region folded in the
-    // middle: its two halves are still rectified apart, but it is paper
-    let bent_sheet = o.magic && spread.as_ref().is_some_and(|s| s.why.contains("folded in the middle") && !s.why.contains("paper mask"));
     if bent_sheet {
         job.say("the folded region is white paper: a sheet bent in two, cleaned as paper".into());
     }
@@ -1422,6 +1492,14 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         job.say("colour copy: light evened, tint and security print kept, nothing whitened".into());
     }
     let mut keep = if o.no_keep_photo || copy || receipt { None } else { keep_face_photo(&mut job, spread.is_some()) };
+    // a finger holding the sheet, skin coming in from the edge: repainted in
+    // the paper's tone (a page with a face photo keeps all its colour)
+    if rectified && !copy && keep.is_none() && !receipt {
+        let (got, share) = erase_fingers_within(&mut job.cur, None, FINGER_BAND);
+        if got {
+            job.say(format!("erased a finger at the sheet's edge ({:.1}% of the page)", share));
+        }
+    }
     // the magic paper is for paper: a page with a face photo is an ID's, and
     // keeps its security print as the classic path leaves it
     let magic = o.magic && keep.is_none();
@@ -1453,8 +1531,21 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         if magic {
             let ink = crate::magic::ink_or_paper(&mut job.cur);
             job.say(format!("magic paper: shadows divided out by the paper's own light, {:.1}% of the page kept as ink, the rest white", ink));
+            let before = crate::magic::bend(&job.cur);
+            let keep_img = job.cur.clone();
             if let Some((shift, lines)) = crate::magic::straighten(&mut job.cur) {
-                job.say(format!("bent lines straightened: {} lines of text, moved by up to {:.0} px", lines, shift));
+                // undone when one half of the page comes out more bent
+                let after = crate::magic::bend(&job.cur);
+                let worse = match (before, after) {
+                    (Some(b), Some(a)) => (0..2).any(|k| !a[k].is_nan() && !b[k].is_nan() && a[k] > b[k] * CURVE_WORSE + CURVE_SLACK),
+                    _ => true,
+                };
+                if worse {
+                    job.cur = keep_img;
+                    job.say(format!("bent lines left as they were: straightening would bend one half of the page more ({:?} -> {:?})", before, after));
+                } else {
+                    job.say(format!("bent lines straightened: {} lines of text, moved by up to {:.0} px", lines, shift));
+                }
             }
         } else {
             finish::tone(&mut job.cur, o);

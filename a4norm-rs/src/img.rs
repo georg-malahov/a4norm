@@ -654,7 +654,7 @@ pub fn rotate_fit(src: &Img, degrees: f64) -> (Img, isize, isize) {
 }
 
 /// A new image filled a row at a time: `f(y, [row of each channel])`.
-fn warp(w: usize, h: usize, nc: usize, f: impl Fn(usize, &mut [&mut [f32]]) + Sync + Send) -> Img {
+pub fn warp(w: usize, h: usize, nc: usize, f: impl Fn(usize, &mut [&mut [f32]]) + Sync + Send) -> Img {
     let mut planes: Vec<Plane> = (0..nc).map(|_| Plane::new(w, h)).collect();
     {
         let mut chunks: Vec<std::slice::ChunksMut<f32>> = planes.iter_mut().map(|p| p.d.chunks_mut(w)).collect();
