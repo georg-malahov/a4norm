@@ -2026,6 +2026,11 @@ pub fn outline_document(ol: &Outline, o: &Opts) -> Option<EdgeDoc> {
     if o.cards != "off" && (CARD_ASPECT.0..=CARD_ASPECT.1).contains(&ol.aspect) {
         return (ol.run_on < CARD_ALONE).then(|| EdgeDoc::Cards(vec![ol.quad], why));
     }
+    // a receipt folded across is no booklet: a spread is about as long as a
+    // sheet
+    if (LONG_ASPECT.0..=LONG_ASPECT.1).contains(&ol.aspect) {
+        return Some(EdgeDoc::Sheet(ol.quad, format!("{}, {}", why, RECEIPT)));
+    }
     if let (Some((f1, f2, horiz)), true) = (ol.fold, o.spread != "off") {
         let [tl, tr, br, bl] = ol.quad;
         let (qa, qb) = if !horiz { ([tl, tr, f2, f1], [f1, f2, br, bl]) } else { ([tl, f1, f2, bl], [f1, tr, br, f2]) };
@@ -2036,9 +2041,6 @@ pub fn outline_document(ol: &Outline, o: &Opts) -> Option<EdgeDoc> {
         if ok {
             return Some(EdgeDoc::Spread(Spread { quads: [qa, qb], horiz, why: why + ", a fold across the middle" }));
         }
-    }
-    if (LONG_ASPECT.0..=LONG_ASPECT.1).contains(&ol.aspect) {
-        return Some(EdgeDoc::Sheet(ol.quad, format!("{}, {}", why, RECEIPT)));
     }
     Some(EdgeDoc::Sheet(ol.quad, why))
 }
