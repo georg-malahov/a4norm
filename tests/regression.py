@@ -120,7 +120,7 @@ def parse_report(text):
          "rectified": None, "rotated": None, "fit": None, "ink_share": None,
          "document": None}
     for l in lines:
-        m = re.match(r"rectified the sheet quad \((?:found by its edges: )?(\d+)% of the frame.*\) -> (\d+)x(\d+)", l)
+        m = re.match(r"rectified the sheet quad \((?:found by its (?:edges|outline): )?(\d+)% of the frame.*\) -> (\d+)x(\d+)", l)
         if m:
             r["rectified"] = tuple(int(x) for x in m.groups())
         if l.startswith("kept as document, not erased or cut: "):
@@ -266,12 +266,18 @@ def notebook_checks():
                        f"{rep['cut']}) -- the binding is still there")
 
     def other_sides_kept(rep, page):
-        missing = [s for s in ("right", "top", "bottom") if s not in rep["kept"]]
-        if missing:
-            raise Fail(f"sides {missing} were NOT judged document -- the "
-                       f"handwriting there is at risk of being erased or cut")
-        if rep["cut"] and any(rep["cut"][s] for s in ("right", "top", "bottom")):
-            raise Fail(f"cut away more than the binding: {rep['cut']}")
+        # a side the outline ends right at has nothing leaning in to judge;
+        # what matters is that nothing but the binding is cut, beyond a thin
+        # sliver of desk at the sheet's edge
+        if "right" not in rep["kept"]:
+            raise Fail("the right side was NOT judged document -- the "
+                       "handwriting running up to it is at risk")
+        _, w, h = rep["rectified"]
+        if rep["cut"]:
+            big = {s: rep["cut"][s] for s in ("right", "top", "bottom")
+                   if rep["cut"][s] > 0.02 * (w if s == "right" else h)}
+            if big:
+                raise Fail(f"cut away more than the binding: {rep['cut']}")
 
     def page_not_picture(rep, page):
         if rep["rotated"]:
@@ -328,7 +334,7 @@ def notebook_checks():
     return [
         ("perspective is rectified onto the notebook page", rectified),
         ("spiral binding on the LEFT is judged a binding and cut", binding_cut),
-        ("right/top/bottom are kept as document, nothing else cut", other_sides_kept),
+        ("nothing but the binding is cut", other_sides_kept),
         ("the page turns, not the picture (portrait A4, sheet unrotated)", page_not_picture),
         ("handwriting runs across the page", lines_across),
         ("the page is not blank", not_blank),
@@ -474,7 +480,7 @@ def landing_invoice_checks():
 
 def white_on_white_checks():
     def found_by_edges(rep, page):
-        hit = [l for l in rep["lines"] if "found by its edges" in l]
+        hit = [l for l in rep["lines"] if "found by its edges" in l or "found by its outline" in l]
         if not hit or not rep["rectified"]:
             raise Fail("the sheet was not found by its edges. This example is "
                        "a white sheet on a near-white desk: brightness cannot "
@@ -557,14 +563,16 @@ def upside_down_back_checks():
 
 
 def upside_down_invoice_checks():
-    def turned(rep, page):
-        if not any(l.startswith("rotated 180°: ") and "lines of text read upright" in l
-                   for l in rep["lines"]):
-            raise Fail("the invoice, shot upside down, was not turned upright by "
-                       "its text. Report:\n    " + "\n    ".join(rep["lines"]))
+    # A page is never turned by a guess from its content: text-based turns
+    # turned passports wrong, and whoever shot the page knows which way up
+    # it is (the browser has a rotate call for the rest).
+    def as_shot(rep, page):
+        if rep["rotated"] or any(l.startswith("rotated") for l in rep["lines"]):
+            raise Fail("the invoice, shot upside down, was turned by a guess. "
+                       "Report:\n    " + "\n    ".join(rep["lines"]))
 
-    # and then it must be the same page as the upright invoice
-    return [("the upside-down page is turned upright by its text", turned)] \
+    # and it must be the same sheet as the upright invoice, found as well
+    return [("the upside-down page is left as shot", as_shot)] \
         + landing_invoice_checks()
 
 

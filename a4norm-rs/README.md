@@ -78,15 +78,23 @@ Some things depart from the script on purpose:
   glyph-sized marks at one even pitch (OCR-B, 2.54 mm on a real card), over
   most of the width and a line apart. If they sit in the upper half, the card
   turns 180°. A back without an MRZ (a driving licence) stays as shot.
-- **A page shot upside down or on its side is turned upright by its text.**
-  A line of Latin print carries more ink above its lower-case core
-  (capitals, digits, b d f h k l t) than below it (g j p q y); the lines vote.
-  It stays cautious: the lines must run clearly one way (2.5:1), most must
-  vote, 70% of votes must agree, and a page with a face photo is left to the
-  photo. Printed Latin text turns reliably. Handwriting, all capitals and
-  Cyrillic (heavy below: д р у ф) mostly split the vote and stay as shot.
-  Over 44 rotations of 11 pages, 11 were turned right, none wrong; over the
-  corpus, nothing changed.
+- **The document is found by its outline first.** Four straight lines, each a
+  boundary over most of its length: the two sides of it differ in brightness,
+  or in grain with the smoother side inside. Nothing asks what colour paper or
+  desk is, so a pale passport on pale granite, where brightness saw one
+  bright region, is found as it lies. The grain of granite, carpet or wood is
+  taken out first with a median, which a straight edge outlives. All four
+  sides count together, so the edge of a windowsill or a line of the page
+  carried on over the desk makes no outline. Of outlines inside one another
+  the larger wins unless it holds much worse, so a photo on a page does not
+  beat the page. A fold is a cut across the middle third lying on an edge
+  over 90% of its width; ruled paper has many such cuts and is no fold.
+  When no outline holds (a sheet filling the frame, a crumpled page, a card
+  whose sides run on) brightness decides, as before.
+- **Nothing is turned by a guess.** The script turned a spread upright by the
+  way its text ran and where its face photo sat; that turned passport pages
+  wrong. The page stays as shot and `--rotate` (or the browser's `rotate`)
+  turns it. A card is still laid landscape by its face photo or MRZ.
 - **A spread's pages must be page-shaped** (1.1-2:1). A card whose MRZ band
   and tinted top split into two light regions is no longer taken for a
   passport spread.
