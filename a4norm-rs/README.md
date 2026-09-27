@@ -187,6 +187,10 @@ const pdf = m.pack(jpgs, new Uint32Array(dpis), gray);
 
 // the Edit panel's rotate: quarter turns clockwise, dpi kept
 const turned = m.rotate(jpg, 1, 88);
+// or no re-encoding at all: the pages turned inside the PDF, quarter turns
+// clockwise each; the JPEG goes in untouched, the page's sides swap and the
+// image is drawn turned (2 ms for four pages, nothing lost)
+const pdf2 = m.pack(jpgs, dpis, false, new Int32Array([0, 1, 0, 2]));
 // the Edit panel's eraser: round spots filled from what surrounds them
 const jpg2 = m.inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
 // the size control: pages written again, four at a time in parallel

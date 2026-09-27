@@ -7,6 +7,8 @@
 //!                   (stage, done) => ...);                // done: 0..1, rising
 //! // r = { pages: [{ jpg: Uint8Array, dpi }], report: "photo-0.jpg\n  page 1:\n    - ..." }
 //! const pdf = pack(jpgs, dpis, gray);
+//! // pages turned without touching their JPEGs: quarter turns clockwise each
+//! const turnedPdf = pack(jpgs, dpis, gray, new Int32Array([0, 1, 0, 2]));
 //!
 //! // Edit panel: fill round spots from their surroundings
 //! const jpg2 = inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
@@ -82,9 +84,12 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
 }
 
 /// JPEG pages -> one PDF. `gray`: each page made single-channel first
-/// (quality 88), as the page's black-and-white option asks.
+/// (quality 88), as the page's black-and-white option asks. `turns`: quarter
+/// turns clockwise per page (0-3, missing ones 0); the JPEG goes in as it is,
+/// the page's sides swap and the image is drawn turned, so a turn costs
+/// nothing and loses nothing.
 #[wasm_bindgen]
-pub fn pack(jpgs: Array, dpis: Vec<u32>, gray: bool) -> Result<Uint8Array, JsValue> {
+pub fn pack(jpgs: Array, dpis: Vec<u32>, gray: bool, turns: Option<Vec<i32>>) -> Result<Uint8Array, JsValue> {
     let mut pages = vec![];
     for (i, j) in jpgs.iter().enumerate() {
         let bytes = Uint8Array::new(&j).to_vec();
@@ -97,7 +102,7 @@ pub fn pack(jpgs: Array, dpis: Vec<u32>, gray: bool) -> Result<Uint8Array, JsVal
         }
     }
     let d: Vec<usize> = dpis.iter().map(|&x| x as usize).collect();
-    Ok(Uint8Array::from(io::write_pdf(&pages, &d).as_slice()))
+    Ok(Uint8Array::from(io::write_pdf_turned(&pages, &d, &turns.unwrap_or_default()).as_slice()))
 }
 
 /// A finished page with round spots filled from what surrounds them, the

@@ -146,6 +146,15 @@ fn jpeg_info(data: &[u8]) -> (usize, usize, usize) {
 
 /// A JPEG-per-page PDF, written by hand (the script's write_pdf).
 pub fn write_pdf(jpegs: &[Vec<u8>], dpis: &[usize]) -> Vec<u8> {
+    write_pdf_turned(jpegs, dpis, &[])
+}
+
+/// The same, each page turned by `turns[i]` quarter turns clockwise (missing
+/// ones 0) without touching its JPEG: the page's sides swap and the image is
+/// drawn through a turning matrix. That is the plainest drawing a PDF has,
+/// so every viewer and printer shows it turned, unlike /Rotate, which a page
+/// extractor or a careless converter may drop. The dpi stays the page's own.
+pub fn write_pdf_turned(jpegs: &[Vec<u8>], dpis: &[usize], turns: &[i32]) -> Vec<u8> {
     let mut objs: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), vec![]];
     let mut kids = vec![];
     for (i, data) in jpegs.iter().enumerate() {
@@ -161,13 +170,22 @@ pub fn write_pdf(jpegs: &[Vec<u8>], dpis: &[usize]) -> Vec<u8> {
         img.extend_from_slice(b"\nendstream");
         objs.push(img);
         let img_id = objs.len();
-        let content = format!("q {:.4} 0 0 {:.4} 0 0 cm /Im0 Do Q", pw, ph);
+        // the image's unit square onto the page, its top edge going to the
+        // page's right (90), bottom (180) or left (270)
+        let turn = turns.get(i).copied().unwrap_or(0).rem_euclid(4);
+        let (cm, bw, bh) = match turn {
+            1 => ([0.0, -pw, ph, 0.0, 0.0, pw], ph, pw),
+            2 => ([-pw, 0.0, 0.0, -ph, pw, ph], pw, ph),
+            3 => ([0.0, pw, -ph, 0.0, ph, 0.0], ph, pw),
+            _ => ([pw, 0.0, 0.0, ph, 0.0, 0.0], pw, ph),
+        };
+        let content = format!("q {} cm /Im0 Do Q", cm.iter().map(|v| format!("{:.4}", v)).collect::<Vec<_>>().join(" "));
         objs.push(format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content).into_bytes());
         let cont_id = objs.len();
         objs.push(
             format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.4} {:.4}] /Resources << /XObject << /Im0 {} 0 R >> /ProcSet [/PDF /ImageB /ImageC] >> /Contents {} 0 R >>",
-                pw, ph, img_id, cont_id
+                bw, bh, img_id, cont_id
             )
             .into_bytes(),
         );
@@ -219,3 +237,19 @@ pub fn preview_png(img: &Img) -> Vec<u8> {
 }
 
 use image::ImageEncoder;
+
+#[cfg(test)]
+mod turn_tests {
+    #[test]
+    fn a_quarter_turn_swaps_the_page_and_keeps_the_jpeg() {
+        // 20x30 px at 72 dpi: a 20x30 pt portrait page
+        let jpg = super::encode_rgb8(&vec![200u8; 20 * 30 * 3], 20, 30, 80, false, 72);
+        let pdf = super::write_pdf_turned(&[jpg.clone(), jpg.clone()], &[72, 72], &[0, 1]);
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains("/MediaBox [0 0 20.0000 30.0000]"));
+        assert!(text.contains("/MediaBox [0 0 30.0000 20.0000]"));
+        assert!(text.contains("q 0.0000 -20.0000 30.0000 0.0000 0.0000 20.0000 cm /Im0 Do Q"));
+        // both pages carry the very same bytes
+        assert_eq!(pdf.windows(jpg.len()).filter(|w| *w == jpg.as_slice()).count(), 2);
+    }
+}
