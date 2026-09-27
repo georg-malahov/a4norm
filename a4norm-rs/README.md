@@ -192,6 +192,9 @@ const jpg2 = m.inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
 // the size control: pages written again, four at a time in parallel
 const small = m.recompress(jpgs, { dpi: 150, quality: 60, gray: false });
 // small: [{ jpg, dpi }]; dpi only ever goes down
+// the tray: a photo's thumbnail as a JPEG, EXIF applied; a JPEG is decoded
+// straight at 1/2, 1/4 or 1/8 of its size (52 ms for 12 MP on an M-series Mac)
+const thumb = m.thumbnail(bytes, 320, 80);
 // the camera's live outline: a video frame drawn to a ~600 px canvas
 const { kind, quads } = m.detect(ctx.getImageData(0, 0, w, h).data, w, h);
 // kind: "sheet" | "receipt" | "cards" | "spread" | "none"; quads: 8 numbers

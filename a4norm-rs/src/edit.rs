@@ -188,6 +188,23 @@ fn gray_small(src: &Src, w2: usize, h2: usize) -> Plane {
     img::resize_with(&g, w2, h2, ops::Filter::Triangle).c.swap_remove(0)
 }
 
+/// A photo's thumbnail: `max_side` px on its long side at most, turned by
+/// its EXIF as the scan will see it, as a JPEG. A JPEG is decoded straight
+/// at 1/2, 1/4 or 1/8 of its size (the smallest scale still as large), so a
+/// 12 MP photo never exists at full size; a triangle takes it the rest of the
+/// way down.
+pub fn thumbnail(bytes: &[u8], max_side: usize, quality: u8) -> Result<Vec<u8>, Fail> {
+    let max_side = max_side.max(1);
+    let src = io::decode_at_least(bytes, "photo", Some(max_side.min(u16::MAX as usize) as u16))?;
+    let k = max_side as f64 / src.w.max(src.h) as f64;
+    if k >= 1.0 {
+        return Ok(io::encode_rgb8(&src.px, src.w, src.h, quality, true, 72));
+    }
+    let (w2, h2) = ((src.w as f64 * k).round().max(1.0) as usize, (src.h as f64 * k).round().max(1.0) as usize);
+    let small = img::resize_with(&src, w2, h2, ops::Filter::Triangle).to_rgb8();
+    Ok(io::encode_rgb8(&small, w2, h2, quality, true, 72))
+}
+
 /// A finished page turned by `quarters` quarter turns clockwise and written
 /// again at `quality`, its dpi kept, a grey page grey.
 pub fn rotate(jpg: &[u8], quarters: i32, quality: u8) -> Result<Vec<u8>, Fail> {
@@ -274,3 +291,4 @@ mod tests {
         assert_eq!(recompress(&jpg, 300, 88, false).unwrap().1, 200);
     }
 }
+
