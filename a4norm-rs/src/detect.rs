@@ -1767,6 +1767,12 @@ const OUTLINE_SURE: f64 = 0.6;
 /// How much a larger outline outweighs a better held one inside it: enough
 /// that a document's own edge beats the photo printed on it.
 const OUTLINE_AREA: f64 = 0.75;
+/// How far, in pixels of the analysis scale, either end of a side may move
+/// to settle onto the boundary.
+const OUTLINE_SETTLE: i64 = 16;
+/// Outlines scoring this close to the best are settled and compared again.
+const OUTLINE_CLOSE: f64 = 0.7;
+const OUTLINE_TRIES: usize = 8;
 const OUTLINE_SHARE: (f64, f64) = (0.10, 0.85);
 
 /// Median of a u8 image over a (2r+1)² square, edges repeated.
@@ -1942,6 +1948,7 @@ pub fn outline(img: &dyn Pix) -> Option<Outline> {
     let (horiz, vert) = (pick(true), pick(false));
     let (wf, hf) = (w as f64, h as f64);
     let mut best: Option<(f64, Quad, [f64; 4])> = None;
+    let mut close: Vec<(f64, Quad)> = vec![];
     for (i, &t) in horiz.iter().enumerate() {
         for &b in &horiz[i + 1..] {
             for (j, &le) in vert.iter().enumerate() {
@@ -1976,6 +1983,7 @@ pub fn outline(img: &dyn Pix) -> Option<Outline> {
                         continue;
                     }
                     let score = held.iter().product::<f64>() * share.powf(OUTLINE_AREA);
+                    close.push((score, q));
                     if best.as_ref().is_none_or(|(s, _, _)| score > *s) {
                         best = Some((score, q, held));
                     }
@@ -1983,7 +1991,83 @@ pub fn outline(img: &dyn Pix) -> Option<Outline> {
             }
         }
     }
-    let (_, q, held) = best?;
+    let (top, _, _) = best?;
+    // Each close outline settles its sides onto the strongest boundary near
+    // them, and the best settled one wins. Two Hough peaks a few pixels
+    // apart swap on a float's last bit between machines; the step itself,
+    // read off the median and the grain, does not.
+    let settle = |q: Quad| -> Option<(Quad, [f64; 4])> {
+        // each side settled onto the strongest boundary near it: two Hough peaks
+        // a few pixels apart can swap on a float's last bit between machines,
+        // the step itself, read off the median and the grain, cannot
+        let c = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+        let step_at = |x: f64, y: f64, nx: f64, ny: f64| -> i64 {
+            let d = OUTLINE_OFF / 2.0;
+            match (px(&gm, x + nx * d, y + ny * d), px(&gm, x - nx * d, y - ny * d), px(&gr, x + nx * d, y + ny * d), px(&gr, x - nx * d, y - ny * d)) {
+                (Some(bi), Some(bo), Some(ri), Some(ro)) => ((bi - bo).abs() as i64 * OUTLINE_GRAIN as i64).max((ro - ri) as i64 * OUTLINE_STEP as i64),
+                _ => 0,
+            }
+        };
+        let mut lines = [Line::of(0.0, 0.0, 1.0, 0.0); 4];
+        for k in 0..4 {
+            let (a, b) = (q[k], q[(k + 1) % 4]);
+            let l = dist(a, b).max(1.0);
+            let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+            let (mut nx, mut ny) = (-uy, ux);
+            if (c.0 - a.0) * nx + (c.1 - a.1) * ny < 0.0 {
+                nx = -nx;
+                ny = -ny;
+            }
+            let n = (l as usize / 2).max(8);
+            let mut best_k = (i64::MIN, 0i64, 0i64);
+            for da in -OUTLINE_SETTLE..=OUTLINE_SETTLE {
+                for db in -OUTLINE_SETTLE..=OUTLINE_SETTLE {
+                    let (a2, b2) = ((a.0 + nx * da as f64, a.1 + ny * da as f64), (b.0 + nx * db as f64, b.1 + ny * db as f64));
+                    let sum: i64 = (0..n)
+                        .map(|i| {
+                            let t = (i as f64 + 0.5) / n as f64;
+                            step_at(a2.0 + (b2.0 - a2.0) * t, a2.1 + (b2.1 - a2.1) * t, nx, ny)
+                        })
+                        .sum();
+                    if sum > best_k.0 {
+                        best_k = (sum, da, db);
+                    }
+                }
+            }
+            let (a2, b2) = ((a.0 + nx * best_k.1 as f64, a.1 + ny * best_k.1 as f64), (b.0 + nx * best_k.2 as f64, b.1 + ny * best_k.2 as f64));
+            let l2 = dist(a2, b2).max(1.0);
+            lines[k] = Line::of(a2.0, a2.1, (b2.0 - a2.0) / l2, (b2.1 - a2.1) / l2);
+        }
+        let mut q2 = q;
+        for k in 0..4 {
+            q2[k] = cross(&lines[(k + 3) % 4], &lines[k])?;
+        }
+        let q = q2;
+        let held: Vec<f64> = (0..4)
+            .map(|k| {
+                let (a, b) = (q[k], q[(k + 1) % 4]);
+                let l = dist(a, b).max(1.0);
+                let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+                let (mut nx, mut ny) = (-uy, ux);
+                if (c.0 - a.0) * nx + (c.1 - a.1) * ny < 0.0 {
+                    nx = -nx;
+                    ny = -ny;
+                }
+                let n = l as usize;
+                (0..n).filter(|&i| holds(a.0 + ux * (i as f64 + 0.5), a.1 + uy * (i as f64 + 0.5), nx, ny)).count() as f64 / n.max(1) as f64
+            })
+            .collect();
+        Some((q, [held[0], held[1], held[2], held[3]]))
+    };
+    close.retain(|c| c.0 >= OUTLINE_CLOSE * top);
+    close.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    close.truncate(OUTLINE_TRIES);
+    let (q, held) = close
+        .iter()
+        .filter_map(|c| settle(c.1))
+        .map(|(q, h)| (h.iter().product::<f64>() * (shoelace(&q) / (wf * hf)).powf(OUTLINE_AREA), q, h))
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+        .map(|(_, q, h)| (q, h))?;
     if held.iter().product::<f64>() < OUTLINE_SURE {
         return None;
     }
