@@ -282,7 +282,20 @@ change what this image may be used for.
 
 1. **Rasterize** — a PDF's embedded image is extracted rather than re-rendered;
    rendering applies the ICC profile and flattens the tonal range.
-2. **Rectify** — the sheet is the big bright low-chroma region, both tests
+2. **Rectify** — **the document's own outline is looked for first**: four
+   straight lines, each a boundary over most of its length, where the two
+   sides differ in brightness or in grain (the smoother side inside). It asks
+   nothing about the colour of paper or desk, so a pale passport on pale
+   granite is found as it lies; the grain of stone, carpet or wood is taken
+   out first with a median, which a straight edge outlives. All four sides
+   count together, so a windowsill's edge, or a page's line carried on over
+   the desk, makes no outline; a larger outline beats a better held one
+   inside it, so the photo on a page does not win over the page. A cut
+   across its middle third lying on an edge over 90% of the width is a fold,
+   and the outline is a spread. When no outline holds — a sheet filling the
+   frame, a card whose sides run on past its corners, an outline an open
+   booklet found by brightness dwarfs — everything below decides as before.
+   Otherwise the sheet is the big bright low-chroma region, both tests
    relative to the image's own paper level, so a dim photo works like a bright
    one. When that assumption is simply false — a grey till slip on a marble
    counter, a white sign on a white wall, where the background really is
@@ -315,12 +328,8 @@ change what this image may be used for.
    taken for the page's colour and left alone). Passport pages are not white paper, so
    when the strict paper mask finds no spread two looser readings get a say:
    chroma up to 100 (salmon-pink pages) and Otsu's brightness split (a
-   booklet half in its own shadow). Then the spread is **turned upright from
-   the page itself**: which way the text runs (ink in long runs across the
-   lines against along them — 0.26 as photographed, 3.79 turned), and which
-   way is up from where the face photo sits — on the left of its page, on a
-   Russian passport's page 3 and on every ICAO data page. With no photo to go
-   on it says so, and `--rotate` settles it.
+   booklet half in its own shadow). The spread stays as it was shot:
+   `--rotate` turns it.
    **An identity card or a driving licence** (`--cards`, auto) is looked for
    alongside. ISO/IEC 7810 ID-1 — German Personalausweis, Russian and EU
    driving licences, bank cards — is 85.60 × 53.98 mm, 1.586:1, where A4 is
@@ -500,8 +509,7 @@ change what this image may be used for.
    shadow or a finger goes; anything with structure survives), then clean the
    paper to pure white with a 1 px guard ring around every glyph.
 10. **Fit to A4** — the PAGE turns, never the picture. A wide result is laid on
-   a landscape A4; `--rotate auto` rotates nothing at all — except a spread,
-   which is turned from the evidence on its own pages (step 2). Turning the pixels
+   a landscape A4; `--rotate auto` rotates nothing at all. Turning the pixels
    instead assumes a wide frame means a sideways sheet, and it usually does not:
    a square notebook page shot in a wide frame is wide because of the FRAME, and
    standing its lines on end makes it unreadable. A portrait sheet genuinely
@@ -572,7 +580,7 @@ flag; `--help` lists them.
 | a small photo came out at 200 dpi and you need 300 | `--dpi 300` — an explicit value is always obeyed |
 | a passport spread was rectified as one page, or only one page of it kept | `--spread on` fails loudly with each paper mask's reason |
 | something that is not a booklet was split in two and joined | `--spread off` |
-| a spread came out upside down | no face photo told up from down — `--rotate 180` |
+| a page or a spread came out sideways or upside down | it stays as shot — `--rotate 90/180/270` |
 | a face photo came out bleached | it was not found — the report has no `face photo at` line |
 | an ID card came out as a scanned page, not a card | not card-shaped — the report has no `card:` line |
 | a passport spread came out with its background whitened (the old scan look) | that is `--spread-scan`; the default keeps it |

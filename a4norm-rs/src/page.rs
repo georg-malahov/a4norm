@@ -101,38 +101,35 @@ fn is_binding(prof: &[usize]) -> bool {
     if !(RING_COVER.0..=RING_COVER.1).contains(&cover) {
         return false;
     }
-    let (mut runs, mut gaps, mut cur, mut prev) = (vec![], vec![], 0usize, 0u8);
-    for &b in &binv {
-        if b != prev {
-            if prev != 0 {
-                runs.push(cur);
-            } else {
-                gaps.push(cur);
+    // the rings as (start, length); the sheet's corners can merge a ring or
+    // two at either end, so the test is for a long enough row of equal rings
+    // at an equal pitch somewhere along the side
+    let mut rings: Vec<(usize, usize)> = vec![];
+    for (i, &b) in binv.iter().enumerate() {
+        if b != 0 {
+            match rings.last_mut() {
+                Some((s0, l)) if *s0 + *l == i => *l += 1,
+                _ => rings.push((i, 1)),
             }
-            cur = 0;
         }
-        cur += 1;
-        prev = b;
     }
-    if prev != 0 {
-        runs.push(cur);
-    } else {
-        gaps.push(cur);
-    }
-    if gaps.len() > 2 {
-        gaps = gaps[1..gaps.len() - 1].to_vec();
-    }
-    if runs.len() < RING_MIN || gaps.len() < RING_MIN - 1 {
+    if rings.len() < RING_MIN {
         return false;
     }
-    let spread = |v: &[usize]| {
-        let m = v.iter().sum::<usize>() as f64 / v.len() as f64;
-        if m <= 0.0 {
-            return 99.9;
-        }
-        (v.iter().map(|&x| (x as f64 - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt() / m
+    let median = |mut v: Vec<usize>| {
+        v.sort_unstable();
+        v[v.len() / 2] as f64
     };
-    spread(&runs) <= RING_SPREAD && spread(&gaps) <= RING_SPREAD
+    let len_m = median(rings.iter().map(|r| r.1).collect());
+    let pitch_m = median(rings.windows(2).map(|p| p[1].0 - p[0].0).collect());
+    let even = |x: usize, m: f64| (x as f64 - m).abs() <= RING_SPREAD * m;
+    let (mut best, mut row) = (0, 0);
+    for (i, r) in rings.iter().enumerate() {
+        let fits = even(r.1, len_m) && (row == 0 || even(r.0 - rings[i - 1].0, pitch_m));
+        row = if fits { row + 1 } else if even(r.1, len_m) { 1 } else { 0 };
+        best = best.max(row);
+    }
+    best >= RING_MIN
 }
 
 #[derive(Clone, Copy, Default)]
@@ -854,6 +851,9 @@ pub enum Found {
 }
 
 /// What is in the frame, before anything touches the pixels.
+/// A spread found by brightness this much larger than the outline wins.
+const OUTLINE_PART: f64 = 1.3;
+
 pub fn locate(src: &Src, o: &Opts, report: &mut Vec<String>) -> Result<Found, Fail> {
     if o.photo == "on" {
         report.push("--photo on — kept as a photo, not scanned".into());
@@ -888,6 +888,33 @@ pub fn locate(src: &Src, o: &Opts, report: &mut Vec<String>) -> Result<Found, Fa
         }
         if spread.is_none() && o.spread == "on" {
             return Err(Fail(format!("a4norm: --spread on, but no two facing pages found: {}", whys.join("; "))));
+        }
+    }
+    // the document's own outline first: four straight lines, each a boundary
+    // over its length, whatever the colour of the paper and of the desk
+    if o.edges != "off" {
+        // unless two pages found by brightness hold it with room to spare:
+        // then the outline was one page, or the photo on it
+        let held_by_spread = |ol: &d::Outline| {
+            spread.as_ref().is_some_and(|s: &d::Spread| {
+                let area: f64 = s.quads.iter().map(|q| d::shoelace(q)).sum();
+                area >= OUTLINE_PART * d::shoelace(&ol.quad)
+            })
+        };
+        if let Some(doc) = d::outline(src).filter(|ol| !held_by_spread(ol)).and_then(|ol| d::outline_document(&ol, o)) {
+            match doc {
+                d::EdgeDoc::Cards(q, why) => {
+                    // a second card beside it is found the old way
+                    if let Ok((cq, cwhy)) = d::detect_cards(&vc) {
+                        if cq.len() == 2 && d::cards_alone(src, &cq, report).len() == 2 {
+                            return Ok(Found::Cards(cq, cwhy));
+                        }
+                    }
+                    return Ok(Found::Cards(q, why));
+                }
+                d::EdgeDoc::Spread(s) => return Ok(Found::Spread(s)),
+                d::EdgeDoc::Sheet(q, why) => return Ok(Found::Sheet(q, why)),
+            }
         }
     }
     if o.cards != "off" {
@@ -1058,28 +1085,14 @@ fn erase_outside(job: &mut Job, w: usize, h: usize) {
     }
 }
 
-fn orient(job: &mut Job, spread: Option<&d::Spread>, receipt: bool) {
+/// Turn the page only when asked: the photographer knows which way up the
+/// document is, and a guess from its content turned passports wrong.
+fn orient(job: &mut Job) {
     let o = job.o;
     if o.rotate != "auto" && o.rotate != "0" {
         let deg: i32 = o.rotate.parse().unwrap_or(0);
         job.cur = job.cur.rotate(deg);
         job.say(format!("rotated {}°", o.rotate));
-    } else if let (Some(s), "auto") = (spread, o.rotate.as_str()) {
-        let turn = d::spread_turn(&job.cur, s.horiz, &mut job.report);
-        if turn != 0 {
-            job.cur = job.cur.rotate(turn);
-            job.say(format!("rotated {}°", turn));
-        }
-    } else if o.rotate == "auto" {
-        // a page shot upside down or on its side: its text says which way up
-        match d::text_turn(&job.cur, receipt) {
-            Ok((0, _)) => {}
-            Ok((turn, why)) => {
-                job.cur = job.cur.rotate(turn);
-                job.say(format!("rotated {}°: {}", turn, why));
-            }
-            Err(_) => {}
-        }
     }
 }
 
@@ -1389,7 +1402,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         erase_outside(&mut job, wh.0, wh.1);
         step("border");
     }
-    orient(&mut job, spread.as_ref(), receipt);
+    orient(&mut job);
     let mut t = if rectified { Trim { flags: [false; 4], span: (0, 0), shave: (0, 0) } } else { trim_border(&mut job) };
     let copy = spread.is_some() && !o.spread_scan;
     if copy {

@@ -790,52 +790,6 @@ pub fn detect_spread(pm: &Pm) -> Result<Spread, String> {
     Ok(Spread { quads: [full(&quads[0]), full(&quads[1])], horiz, why })
 }
 
-/// The page `side` px on its long side, divided by its closed background and
-/// thresholded at `thr`%: ink is 0, paper 255.
-fn ink_map(img: &Img, side: usize, thr: f64) -> (Vec<u8>, usize, usize) {
-    let (w0, h0) = (img.w, img.h);
-    let (w, h) = long_side(w0, h0, side);
-    let g = img.resize_auto(w, h).gray();
-    let closed = ops::morph_p(&g, &ops::octagon(3), true, 1);
-    let closed = ops::morph_p(&closed, &ops::octagon(3), false, 1);
-    let bg = ops::blur(&closed, 2.0);
-    let div = g.zip(&bg, divide);
-    (ops::threshold(&div, thr).bytes(), w, h)
-}
-
-/// (horizontal, vertical) ink in long runs: which way the lines of text go.
-pub fn ink_runs(img: &Img, side: usize, thr: f64) -> (usize, usize) {
-    let (raw, w, h) = ink_map(img, side, thr);
-    let minlen = 8.max(ops::py_round(0.025 * w.max(h) as f64) as usize);
-    let runs = |n_lines: usize, n_len: usize, at: &dyn Fn(usize, usize) -> usize| -> usize {
-        let gap = 2;
-        let mut tot = 0;
-        for a in 0..n_lines {
-            let (mut cur, mut hole) = (0, 0);
-            for b in 0..n_len {
-                if raw[at(a, b)] < 128 {
-                    cur = if cur > 0 { cur + hole + 1 } else { 1 };
-                    hole = 0;
-                } else if cur > 0 {
-                    hole += 1;
-                    if hole > gap {
-                        if cur >= minlen {
-                            tot += cur;
-                        }
-                        cur = 0;
-                        hole = 0;
-                    }
-                }
-            }
-            if cur >= minlen {
-                tot += cur;
-            }
-        }
-        tot
-    };
-    (runs(h, w, &|y, x| y * w + x), runs(w, h, &|x, y| y * w + x))
-}
-
 /// ImageMagick's Divide, dst / src, for opaque pixels.
 pub fn divide(d: f32, s: f32) -> f32 {
     const E: f32 = 1.0e-12;
@@ -979,7 +933,6 @@ pub fn find_photo_block(img: &Img, area_min: Option<f64>, area_max: Option<f64>,
 
 pub const SPREAD_PHOTO_MM: (f64, f64) = (38.0, 48.0);
 pub const SPREAD_PHOTO_DARK: f64 = 0.25;
-const SPREAD_PHOTO_PLACE: (f64, f64, f64, f64) = (0.03, 0.37, 0.58, 0.98);
 pub const CARD_FACE_DARK: f64 = 0.30;
 pub const CARD_FACE_RUN: f64 = 0.20;
 
@@ -1011,94 +964,6 @@ pub fn place(cells: &Cells, x0: f64, x1: f64, y0: f64, y1: f64) -> (f64, f64) {
         n as f64 / (cols.len() * 1.max(yb.min(ch) as isize - ya as isize) as usize) as f64,
         runs as f64 / cols.len() as f64,
     )
-}
-
-/// Degrees to turn a rectified spread so its text reads upright.
-pub fn spread_turn(img: &Img, horiz: bool, report: &mut Vec<String>) -> i32 {
-    let (hr, vr) = ink_runs(img, 600, 75.0);
-    let ratio = hr as f64 / vr.max(1) as f64;
-    let cands: [i32; 2] = if ratio >= 1.6 {
-        [0, 180]
-    } else if ratio <= 1.0 / 1.6 {
-        [90, 270]
-    } else {
-        report.push(format!(
-            "spread: text direction unclear (runs across/along {:.2}) — left as photographed; pass --rotate",
-            ratio
-        ));
-        return 0;
-    };
-    let lines = if cands[0] == 0 { "across" } else { "up and down" };
-    let (iw, ih) = (img.w as f64, img.h as f64);
-    let mut scored = vec![];
-    for turn in cands {
-        if horiz == (turn == 0 || turn == 180) {
-            continue;
-        }
-        // -resize 400x400: fitted inside, aspect kept
-        let s = (400.0 / iw).min(400.0 / ih);
-        let (sw, sh) = if 400.0 / iw <= 400.0 / ih {
-            (400, (ih * s + 0.5).floor().max(1.0) as usize)
-        } else {
-            ((iw * s + 0.5).floor().max(1.0) as usize, 400)
-        };
-        let mut small = img.resize_auto(sw, sh).rotate(turn);
-        small.q8();
-        if let Some(cells) = dark_cells(&small, 200) {
-            let (d, r) = place(&cells, SPREAD_PHOTO_PLACE.0, SPREAD_PHOTO_PLACE.1, SPREAD_PHOTO_PLACE.2, SPREAD_PHOTO_PLACE.3);
-            scored.push((d, r, turn));
-        }
-    }
-    let mut pick = None;
-    if scored.len() == 2 {
-        let mut s = scored.clone();
-        s.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        let ((d1, _, t1), (d2, _, _)) = ((s[0].0, s[0].1, s[0].2), (s[1].0, s[1].1, s[1].2));
-        if d1 >= SPREAD_PHOTO_DARK && d1 >= 3.0 * d2 + 0.02 {
-            pick = Some(t1);
-        }
-    }
-    for &(d, r, t) in &scored {
-        if pick.is_none() && d >= CARD_FACE_DARK && r >= CARD_FACE_RUN {
-            pick = Some(t);
-        }
-    }
-    if let Some(turn) = pick {
-        report.push(format!(
-            "spread: text runs {} (ratio {:.2}); the face photo is in its place, left on the lower page, when turned {}°",
-            lines, ratio, turn
-        ));
-        return turn;
-    }
-    if let Some(bx) = find_photo_block(img, None, None, None, None) {
-        let (cx, cy) = (bx.0 as f64 + bx.2 as f64 / 2.0, bx.1 as f64 + bx.3 as f64 / 2.0);
-        for turn in cands {
-            let (mut x, mut ww) = match turn {
-                0 => (cx, iw),
-                180 => (iw - cx, iw),
-                90 => (ih - cy, ih),
-                _ => (cy, ih),
-            };
-            let side_by_side = horiz == (turn == 0 || turn == 180);
-            if side_by_side {
-                ww /= 2.0;
-                x = x.rem_euclid(ww);
-            }
-            if x < ww / 2.0 {
-                report.push(format!(
-                    "spread: text runs {} (ratio {:.2}); the photo sits left of its page when turned {}°",
-                    lines, ratio, turn
-                ));
-                return turn;
-            }
-        }
-    }
-    let turn = cands[0];
-    report.push(format!(
-        "spread: text runs {} (ratio {:.2}); no face photo to tell up from down — turned {}°, pass --rotate if it came out upside down",
-        lines, ratio, turn
-    ));
-    turn
 }
 
 // -------------------------------------------------------------------- cards
@@ -1357,8 +1222,8 @@ fn g_exponent(v: f64) -> bool {
     v != 0.0 && (v.abs() < 1e-4 || v.abs() >= 1e6)
 }
 
-fn edge_quads(img: &dyn Pix) -> (Vec<Cand>, Vec<HLine>, EdgeMap) {
-    let em = edge_map(img, true);
+/// The Hough lines of an edge map, each with how much of it lies on an edge.
+fn hlines(em: &EdgeMap) -> Vec<HLine> {
     let (w, h) = (em.w, em.h);
     let mut lines = vec![];
     for &(x1, y1, x2, y2, cnt) in &em.hough {
@@ -1380,6 +1245,13 @@ fn edge_quads(img: &dyn Pix) -> (Vec<Cand>, Vec<HLine>, EdgeMap) {
         }
         lines.push(HLine { l: Line::of(x1, y1, dx, dy), cnt, pre, span });
     }
+    lines
+}
+
+fn edge_quads(img: &dyn Pix) -> (Vec<Cand>, Vec<HLine>, EdgeMap) {
+    let em = edge_map(img, true);
+    let (w, h) = (em.w, em.h);
+    let lines = hlines(&em);
     let pick = |hz: bool| -> Vec<usize> {
         let mut v: Vec<usize> = (0..lines.len()).filter(|&i| (lines[i].l.dx.abs() >= lines[i].l.dy.abs()) == hz).collect();
         v.sort_by(|&a, &b| lines[b].cnt.partial_cmp(&lines[a].cnt).unwrap());
@@ -1449,10 +1321,82 @@ fn quad_sides(q: &Quad) -> (f64, f64) {
 const FOLD_SUPPORT: f64 = 0.6;
 const FOLD_MARGIN: f64 = 0.25;
 const FOLD_SPREAD: f64 = 0.03;
+const FOLD_T: (f64, f64) = (0.35, 0.65);
+/// A fold runs the whole way across, close to the middle.
+const FOLD_FULL: f64 = 0.9;
+const FOLD_MID: (f64, f64) = (0.4, 0.6);
 const EDGE_SHEET_ASPECT: (f64, f64) = (1.25, 1.6);
 const EDGE_SHEET_MAX: f64 = 0.85;
 const EDGE_BRIGHT_FRAME: f64 = 0.7;
 const EDGE_GROWTH: f64 = 1.3;
+
+/// Canny of the grey within a quad's bounding box, its thresholds set by
+/// what is inside rather than by the whole frame.
+fn inner_edges(g: &[u8], w: usize, h: usize, q: &Quad) -> EdgeMap {
+    let x0 = q.iter().map(|p| p.0).fold(f64::MAX, f64::min).max(0.0) as usize;
+    let y0 = q.iter().map(|p| p.1).fold(f64::MAX, f64::min).max(0.0) as usize;
+    let x1 = (q.iter().map(|p| p.0).fold(f64::MIN, f64::max).ceil() as usize + 1).min(w);
+    let y1 = (q.iter().map(|p| p.1).fold(f64::MIN, f64::max).ceil() as usize + 1).min(h);
+    let mut e = vec![0u8; w * h];
+    if x1 > x0 + 8 && y1 > y0 + 8 {
+        let (cw, ch) = (x1 - x0, y1 - y0);
+        let crop = |v: &[u8]| {
+            let mut d = Vec::with_capacity(cw * ch);
+            for y in y0..y1 {
+                d.extend(v[y * w + x0..y * w + x1].iter().map(|&v| v as f32 / 255.0));
+            }
+            ops::canny(&ops::Plane { w: cw, h: ch, d }, 2.0, 0.03, 0.10)
+        };
+        let c = crop(g);
+        let c = ops::morph_k(&c, cw, ch, &ops::square(2), true);
+        for y in 0..ch {
+            for x in 0..cw {
+                e[(y + y0) * w + x + x0] = if c[y * cw + x] != 0 { 255 } else { 0 };
+            }
+        }
+    }
+    EdgeMap { e, w, h, w0: w, h0: h, hough: vec![], g: vec![] }
+}
+
+/// A fold across the middle of a found outline: of every straight cut from
+/// one long side to the other through its middle third, the one lying on an
+/// edge the most. The pages' print makes a second, weaker run of edges at
+/// most; ruled paper makes several as strong, and is no fold.
+fn fold_scan(q: &Quad, em: &EdgeMap) -> Option<(Pt, Pt, bool)> {
+    let (wd, ht) = quad_sides(q);
+    let [tl, tr, br, bl] = *q;
+    let ((a0, a1), (b0, b1), horiz) = if ht >= wd { ((tl, bl), (tr, br), false) } else { ((tl, tr), (bl, br), true) };
+    let at = |p: Pt, r: Pt, t: f64| (p.0 + (r.0 - p.0) * t, p.1 + (r.1 - p.1) * t);
+    let len = dist(a0, a1).max(dist(b0, b1)).max(1.0);
+    let step = 1.0 / len;
+    let tilt = (0.02 * len) as i64;
+    let mut runs: Vec<(f64, f64, Pt, Pt)> = vec![];
+    let mut t = FOLD_T.0;
+    while t <= FOLD_T.1 {
+        let mut best = (0.0, (0.0, 0.0), (0.0, 0.0));
+        for k in -tilt..=tilt {
+            let (p, r) = (at(a0, a1, t), at(b0, b1, t + k as f64 * step));
+            let sup = seg_support(em, p, r);
+            if sup > best.0 {
+                best = (sup, p, r);
+            }
+        }
+        runs.push((best.0, t, best.1, best.2));
+        t += step;
+    }
+    let full: Vec<&(f64, f64, Pt, Pt)> = runs.iter().filter(|r| r.0 >= FOLD_FULL).collect();
+    // separate runs of full cuts: a fold makes one, maybe with a printed
+    // rule beside it; ruled paper makes many
+    let groups = full.windows(2).filter(|w| w[1].1 - w[0].1 > 2.5 * step).count() + (!full.is_empty()) as usize;
+    if groups == 0 || groups > 2 {
+        return None;
+    }
+    let top = full
+        .iter()
+        .filter(|r| (FOLD_MID.0..=FOLD_MID.1).contains(&r.1))
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then((b.1 - 0.5).abs().partial_cmp(&(a.1 - 0.5).abs()).unwrap()))?;
+    Some((top.2, top.3, horiz))
+}
 
 fn edge_fold(q: &Quad, lines: &[HLine]) -> Option<(Pt, Pt, bool)> {
     let (wd, ht) = quad_sides(q);
@@ -1803,6 +1747,390 @@ fn edge_outline(cands: &[Cand], lines: &[HLine], em: &EdgeMap, bright: Option<Qu
     None
 }
 
+// ------------------------------------------------------------ outline first
+
+/// Median radius at the analysis scale: wipes out the grain of granite,
+/// terrazzo or a carpet while a sheet's straight edge survives it.
+const OUTLINE_MEDIAN: usize = 7;
+/// How far either side of a line the two bands are read, and how far the
+/// line may miss the true edge (a Hough line is 1 px and 1° coarse, and a
+/// booklet's edge bows a little).
+const OUTLINE_OFF: f64 = 6.0;
+const OUTLINE_SHIFT: f64 = 3.0;
+/// A point of a side holds when the bands differ: in brightness, or in
+/// grain with the smoother band inside.
+const OUTLINE_STEP: i32 = 25;
+const OUTLINE_GRAIN: i32 = 40;
+/// Every side must hold over most of its length, and all four together.
+const OUTLINE_SIDE: f64 = 0.6;
+const OUTLINE_SURE: f64 = 0.6;
+/// How much a larger outline outweighs a better held one inside it: enough
+/// that a document's own edge beats the photo printed on it.
+const OUTLINE_AREA: f64 = 0.75;
+/// How far, in pixels of the analysis scale, either end of a side may move
+/// to settle onto the boundary.
+const OUTLINE_SETTLE: i64 = 16;
+/// Outlines scoring this close to the best are settled and compared again.
+const OUTLINE_CLOSE: f64 = 0.7;
+const OUTLINE_TRIES: usize = 8;
+const OUTLINE_SHARE: (f64, f64) = (0.10, 0.85);
+
+/// Median of a u8 image over a (2r+1)² square, edges repeated.
+fn median_u8(g: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
+    let half = ((2 * r + 1) * (2 * r + 1)) / 2;
+    let rows = ops::par_map(h, |y| {
+        let mut hist = [0u32; 256];
+        let col = |x: isize, hist: &mut [u32; 256], add: bool| {
+            let xx = x.clamp(0, w as isize - 1) as usize;
+            for dy in -(r as isize)..=r as isize {
+                let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                let v = g[yy * w + xx] as usize;
+                if add {
+                    hist[v] += 1;
+                } else {
+                    hist[v] -= 1;
+                }
+            }
+        };
+        for x in -(r as isize)..=r as isize {
+            col(x, &mut hist, true);
+        }
+        let mut out = vec![0u8; w];
+        for x in 0..w {
+            if x > 0 {
+                col(x as isize - r as isize - 1, &mut hist, false);
+                col(x as isize + r as isize, &mut hist, true);
+            }
+            let mut acc = 0;
+            for (v, &c) in hist.iter().enumerate() {
+                acc += c as usize;
+                if acc > half {
+                    out[x] = v as u8;
+                    break;
+                }
+            }
+        }
+        out
+    });
+    rows.concat()
+}
+
+/// Mean over a (2r+1)² square, edges repeated.
+fn box_mean(v: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let pass = |src: &[f32], w: usize, h: usize, along_x: bool| -> Vec<f32> {
+        let mut out = vec![0f32; w * h];
+        let (n, len) = if along_x { (h, w) } else { (w, h) };
+        for line in 0..n {
+            let at = |k: isize| {
+                let k = k.clamp(0, len as isize - 1) as usize;
+                if along_x { src[line * w + k] } else { src[k * w + line] }
+            };
+            let mut s: f32 = (-(r as isize)..=r as isize).map(at).sum();
+            for k in 0..len {
+                if k > 0 {
+                    s += at(k as isize + r as isize) - at(k as isize - r as isize - 1);
+                }
+                let i = if along_x { line * w + k } else { k * w + line };
+                out[i] = s / (2 * r + 1) as f32;
+            }
+        }
+        out
+    };
+    pass(&pass(v, w, h, true), w, h, false)
+}
+
+/// How grainy the frame is around each pixel: the mean distance of the grey
+/// from its own slight blur, times ten, evened out over a few pixels.
+fn grain_map(g: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let p = ops::Plane { w, h, d: g.iter().map(|&v| v as f32 / 255.0).collect() };
+    let b = ops::blur(&p, 1.0);
+    let d: Vec<f32> = p.d.iter().zip(&b.d).map(|(a, c)| (a - c).abs() * 255.0).collect();
+    let r: Vec<u8> = box_mean(&d, w, h, 3).iter().map(|&v| (v * 10.0).clamp(0.0, 255.0) as u8).collect();
+    let r = median_u8(&r, w, h, 4);
+    box_mean(&r.iter().map(|&v| v as f32).collect::<Vec<_>>(), w, h, 4).iter().map(|&v| v as u8).collect()
+}
+
+/// A Hough line with, for each normal direction, how much of it lies on a
+/// boundary whose inner side is that way: prefix sums along the line.
+struct Rim {
+    l: Line,
+    cnt: f64,
+    span: i64,
+    held: [Vec<u32>; 2],
+}
+
+impl Rim {
+    fn support(&self, a: Pt, b: Pt, side: usize) -> f64 {
+        let l = &self.l;
+        let mut ta = (a.0 - l.cx) * l.dx + (a.1 - l.cy) * l.dy;
+        let mut tb = (b.0 - l.cx) * l.dx + (b.1 - l.cy) * l.dy;
+        if ta > tb {
+            std::mem::swap(&mut ta, &mut tb);
+        }
+        let s = self.span;
+        let i0 = (ops::py_round(ta) + s).clamp(0, 2 * s + 1);
+        let i1 = (ops::py_round(tb) + s + 1).clamp(0, 2 * s + 1);
+        let p = &self.held[side];
+        (p[i1 as usize] as f64 - p[i0 as usize] as f64) / 1.max(i1 - i0) as f64
+    }
+    /// The normal direction (0: (-dy, dx), 1: its opposite) facing `c`.
+    fn facing(&self, c: Pt) -> usize {
+        ((c.0 - self.l.cx) * -self.l.dy + (c.1 - self.l.cy) * self.l.dx < 0.0) as usize
+    }
+}
+
+pub struct Outline {
+    pub quad: Quad,
+    /// How far a side carries on past its corner (see `card_run_on`).
+    pub run_on: f64,
+    pub share: f64,
+    pub aspect: f64,
+    pub held: [f64; 4],
+    pub fold: Option<(Pt, Pt, bool)>,
+}
+
+/// The document as four straight lines, each of which is a boundary over
+/// its whole length. Nothing here asks what colour paper or desk is: a
+/// side holds where the two sides of it differ, in brightness or in grain,
+/// so granite that is as pale as the page still has an edge against it, a
+/// windowsill's edge with nothing matching it makes no quad, and a page's
+/// line carried on past its corner over the desk stops holding there.
+pub fn outline(img: &dyn Pix) -> Option<Outline> {
+    let (w0, h0) = img.dims();
+    let (w, h) = long_side(w0, h0, EDGE_SIDE);
+    let g = raw_gray(img, w, h);
+    let gm = median_u8(&g, w, h, OUTLINE_MEDIAN);
+    let gr = grain_map(&g, w, h);
+    let plane = |v: &[u8]| ops::Plane { w, h, d: v.iter().map(|&x| x as f32 / 255.0).collect() };
+    let e1 = ops::canny(&plane(&gm), 1.0, 0.10, 0.30);
+    let e2 = ops::canny(&plane(&gr), 1.0, 0.10, 0.30);
+    let edge: Vec<u8> = e1.iter().zip(&e2).map(|(a, b)| a | b).collect();
+    let thr = 20.max(ops::py_round(w.min(h) as f64 * 0.12) as usize);
+    let hough = ops::hough_lines(&edge, w, h, 15, 15, thr);
+    let px = |v: &[u8], x: f64, y: f64| -> Option<i32> {
+        let (x, y) = (ops::py_round(x), ops::py_round(y));
+        (x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h).then(|| v[y as usize * w + x as usize] as i32)
+    };
+    let holds = |x: f64, y: f64, nx: f64, ny: f64| -> bool {
+        [-OUTLINE_SHIFT, 0.0, OUTLINE_SHIFT].iter().any(|&s| {
+            let (x, y) = (x + nx * s, y + ny * s);
+            let (xi, yi, xo, yo) = (x + nx * OUTLINE_OFF, y + ny * OUTLINE_OFF, x - nx * OUTLINE_OFF, y - ny * OUTLINE_OFF);
+            match (px(&gm, xi, yi), px(&gm, xo, yo), px(&gr, xi, yi), px(&gr, xo, yo)) {
+                (Some(bi), Some(bo), Some(ri), Some(ro)) => (bi - bo).abs() >= OUTLINE_STEP || ro - ri >= OUTLINE_GRAIN,
+                _ => false,
+            }
+        })
+    };
+    let span = ((w as f64).hypot(h as f64)) as i64 + 2;
+    let mut rims = vec![];
+    for &(x1, y1, x2, y2, cnt) in &hough {
+        let n = (x2 - x1).hypot(y2 - y1);
+        if n < 1.0 {
+            continue;
+        }
+        let (dx, dy) = ((x2 - x1) / n, (y2 - y1) / n);
+        let mut held = [vec![0u32; (2 * span + 2) as usize], vec![0u32; (2 * span + 2) as usize]];
+        for k in -span..=span {
+            let (x, y) = (x1 + dx * k as f64, y1 + dy * k as f64);
+            let i = (k + span) as usize;
+            for (side, sign) in [(0usize, 1.0), (1, -1.0)] {
+                held[side][i + 1] = held[side][i] + holds(x, y, -dy * sign, dx * sign) as u32;
+            }
+        }
+        rims.push(Rim { l: Line::of(x1, y1, dx, dy), cnt, span, held });
+    }
+    let pick = |hz: bool| -> Vec<usize> {
+        let mut v: Vec<usize> = (0..rims.len()).filter(|&i| (rims[i].l.dx.abs() >= rims[i].l.dy.abs()) == hz).collect();
+        v.sort_by(|&a, &b| rims[b].cnt.partial_cmp(&rims[a].cnt).unwrap());
+        v.truncate(EDGE_LINES);
+        v
+    };
+    let (horiz, vert) = (pick(true), pick(false));
+    let (wf, hf) = (w as f64, h as f64);
+    let mut best: Option<(f64, Quad, [f64; 4])> = None;
+    let mut close: Vec<(f64, Quad)> = vec![];
+    for (i, &t) in horiz.iter().enumerate() {
+        for &b in &horiz[i + 1..] {
+            for (j, &le) in vert.iter().enumerate() {
+                for &r in &vert[j + 1..] {
+                    let sides = [t, r, b, le];
+                    let q = match (cross(&rims[t].l, &rims[le].l), cross(&rims[t].l, &rims[r].l), cross(&rims[b].l, &rims[r].l), cross(&rims[b].l, &rims[le].l)) {
+                        (Some(a), Some(bb), Some(c), Some(d)) => [a, bb, c, d],
+                        _ => continue,
+                    };
+                    if q.iter().any(|p| p.0 < -0.05 * wf || p.0 > 1.05 * wf || p.1 < -0.05 * hf || p.1 > 1.05 * hf) {
+                        continue;
+                    }
+                    let share = shoelace(&q) / (wf * hf);
+                    if !(OUTLINE_SHARE.0..=OUTLINE_SHARE.1).contains(&share) {
+                        continue;
+                    }
+                    if (0..4).any(|k| !(60.0..=120.0).contains(&angle(q[(k + 3) % 4], q[k], q[(k + 1) % 4]))) {
+                        continue;
+                    }
+                    let c = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+                    let mut held = [0.0; 4];
+                    let mut ok = true;
+                    for k in 0..4 {
+                        let rim = &rims[sides[k]];
+                        held[k] = rim.support(q[k], q[(k + 1) % 4], rim.facing(c));
+                        if held[k] < OUTLINE_SIDE {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let score = held.iter().product::<f64>() * share.powf(OUTLINE_AREA);
+                    close.push((score, q));
+                    if best.as_ref().is_none_or(|(s, _, _)| score > *s) {
+                        best = Some((score, q, held));
+                    }
+                }
+            }
+        }
+    }
+    let (top, _, _) = best?;
+    // Each close outline settles its sides onto the strongest boundary near
+    // them, and the best settled one wins. Two Hough peaks a few pixels
+    // apart swap on a float's last bit between machines; the step itself,
+    // read off the median and the grain, does not.
+    let settle = |q: Quad| -> Option<(Quad, [f64; 4])> {
+        // each side settled onto the strongest boundary near it: two Hough peaks
+        // a few pixels apart can swap on a float's last bit between machines,
+        // the step itself, read off the median and the grain, cannot
+        let c = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+        let step_at = |x: f64, y: f64, nx: f64, ny: f64| -> i64 {
+            let d = OUTLINE_OFF / 2.0;
+            match (px(&gm, x + nx * d, y + ny * d), px(&gm, x - nx * d, y - ny * d), px(&gr, x + nx * d, y + ny * d), px(&gr, x - nx * d, y - ny * d)) {
+                (Some(bi), Some(bo), Some(ri), Some(ro)) => ((bi - bo).abs() as i64 * OUTLINE_GRAIN as i64).max((ro - ri) as i64 * OUTLINE_STEP as i64),
+                _ => 0,
+            }
+        };
+        let mut lines = [Line::of(0.0, 0.0, 1.0, 0.0); 4];
+        for k in 0..4 {
+            let (a, b) = (q[k], q[(k + 1) % 4]);
+            let l = dist(a, b).max(1.0);
+            let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+            let (mut nx, mut ny) = (-uy, ux);
+            if (c.0 - a.0) * nx + (c.1 - a.1) * ny < 0.0 {
+                nx = -nx;
+                ny = -ny;
+            }
+            let n = (l as usize / 2).max(8);
+            let mut best_k = (i64::MIN, 0i64, 0i64);
+            // outwards only: a line a few pixels inside the edge lets the
+            // desk in at worst, one moved inwards can cut into the print
+            for da in -OUTLINE_SETTLE..=0 {
+                for db in -OUTLINE_SETTLE..=0 {
+                    let (a2, b2) = ((a.0 + nx * da as f64, a.1 + ny * da as f64), (b.0 + nx * db as f64, b.1 + ny * db as f64));
+                    let sum: i64 = (0..n)
+                        .map(|i| {
+                            let t = (i as f64 + 0.5) / n as f64;
+                            step_at(a2.0 + (b2.0 - a2.0) * t, a2.1 + (b2.1 - a2.1) * t, nx, ny)
+                        })
+                        .sum();
+                    if sum > best_k.0 {
+                        best_k = (sum, da, db);
+                    }
+                }
+            }
+            let (a2, b2) = ((a.0 + nx * best_k.1 as f64, a.1 + ny * best_k.1 as f64), (b.0 + nx * best_k.2 as f64, b.1 + ny * best_k.2 as f64));
+            let l2 = dist(a2, b2).max(1.0);
+            lines[k] = Line::of(a2.0, a2.1, (b2.0 - a2.0) / l2, (b2.1 - a2.1) / l2);
+        }
+        let mut q2 = q;
+        for k in 0..4 {
+            q2[k] = cross(&lines[(k + 3) % 4], &lines[k])?;
+        }
+        let q = q2;
+        let held: Vec<f64> = (0..4)
+            .map(|k| {
+                let (a, b) = (q[k], q[(k + 1) % 4]);
+                let l = dist(a, b).max(1.0);
+                let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+                let (mut nx, mut ny) = (-uy, ux);
+                if (c.0 - a.0) * nx + (c.1 - a.1) * ny < 0.0 {
+                    nx = -nx;
+                    ny = -ny;
+                }
+                let n = l as usize;
+                (0..n).filter(|&i| holds(a.0 + ux * (i as f64 + 0.5), a.1 + uy * (i as f64 + 0.5), nx, ny)).count() as f64 / n.max(1) as f64
+            })
+            .collect();
+        Some((q, [held[0], held[1], held[2], held[3]]))
+    };
+    close.retain(|c| c.0 >= OUTLINE_CLOSE * top);
+    close.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    close.truncate(OUTLINE_TRIES);
+    let (q, held) = close
+        .iter()
+        .filter_map(|c| settle(c.1))
+        .map(|(q, h)| (h.iter().product::<f64>() * (shoelace(&q) / (wf * hf)).powf(OUTLINE_AREA), q, h))
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+        .map(|(_, q, h)| (q, h))?;
+    if held.iter().product::<f64>() < OUTLINE_SURE {
+        return None;
+    }
+    // corners in order from the top left, clockwise, as elsewhere
+    let c = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+    let mut order: Vec<usize> = (0..4).collect();
+    order.sort_by(|&a, &b| (q[a].1 - c.1).atan2(q[a].0 - c.0).partial_cmp(&(q[b].1 - c.1).atan2(q[b].0 - c.0)).unwrap());
+    let qq: Vec<Pt> = order.iter().map(|&k| q[k]).collect();
+    let k0 = arg_min_idx(&qq);
+    let quad = [qq[k0], qq[(k0 + 1) % 4], qq[(k0 + 2) % 4], qq[(k0 + 3) % 4]];
+    // a fold across the middle: a crease, too fine to outlive the median and
+    // too faint beside the desk's grain, so it is looked for on the edges of
+    // the plain grey inside the outline alone
+    let fold = fold_scan(&quad, &inner_edges(&g, w, h, &quad));
+    let (wd, ht) = quad_sides(&quad);
+    let (sx, sy) = (w0 as f64 / wf, h0 as f64 / hf);
+    let full = |p: Pt| (p.0 * sx, p.1 * sy);
+    Some(Outline {
+        run_on: card_run_on(&quad, &gm, w, h),
+        quad: quad.map(full),
+        share: shoelace(&quad) / (wf * hf),
+        aspect: wd.max(ht) / 1e-6f64.max(wd.min(ht)),
+        held,
+        fold: fold.map(|(a, b, hz)| (full(a), full(b), hz)),
+    })
+}
+
+/// What a found outline is, by its shape alone: a card, two facing pages
+/// with a fold between them, a receipt or a sheet. None for a card-shaped
+/// outline whose sides carry on past its corners, like the top sheet of a
+/// wall calendar: brightness decides that one.
+pub fn outline_document(ol: &Outline, o: &Opts) -> Option<EdgeDoc> {
+    let held = ol.held.iter().cloned().fold(f64::MAX, f64::min);
+    let why = format!(
+        "found by its outline: {} of the frame, sides {:.2}:1, every side a boundary over {}+ of its length",
+        pc0(ol.share),
+        ol.aspect,
+        pc0(held)
+    );
+    if o.cards != "off" && (CARD_ASPECT.0..=CARD_ASPECT.1).contains(&ol.aspect) {
+        return (ol.run_on < CARD_ALONE).then(|| EdgeDoc::Cards(vec![ol.quad], why));
+    }
+    // a receipt folded across is no booklet: a spread is about as long as a
+    // sheet
+    if (LONG_ASPECT.0..=LONG_ASPECT.1).contains(&ol.aspect) {
+        return Some(EdgeDoc::Sheet(ol.quad, format!("{}, {}", why, RECEIPT)));
+    }
+    if let (Some((f1, f2, horiz)), true) = (ol.fold, o.spread != "off") {
+        let [tl, tr, br, bl] = ol.quad;
+        let (qa, qb) = if !horiz { ([tl, tr, f2, f1], [f1, f2, br, bl]) } else { ([tl, f1, f2, bl], [f1, tr, br, f2]) };
+        let ok = [qa, qb].iter().all(|pq| {
+            let (pw, ph) = quad_sides(pq);
+            (1.15..=1.75).contains(&(pw.max(ph) / 1e-6f64.max(pw.min(ph))))
+        });
+        if ok {
+            return Some(EdgeDoc::Spread(Spread { quads: [qa, qb], horiz, why: why + ", a fold across the middle" }));
+        }
+    }
+    Some(EdgeDoc::Sheet(ol.quad, why))
+}
+
 // -------------------------------------------------------- the frame's border
 
 fn smooth(v: &[f64], k: usize) -> Vec<f64> {
@@ -1994,91 +2322,4 @@ pub fn mrz_rows(img: &Img, mm: f64) -> Vec<f64> {
         return vec![];
     }
     best.iter().map(|r| r.0 * mm / h as f64).collect()
-}
-
-// ------------------------------------------------- which way up text reads
-
-const TEXT_SIDE: usize = 1600;
-const TEXT_ACROSS: f64 = 2.5;
-const TEXT_CORE: f64 = 0.4;
-const TEXT_LINE_PX: (usize, usize) = (6, 90);
-const TEXT_LEAN: f64 = 1.3;
-const TEXT_MIN_LINES: usize = 3;
-const TEXT_SURE: f64 = 0.15;
-const TEXT_AGREE: f64 = 0.7;
-
-/// The turn that puts a page's text upright, read off the text itself.
-/// A line of Latin print carries more ink above its lower-case core
-/// (capitals, digits, b d f h k l t) than below it (g j p q y), so a line
-/// upside down has its heavy side at the bottom.
-/// It stays cautious, because a wrong turn is worse than none:
-/// - the lines must run clearly one way;
-/// - most of them must vote, and 70% of the votes must agree;
-/// - a page with a face photo is left to the photo.
-///
-/// Handwriting, all capitals and Cyrillic (heavy below: д р у ф) mostly split
-/// the vote and are left as shot. Ok(turn) or Err(why not).
-pub fn text_turn(img: &Img, receipt: bool) -> Result<(i32, String), String> {
-    // an ID's face photo says which way up it is, and its print, mostly
-    // capitals and Cyrillic, leans either way (a receipt has none: what looks
-    // like one is a crumple)
-    if !receipt && find_photo_block(img, None, None, None, None).is_some() {
-        return Err("a face photo on the page".into());
-    }
-    let (hr, vr) = ink_runs(img, 600, 75.0);
-    let ratio = hr as f64 / vr.max(1) as f64;
-    let base = if ratio >= TEXT_ACROSS {
-        0
-    } else if ratio <= 1.0 / TEXT_ACROSS {
-        90
-    } else {
-        return Err(format!("text direction unclear (runs across/along {:.2})", ratio));
-    };
-    let turned = if base == 0 { img.clone() } else { img.rotate(base) };
-    let (m, w, h) = ink_map(&turned, TEXT_SIDE, 75.0);
-    let prof: Vec<f64> = (0..h).map(|y| m[y * w..(y + 1) * w].iter().filter(|&&v| v < 128).count() as f64).collect();
-    let floor = 0.005 * w as f64;
-    let (mut above, mut below, mut up, mut down, mut lines) = (0.0, 0.0, 0, 0, 0);
-    let mut y = 0;
-    while y < h {
-        if prof[y] <= floor {
-            y += 1;
-            continue;
-        }
-        let top = y;
-        while y < h && prof[y] > floor {
-            y += 1;
-        }
-        let band = &prof[top..y];
-        if !(TEXT_LINE_PX.0..=TEXT_LINE_PX.1).contains(&band.len()) {
-            continue;
-        }
-        let peak = band.iter().cloned().fold(0.0, f64::max);
-        let core: Vec<usize> = (0..band.len()).filter(|&i| band[i] >= TEXT_CORE * peak).collect();
-        let (c0, c1) = (core[0], *core.last().unwrap());
-        let a: f64 = band[..c0].iter().sum();
-        let b: f64 = band[c1 + 1..].iter().sum();
-        above += a;
-        below += b;
-        lines += 1;
-        if a > TEXT_LEAN * b {
-            up += 1;
-        } else if b > TEXT_LEAN * a {
-            down += 1;
-        }
-    }
-    if std::env::var_os("A4DBG").is_some() {
-        eprintln!("text_turn base {} ratio {:.2} lines {} up {} down {} above {:.0} below {:.0}", base, ratio, lines, up, down, above, below);
-    }
-    let votes = up + down;
-    if lines < TEXT_MIN_LINES || (votes as f64) < 0.5 * lines as f64 {
-        return Err(format!("too few lines of text to tell up from down ({})", lines));
-    }
-    let lean = (above - below) / (above + below).max(1.0);
-    let agree = up.max(down) as f64 / votes as f64;
-    if lean.abs() < TEXT_SURE || agree < TEXT_AGREE || (lean > 0.0) != (up > down) {
-        return Err(format!("text reads either way up ({} lines, {} lean up, {} down)", lines, up, down));
-    }
-    let turn = if lean > 0.0 { base } else { (base + 180) % 360 };
-    Ok((turn, format!("{} of {} lines of text read upright when turned {}°", up.max(down), lines, turn)))
 }
