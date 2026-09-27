@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Camera outline</title>
+<style>
+  :root { --bg: #111; --fg: #eee; --accent: #3ddc84; --muted: #999; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; }
+  #stage { position: relative; width: 100%; max-width: 900px; margin: 0 auto; }
+  video, #overlay { display: block; width: 100%; height: auto; }
+  #overlay { position: absolute; inset: 0; height: 100%; pointer-events: none; }
+  #bar { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 12px 16px; max-width: 900px; margin: 0 auto; }
+  #status { color: var(--muted); font-variant-numeric: tabular-nums; }
+  button { font: inherit; padding: 10px 18px; border-radius: 999px; border: 0; background: var(--accent); color: #000; }
+  button:disabled { opacity: .4; }
+  #result { max-width: 900px; margin: 0 auto; padding: 0 16px 24px; }
+  #result img { width: 100%; background: #fff; }
+</style>
+<div id="stage"><video id="video" playsinline muted></video><canvas id="overlay"></canvas></div>
+<div id="bar"><span id="status">камера…</span><button id="shoot" disabled>Снять</button></div>
+<div id="result"></div>
+<script type="module">
+// The camera's live frame: every frame the worker is free for goes to
+// detect() at ~600 px, the same finder the scan uses, and its outline is
+// drawn over the video, smoothed so it does not shimmer. "Снять" scans a
+// full-resolution still with process().
+const SIDE = 600;          // the finder works at 600 px on the long side
+const EASE = 0.5;          // share of the new corners taken each frame
+const HOLD_MS = 500;       // an outline lost this briefly stays drawn
+
+const worker = new Worker(URL.createObjectURL(new Blob([`
+let m;
+self.onmessage = async (e) => {
+  const d = e.data;
+  if (d.init) {
+    m = await import(self.location.origin + '/dist/st/a4norm.js');
+    await m.default({ module_or_path: self.location.origin + '/dist/st/a4norm_bg.wasm' });
+    self.postMessage({ ready: true });
+  } else if (d.frame) {
+    const t = performance.now();
+    const r = m.detect(new Uint8Array(d.frame), d.w, d.h);
+    self.postMessage({ kind: r.kind, quads: Array.from(r.quads), ms: performance.now() - t });
+  } else if (d.shoot) {
+    const r = m.process([{ name: 'camera.jpg', bytes: new Uint8Array(d.shoot) }], ['--format', 'jpg', '--dpi', '200'], () => {});
+    self.postMessage({ page: r.pages[0].jpg, report: r.report });
+  }
+};`], { type: 'text/javascript' })), { type: 'module' });
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const status = document.getElementById('status');
+const shoot = document.getElementById('shoot');
+const small = document.createElement('canvas');
+const sctx = small.getContext('2d', { willReadFrequently: true });
+let shown = null, lastSeen = 0, busy = false;
+
+function sendFrame() {
+  if (busy || video.readyState < 2) return;
+  const k = SIDE / Math.max(video.videoWidth, video.videoHeight);
+  small.width = Math.round(video.videoWidth * k);
+  small.height = Math.round(video.videoHeight * k);
+  sctx.drawImage(video, 0, 0, small.width, small.height);
+  const px = sctx.getImageData(0, 0, small.width, small.height).data;
+  busy = true;
+  worker.postMessage({ frame: px.buffer, w: small.width, h: small.height }, [px.buffer]);
+}
+
+function draw() {
+  const r = overlay.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  if (overlay.width !== Math.round(r.width * dpr)) {
+    overlay.width = Math.round(r.width * dpr);
+    overlay.height = Math.round(r.height * dpr);
+  }
+  const ctx = overlay.getContext('2d');
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  if (shown && performance.now() - lastSeen < HOLD_MS) {
+    const sx = overlay.width / small.width, sy = overlay.height / small.height;
+    ctx.lineWidth = 3 * dpr;
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--accent');
+    ctx.fillStyle = 'rgba(61, 220, 132, 0.15)';
+    for (let q = 0; q < shown.quads.length; q += 8) {
+      ctx.beginPath();
+      for (let i = 0; i < 4; i++) ctx.lineTo(shown.quads[q + 2 * i] * sx, shown.quads[q + 2 * i + 1] * sy);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+  requestAnimationFrame(draw);
+}
+
+worker.onmessage = (e) => {
+  const d = e.data;
+  if (d.ready) {
+    shoot.disabled = false;
+    sendFrame();
+  } else if (d.kind !== undefined) {
+    busy = false;
+    status.textContent = `${d.kind} · ${d.ms.toFixed(0)} ms`;
+    if (d.kind !== 'none') {
+      // ease towards the new corners when the same kind of document is still
+      // there, jump when it changed
+      if (shown && shown.kind === d.kind && shown.quads.length === d.quads.length) {
+        shown.quads = shown.quads.map((v, i) => v + (d.quads[i] - v) * EASE);
+      } else {
+        shown = { kind: d.kind, quads: d.quads };
+      }
+      lastSeen = performance.now();
+    }
+    requestAnimationFrame(sendFrame);
+  } else if (d.page) {
+    const url = URL.createObjectURL(new Blob([d.page], { type: 'image/jpeg' }));
+    document.getElementById('result').innerHTML = `<img src="${url}"><pre>${d.report.replace(/</g, '&lt;')}</pre>`;
+    shoot.disabled = false;
+    status.textContent = 'готово';
+  }
+};
+
+shoot.onclick = () => {
+  shoot.disabled = true;
+  status.textContent = 'сканирую…';
+  const c = document.createElement('canvas');
+  c.width = video.videoWidth;
+  c.height = video.videoHeight;
+  c.getContext('2d').drawImage(video, 0, 0);
+  c.toBlob(async (b) => {
+    const buf = await b.arrayBuffer();
+    worker.postMessage({ shoot: buf }, [buf]);
+  }, 'image/jpeg', 0.92);
+};
+
+try {
+  video.srcObject = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false,
+  });
+  await video.play();
+  status.textContent = 'загружаю…';
+  worker.postMessage({ init: true });
+  requestAnimationFrame(draw);
+} catch (x) {
+  status.textContent = 'нет доступа к камере: ' + x.message;
+}
+</script>
+</html>

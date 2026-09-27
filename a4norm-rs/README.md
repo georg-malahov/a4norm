@@ -192,6 +192,21 @@ const jpg2 = m.inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
 // the size control: pages written again, four at a time in parallel
 const small = m.recompress(jpgs, { dpi: 150, quality: 60, gray: false });
 // small: [{ jpg, dpi }]; dpi only ever goes down
+// the camera's live outline: a video frame drawn to a ~600 px canvas
+const { kind, quads } = m.detect(ctx.getImageData(0, 0, w, h).data, w, h);
+// kind: "sheet" | "receipt" | "cards" | "spread" | "none"; quads: 8 numbers
+// a quad, corners clockwise from the top left, in the canvas's pixels
+```
+
+`detect` runs the scan's own finder on one frame, so the outline drawn over
+the camera is the one the scan will take. At 600 px it takes 110-220 ms on
+one thread (Chromium, an M-series Mac), about five frames a second. Keep it
+in a worker, send the next frame when the last answer is back, and ease the
+corners between answers so the outline does not shimmer.
+`web/check/camera.html` does all that, and scans a still with `process`:
+
+```sh
+node web/check/server.mjs 8765 &   # then open http://localhost:8765/camera.html
 ```
 
 - **`inpaint`** fills the spots by push-pull. The known pixels are averaged

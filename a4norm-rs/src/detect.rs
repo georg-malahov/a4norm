@@ -2020,8 +2020,10 @@ pub fn outline(img: &dyn Pix) -> Option<Outline> {
             }
             let n = (l as usize / 2).max(8);
             let mut best_k = (i64::MIN, 0i64, 0i64);
-            for da in -OUTLINE_SETTLE..=OUTLINE_SETTLE {
-                for db in -OUTLINE_SETTLE..=OUTLINE_SETTLE {
+            // outwards only: a line a few pixels inside the edge lets the
+            // desk in at worst, one moved inwards can cut into the print
+            for da in -OUTLINE_SETTLE..=0 {
+                for db in -OUTLINE_SETTLE..=0 {
                     let (a2, b2) = ((a.0 + nx * da as f64, a.1 + ny * da as f64), (b.0 + nx * db as f64, b.1 + ny * db as f64));
                     let sum: i64 = (0..n)
                         .map(|i| {

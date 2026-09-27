@@ -15,6 +15,9 @@
 //! // small = [{ jpg: Uint8Array, dpi }, ...]
 //! // the Edit panel's rotate: quarter turns clockwise
 //! const turned = rotate(jpg, 1, 88);
+//!
+//! // camera preview: the document in a video frame drawn to a ~600 px canvas
+//! const { kind, quads } = detect(ctx.getImageData(0, 0, w, h).data, w, h);
 //! ```
 
 use crate::{encode_page, io, parse_args, run, Source};
@@ -140,4 +143,33 @@ pub fn rotate(jpg: Vec<u8>, quarter_turns: i32, quality: Option<u8>) -> Result<U
     let q = quality.unwrap_or(crate::Opts::default().quality);
     let out = crate::edit::rotate(&jpg, quarter_turns, q).map_err(|e| JsValue::from_str(&e.0))?;
     Ok(Uint8Array::from(out.as_slice()))
+}
+
+/// Camera preview: what a scan of this video frame would take, found the same
+/// way. `rgba` is a canvas's ImageData, `w`×`h`; about 600 px on the long side
+/// is enough, the finder works at that size. Returns `{ kind, quads }`:
+/// `kind` is "sheet", "receipt", "cards", "spread" or "none", and `quads`
+/// holds 8 numbers per quad, its corners clockwise from the top left in the
+/// frame's pixels (a spread: its two pages; cards: one quad each).
+#[wasm_bindgen]
+pub fn detect(rgba: &[u8], w: u32, h: u32) -> Result<Object, JsValue> {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return Err(JsValue::from_str("detect: rgba must hold w*h*4 bytes"));
+    }
+    let px: Vec<u8> = rgba[..w * h * 4].chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let src = crate::img::Src { w, h, px };
+    let o = crate::Opts::default();
+    let mut report = vec![];
+    let (kind, quads): (&str, Vec<crate::detect::Quad>) = match crate::page::locate(&src, &o, &mut report) {
+        Ok(crate::page::Found::Sheet(q, why)) => (if why.ends_with(crate::detect::RECEIPT) { "receipt" } else { "sheet" }, vec![q]),
+        Ok(crate::page::Found::Cards(qs, _)) => ("cards", qs),
+        Ok(crate::page::Found::Spread(s)) => ("spread", s.quads.to_vec()),
+        _ => ("none", vec![]),
+    };
+    let flat: Vec<f32> = quads.iter().flat_map(|q| q.iter().flat_map(|p| [p.0 as f32, p.1 as f32])).collect();
+    let out = Object::new();
+    set(&out, "kind", &JsValue::from_str(kind));
+    set(&out, "quads", &js_sys::Float32Array::from(flat.as_slice()).into());
+    Ok(out)
 }
