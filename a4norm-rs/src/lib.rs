@@ -12,6 +12,7 @@ pub mod finish;
 pub mod img;
 pub mod io;
 pub mod ops;
+pub mod magic;
 pub mod page;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -95,6 +96,7 @@ pub struct Opts {
     pub no_despeckle: bool,
     pub no_keep_photo: bool,
     pub no_flatten_paper: bool,
+    pub magic: bool,
 }
 
 impl Default for Opts {
@@ -159,6 +161,7 @@ impl Default for Opts {
             no_despeckle: false,
             no_keep_photo: false,
             no_flatten_paper: false,
+            magic: false,
         }
     }
 }
@@ -201,6 +204,7 @@ pub fn parse_args(args: &[String]) -> Result<Opts, Fail> {
         ("--no-despeckle", |o| o.no_despeckle = true),
         ("--no-keep-photo", |o| o.no_keep_photo = true),
         ("--no-flatten-paper", |o| o.no_flatten_paper = true),
+        ("--magic", |o| o.magic = true),
     ];
     while i < args.len() {
         let a = &args[i];

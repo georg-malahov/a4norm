@@ -764,6 +764,9 @@ fn clean_specks(page: &mut Img, dpi: usize) -> f64 {
 }
 
 const PATCH_MONO: u8 = 20;
+/// A face photo on a sheet stands upright or square (the corpus: 0.69-1.03
+/// wide to tall); a wide dark block is a shadow or a band of print.
+const FACE_ASPECT: (f64, f64) = (0.5, 1.3);
 
 /// A face photo kept for the end: its crop from the page before the
 /// flat-field, its box, and that page's paper level.
@@ -1159,7 +1162,7 @@ fn spread_photo_box(job: &Job) -> Option<(i64, i64, i64, i64)> {
 }
 
 fn keep_face_photo(job: &mut Job, spread: bool) -> Option<Keep> {
-    let bx = if spread { spread_photo_box(job) } else { d::find_photo_block(&job.cur, None, None, None, None) }?;
+    let bx = if spread { spread_photo_box(job) } else { d::find_photo_block(&job.cur, None, None, None, Some(FACE_ASPECT)) }?;
     let (pw0, ph0) = (job.cur.w, job.cur.h);
     job.say(format!(
         "face photo at {}x{}+{}+{} of {}x{} — toned on its own, not flattened into the paper",
@@ -1404,7 +1407,13 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     }
     orient(&mut job);
     let mut t = if rectified { Trim { flags: [false; 4], span: (0, 0), shave: (0, 0) } } else { trim_border(&mut job) };
-    let copy = spread.is_some() && !o.spread_scan;
+    // a white sheet bent in the hand reads as one paper region folded in the
+    // middle: its two halves are still rectified apart, but it is paper
+    let bent_sheet = o.magic && spread.as_ref().is_some_and(|s| s.why.contains("folded in the middle") && !s.why.contains("paper mask"));
+    if bent_sheet {
+        job.say("the folded region is white paper: a sheet bent in two, cleaned as paper".into());
+    }
+    let copy = spread.is_some() && !o.spread_scan && !bent_sheet;
     if copy {
         let w = job.cur.w;
         let mut c = copy_tone(&job.cur, w, None);
@@ -1413,8 +1422,18 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         job.say("colour copy: light evened, tint and security print kept, nothing whitened".into());
     }
     let mut keep = if o.no_keep_photo || copy || receipt { None } else { keep_face_photo(&mut job, spread.is_some()) };
+    // the magic paper is for paper: a page with a face photo is an ID's, and
+    // keeps its security print as the classic path leaves it
+    let magic = o.magic && keep.is_none();
+    if o.magic && !magic {
+        job.say("a face photo on the page: an ID, left to the classic paper".into());
+    }
     if !copy {
-        finish::flat_field(&mut job.cur, o);
+        if magic {
+            crate::magic::divide_paper(&mut job.cur);
+        } else {
+            finish::flat_field(&mut job.cur, o);
+        }
         step("flat");
     }
     if !o.no_deskew && !rectified {
@@ -1431,7 +1450,15 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         step("ink");
     }
     if !copy {
-        finish::tone(&mut job.cur, o);
+        if magic {
+            let ink = crate::magic::ink_or_paper(&mut job.cur);
+            job.say(format!("magic paper: shadows divided out by the paper's own light, {:.1}% of the page kept as ink, the rest white", ink));
+            if let Some((shift, lines)) = crate::magic::straighten(&mut job.cur) {
+                job.say(format!("bent lines straightened: {} lines of text, moved by up to {:.0} px", lines, shift));
+            }
+        } else {
+            finish::tone(&mut job.cur, o);
+        }
         step("tone");
     }
     let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy);
