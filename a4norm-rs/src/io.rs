@@ -10,13 +10,20 @@ use std::io::Cursor;
 /// A photo's bytes -> the upright photo as RGB bytes, as `magick
 /// -auto-orient` gives it.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Src, Fail> {
+    decode_at_least(bytes, name, None)
+}
+
+/// A photo decoded no smaller than `side` on its short side where that is
+/// cheaper: a JPEG's DCT scaled by 1/2, 1/4 or 1/8 as it is decoded, as
+/// libjpeg's scale_denom does. Other formats decode whole. EXIF applied.
+pub fn decode_at_least(bytes: &[u8], name: &str, side: Option<u16>) -> Result<Src, Fail> {
     let err = |e: &dyn std::fmt::Display| Fail(format!("a4norm: cannot read {}: {}", name, e));
     let reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| err(&e))?;
     let mut dec = reader.into_decoder().map_err(|e| err(&e))?;
     let orient = dec.orientation().unwrap_or(Orientation::NoTransforms);
     let (w, h, px) = if bytes.starts_with(&[0xFF, 0xD8]) {
         drop(dec);
-        jpeg(bytes).map_err(|e| err(&e))?
+        jpeg(bytes, side).map_err(|e| err(&e))?
     } else {
         let rgb = DynamicImage::from_decoder(dec).map_err(|e| err(&e))?.into_rgb8();
         (rgb.width() as usize, rgb.height() as usize, rgb.into_raw())
@@ -55,9 +62,12 @@ pub fn orient_px(s: Src, o: Orientation) -> Src {
 }
 
 /// A JPEG's pixels through jpeg-decoder, as RGB bytes.
-fn jpeg(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), jpeg_decoder::Error> {
+fn jpeg(bytes: &[u8], side: Option<u16>) -> Result<(usize, usize, Vec<u8>), jpeg_decoder::Error> {
     use jpeg_decoder::PixelFormat;
     let mut d = jpeg_decoder::Decoder::new(Cursor::new(bytes));
+    if let Some(s) = side {
+        d.scale(s, s)?;
+    }
     let px = d.decode()?;
     let info = d.info().unwrap();
     let (w, h) = (info.width as u32, info.height as u32);

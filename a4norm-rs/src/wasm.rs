@@ -16,6 +16,8 @@
 //! // the Edit panel's rotate: quarter turns clockwise
 //! const turned = rotate(jpg, 1, 88);
 //!
+//! // the tray: a photo's thumbnail, EXIF applied, a JPEG decoded at 1/2..1/8
+//! const thumb = thumbnail(bytes, 320, 80);
 //! // camera preview: the document in a video frame drawn to a ~600 px canvas
 //! const { kind, quads } = detect(ctx.getImageData(0, 0, w, h).data, w, h);
 //! ```
@@ -172,4 +174,13 @@ pub fn detect(rgba: &[u8], w: u32, h: u32) -> Result<Object, JsValue> {
     set(&out, "kind", &JsValue::from_str(kind));
     set(&out, "quads", &js_sys::Float32Array::from(flat.as_slice()).into());
     Ok(out)
+}
+
+/// A photo's thumbnail as a JPEG, `max_side` px on its long side at most,
+/// turned by its EXIF. A JPEG is decoded straight at 1/2, 1/4 or 1/8 of its
+/// size; PNG and WebP decode whole. `quality` defaults to 80.
+#[wasm_bindgen]
+pub fn thumbnail(bytes: &[u8], max_side: u32, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
+    let out = crate::edit::thumbnail(bytes, max_side as usize, quality.unwrap_or(80)).map_err(|e| JsValue::from_str(&e.0))?;
+    Ok(Uint8Array::from(out.as_slice()))
 }
