@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><title>a4norm pool life</title>
+<script type="module">
+// The thread pool's life on a page, for life.mjs. The module runs in a
+// worker, as on malahov.io; a scan; then what `mode` asks:
+//   keep     the pool stays (what a page did before releaseThreadPool)
+//   release  the pool is released after the scan, and awaited
+//   hide     the pool stays; pagehide asks the worker to release it
+//   hidden   the pool stays; visibilitychange to hidden asks for the release
+//   cycle    release, init again, scan again, release, scan with no pool
+// life.html?build=mt&threads=N&mode=MODE&files=/examples/a.jpg,/photos/b.jpg
+const q = new URLSearchParams(location.search);
+const src = `
+let m;
+const hash = async (r) => {
+  const pdf = m.pack(r.pages.map((p) => p.jpg), new Uint32Array(r.pages.map((p) => p.dpi)), false);
+  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', pdf))).slice(0, 6).map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+self.onmessage = async (e) => { try {
+  const d = e.data;
+  if (d.type === 'release') { if (m && m.releaseThreadPool) m.releaseThreadPool(); return; }
+  const { build, threads, files, mode } = d;
+  const args = ['--format', 'jpg', '--dpi', '200'];
+  const base = self.location.origin + '/dist/' + build + '/';
+  m = await import(base + 'a4norm.js');
+  await m.default({ module_or_path: base + 'a4norm_bg.wasm' });
+  const got = await Promise.all(files.map(async (n) => ({ name: n.split('/').pop(), bytes: new Uint8Array(await (await fetch(self.location.origin + n)).arrayBuffer()) })));
+  const ms = {}, hashes = {};
+  const time = async (k, f) => { const t = performance.now(); const r = await f(); ms[k] = Math.round(performance.now() - t); return r; };
+  const scan = async (k) => { hashes[k] = await hash(await time(k, () => m.process(got, args, null))); };
+  if (build === 'mt') await time('init', () => m.initThreadPool(threads));
+  await scan('scan');
+  if (mode === 'release' || mode === 'cycle') await time('release', () => m.releaseThreadPool());
+  if (mode === 'cycle') {
+    await time('reinit', () => m.initThreadPool(threads));
+    await scan('scan2');
+    await time('release2', () => m.releaseThreadPool());
+    await time('release3', () => m.releaseThreadPool());
+    await scan('scan1t');
+  }
+  self.postMessage({ ms, hashes });
+} catch (x) { self.postMessage({ error: String(x && x.stack || x) }); } };`;
+const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), { type: 'module' });
+w.onmessage = (e) => { window.done = e.data; };
+w.onerror = (e) => { window.done = { error: e.message || String(e) }; };
+if (q.get('mode') === 'hide') addEventListener('pagehide', () => w.postMessage({ type: 'release' }));
+if (q.get('mode') === 'hidden') document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') w.postMessage({ type: 'release' }); });
+w.postMessage({ build: q.get('build') || 'mt', threads: +(q.get('threads') || navigator.hardwareConcurrency), files: (q.get('files') || '').split(','), mode: q.get('mode') || 'keep' });
+</script>

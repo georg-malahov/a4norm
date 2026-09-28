@@ -3,7 +3,8 @@
 #   st/  one thread, runs anywhere (a page that is not cross-origin isolated,
 #        the Telegram web client's iframe, an old browser)
 #   mt/  rayon over Web Workers; needs SharedArrayBuffer, so a page served
-#        with COOP same-origin + COEP require-corp
+#        with COOP same-origin + COEP require-corp. The pool can be let go:
+#        releaseThreadPool() (src/pool.rs)
 # Same output from both, byte for byte: the work is split by rows and
 # channels, and nothing depends on which thread did what.
 #
@@ -32,12 +33,8 @@ RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 $LI
     --features wasm-threads --target-dir target/wasm-mt -Z build-std=panic_abort,std
 wasm-bindgen --target web --out-dir "$OUT/mt" --out-name a4norm "target/wasm-mt/$BG"
 
-# The pool's workers load the main module as '../../..', which a bundler
-# resolves and a plain static server answers with 404 (it is a directory):
-# the pool then waits forever. Name the file.
-sed -i.bak "s|import('../../..')|import('../../../a4norm.js')|" "$OUT"/mt/snippets/*/src/workerHelpers.js
-rm -f "$OUT"/mt/snippets/*/src/workerHelpers.js.bak
-grep -q "import('../../../a4norm.js')" "$OUT"/mt/snippets/*/src/workerHelpers.js
+# The pool's workers (src/pool.js) load the main module three levels up.
+grep -q "import('../../../a4norm.js')" "$OUT"/mt/snippets/*/src/pool.js
 
 rm -f "$OUT"/*/*.d.ts
 # Node reads a bare .js as CommonJS; the modules are ES, which a browser

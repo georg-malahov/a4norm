@@ -14,6 +14,8 @@ pub mod io;
 pub mod ops;
 pub mod magic;
 pub mod page;
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+pub mod pool;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 

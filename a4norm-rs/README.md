@@ -9,6 +9,8 @@ One crate builds three things:
 - **`web/dist/st`**, WebAssembly on one thread, for any browser.
 - **`web/dist/mt`**, WebAssembly on a rayon pool over Web Workers, for a page
   served cross-origin isolated (COOP `same-origin` + COEP `require-corp`).
+  The pool can be released between runs, see
+  [docs/threads.md](docs/threads.md).
 
 There is no ImageMagick inside and no Python.
 - Photos decode in Rust: JPEG, PNG and WebP, with the EXIF turn applied.
@@ -172,7 +174,7 @@ web/build.sh                                   # web/dist/{st,mt}
 nightly toolchain with `rust-src`, because atomics need a std built with them.
 It also:
 - links the threaded build with a shared, imported memory (max 512 MiB);
-- names the pool worker's module path, which a plain static server needs.
+- checks that the pool's worker (`src/pool.js`) finds the module.
 
 ## Check
 
@@ -187,6 +189,9 @@ node web/check/server.mjs 8765 &
 node web/check/run.mjs chromium /examples/landing-invoice.webp /examples/specimen-card-front.jpg,/examples/specimen-card-back.jpg
 ```
 
+- `web/check/life.mjs` follows the thread pool over page loads: the times of
+  init and release, and the CPU a reload leaves busy in WebKit
+  ([docs/threads.md](docs/threads.md)).
 - `A4MEM=1 a4norm ...` prints the peak memory of each stage.
 
 ## The browser API
@@ -200,6 +205,8 @@ const r = m.process([{ bytes, name }], ['--format', 'jpg', '--dpi', '200'],
 // r.pages: [{ jpg, dpi }] (dpi also in each JPEG's JFIF header)
 // r.report: the command line's stdout, "card: 1 ID-1 card ..." included
 const pdf = m.pack(jpgs, new Uint32Array(dpis), gray);
+// mt: the threads leave and their workers close; initThreadPool starts again
+await m.releaseThreadPool();
 
 // the Edit panel's rotate: quarter turns clockwise, dpi kept
 const turned = m.rotate(jpg, 1, 88);
