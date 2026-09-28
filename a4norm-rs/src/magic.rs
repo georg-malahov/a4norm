@@ -89,8 +89,9 @@ fn background(p: &Plane, block: usize) -> Plane {
 /// Step 1: each channel divided by the paper's light in it.
 pub fn divide_paper(img: &mut Img) {
     let block = (img.w.min(img.h) / 36).max(16);
-    for p in img.c.iter_mut() {
-        let bg = background(p, block);
+    // the channels' backgrounds side by side
+    let bgs = ops::par_map(img.c.len(), |k| background(&img.c[k], block));
+    for (p, bg) in img.c.iter_mut().zip(bgs) {
         let w = p.w;
         ops::rows(&mut p.d, w, |y, row| {
             for (v, &b) in row.iter_mut().zip(bg.row(y)) {
@@ -298,7 +299,7 @@ fn fill_rules(ink: &mut [u8], n: &Plane, level: &[f32], w: usize, h: usize) {
 /// desk, a shadow, a curled rim) with a margin round them, then whatever
 /// still touches the border only a little way in. Text a little in from the
 /// edge (a footer, a publisher's line) touches nothing and stays.
-fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
+fn off_border(ink: &mut [u8], n: &Plane, chroma: &(dyn Fn(usize) -> f32 + Sync), w: usize, h: usize) {
     let r = (w.min(h) / THICK_DIV).max(3);
     let thick = box_morph(&box_morph(ink, w, h, r, r, false), w, h, r, r, true);
     let touch = |x0: usize, x1: usize, y0: usize, y1: usize| x0 <= BORDER_TOUCH || y0 <= BORDER_TOUCH || x1 + BORDER_TOUCH >= w - 1 || y1 + BORDER_TOUCH >= h - 1;
@@ -335,44 +336,6 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
             *v = 0;
         }
     }
-    let depth = (w.min(h) as f64 * BORDER_DEPTH) as usize;
-    for comp in crate::detect::components(ink, w, h) {
-        let (x0, x1, y0, y1) = bbox(&comp);
-        let shallow = (x0 <= BORDER_TOUCH && x1 <= depth)
-            || (x1 + BORDER_TOUCH >= w - 1 && x0 + depth >= w - 1)
-            || (y0 <= BORDER_TOUCH && y1 <= depth)
-            || (y1 + BORDER_TOUCH >= h - 1 && y0 + depth >= h - 1);
-        // grey blotches near a side: shade, not print (print is dark after
-        // the division, a pencil mark is thin and away from the side)
-        let z = (w.min(h) as f64 * GREY_ZONE) as usize;
-        // lying wholly by a side, not merely reaching it
-        let near = y0 + 2 * z >= h - 1 || y1 <= 2 * z || x1 <= 2 * z || x0 + 2 * z >= w - 1;
-        // and larger than a letter: small grey print (an address, a
-        // footer) sits near a side too
-        let big = comp.len() as f64 >= (w.min(h) as f64 * BLOT_MIN).powi(2);
-        let grey = near && big && {
-            let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[v.len() / 2] > GREY_BLOT
-        };
-        // thin pieces along a side close to it: the sheet's own edge line
-        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
-        let thin = (w.min(h) as f64 * EDGE_THIN) as usize;
-        let zl = (w.min(h) as f64 * EDGE_LINE_ZONE) as usize;
-        let edge_line = (bh <= thin && bw >= 3 * bh && (y1 + zl >= h - 1 || y0 <= zl)) || (bw <= thin && bh >= 3 * bw && (x1 + zl >= w - 1 || x0 <= zl));
-        if shallow || edge_line {
-            for i in comp {
-                ink[i] = 0;
-            }
-        } else if grey {
-            // its grey goes; letters inside it, darker, stay
-            for i in comp {
-                if n.d[i] > EDGE_TEXT {
-                    ink[i] = 0;
-                }
-            }
-        }
-    }
     // a grey band along a side, thick and long, that print runs into (staff
     // lines, a table's rules): the sheet's rim, cut out of what it touches.
     // Thin rules and dark print survive.
@@ -404,40 +367,96 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
             }
         }
     }
-    // a fold's crease: a long thin grey line that runs on into a margin (a
-    // printed rule keeps off the margins, and is dark)
+    // then each piece of ink once, whatever it is
+    let depth = (w.min(h) as f64 * BORDER_DEPTH) as usize;
+    let z = (w.min(h) as f64 * GREY_ZONE) as usize;
+    let blot = (w.min(h) as f64 * BLOT_MIN).powi(2);
+    let thin = (w.min(h) as f64 * EDGE_THIN) as usize;
+    let zl = (w.min(h) as f64 * EDGE_LINE_ZONE) as usize;
     let margin_x = (w as f64 * RULE_MARGIN) as usize;
     let margin_y = (h as f64 * RULE_MARGIN) as usize;
     let crease_thin = (w.min(h) as f64 * CREASE_THIN) as usize;
+    let speck = (w.min(h) / SPECK_DIV).max(2);
+    let crumb = speck * CRUMB_K;
+    let band = (w.min(h) as f64 * EDGE_BAND) as usize;
+    let median = |comp: &[usize]| {
+        let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
     for comp in crate::detect::components(ink, w, h) {
         let (x0, x1, y0, y1) = bbox(&comp);
         let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
-        // thin on average (a crease wavers, so its box is taller than it)
-        let across = bw as f64 >= CREASE_LONG * w as f64 && comp.len() <= crease_thin * bw && bh as f64 <= CREASE_WAVE * h as f64 && (x0 <= margin_x || x1 + margin_x >= w);
-        let down = bh as f64 >= CREASE_LONG * h as f64 && comp.len() <= crease_thin * bh && bw as f64 <= CREASE_WAVE * w as f64 && (y0 <= margin_y || y1 + margin_y >= h);
-        if !(across || down) {
+        // grain that passed for ink in a deep shadow, and small coloured
+        // crumbs: the back's print through a fold, tinted by the light
+        let speckle = comp.len() <= speck || (comp.len() <= crumb && comp.iter().map(|&i| chroma(i)).sum::<f32>() / comp.len() as f32 > TINT);
+        // touching the border only a little way in
+        let shallow = (x0 <= BORDER_TOUCH && x1 <= depth)
+            || (x1 + BORDER_TOUCH >= w - 1 && x0 + depth >= w - 1)
+            || (y0 <= BORDER_TOUCH && y1 <= depth)
+            || (y1 + BORDER_TOUCH >= h - 1 && y0 + depth >= h - 1);
+        // thin pieces along a side close to it: the sheet's own edge line
+        let edge_line = (bh <= thin && bw >= 3 * bh && (y1 + zl >= h - 1 || y0 <= zl)) || (bw <= thin && bh >= 3 * bw && (x1 + zl >= w - 1 || x0 <= zl));
+        // a rim runs along the side: long along it, thin across (a line of
+        // small print at the foot is neither)
+        let (along_v, along_h) = (bh >= RIM_LONG * bw, bw >= RIM_LONG * bh);
+        let rim = (along_v && x0 <= band && x1 <= 2 * band)
+            || (along_v && x1 + band >= w - 1 && x0 + 2 * band >= w - 1)
+            || (along_h && y0 <= band && y1 <= 2 * band)
+            || (along_h && y1 + band >= h - 1 && y0 + 2 * band >= h - 1);
+        if speckle || shallow || edge_line || rim {
+            for i in comp {
+                ink[i] = 0;
+            }
             continue;
         }
-        let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        if v[v.len() / 2] > CREASE_GREY {
-            // its grey goes; letters it runs through, darker, stay
+        // grey blots lying wholly by a side, larger than a letter: shade
+        // (print is dark after the division; small grey print, an address or
+        // a footer, sits near a side too)
+        let near = y0 + 2 * z >= h - 1 || y1 <= 2 * z || x1 <= 2 * z || x0 + 2 * z >= w - 1;
+        let grey = near && comp.len() as f64 >= blot && median(&comp) > GREY_BLOT;
+        // a fold's crease: long, thin on average (it wavers), running into a
+        // margin, grey (a printed rule keeps off the margins, and is dark)
+        let across = bw as f64 >= CREASE_LONG * w as f64 && comp.len() <= crease_thin * bw && bh as f64 <= CREASE_WAVE * h as f64 && (x0 <= margin_x || x1 + margin_x >= w);
+        let down = bh as f64 >= CREASE_LONG * h as f64 && comp.len() <= crease_thin * bh && bw as f64 <= CREASE_WAVE * w as f64 && (y0 <= margin_y || y1 + margin_y >= h);
+        let crease = (across || down) && median(&comp) > CREASE_GREY;
+        if grey || crease {
+            // its grey goes; letters inside it, darker, stay
+            let keep = if crease { CREASE_TEXT } else { EDGE_TEXT };
             for i in comp {
-                if n.d[i] > CREASE_TEXT {
+                if n.d[i] > keep {
                     ink[i] = 0;
                 }
             }
         }
     }
-    // once the shade is gone, the sheet's edge line it hid is on its own
-    let thin = (w.min(h) as f64 * EDGE_THIN) as usize;
-    let zl = (w.min(h) as f64 * EDGE_LINE_ZONE) as usize;
-    for comp in crate::detect::components(ink, w, h) {
-        let (x0, x1, y0, y1) = bbox(&comp);
-        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
-        if (bh <= thin && bw >= 3 * bh && (y1 + zl >= h - 1 || y0 <= zl)) || (bw <= thin && bh >= 3 * bw && (x1 + zl >= w - 1 || x0 <= zl)) {
-            for i in comp {
-                ink[i] = 0;
+    // once the shade is gone, the sheet's edge line it hid stands alone: the
+    // strips along the sides looked at again
+    for side in 0..4 {
+        let (cx0, cy0, cw, ch) = match side {
+            0 => (0, 0, zl.min(w), h),
+            1 => (w.saturating_sub(zl), 0, zl.min(w), h),
+            2 => (0, 0, w, zl.min(h)),
+            _ => (0, h.saturating_sub(zl), w, zl.min(h)),
+        };
+        if cw == 0 || ch == 0 {
+            continue;
+        }
+        let crop: Vec<u8> = (0..ch).flat_map(|y| ink[(cy0 + y) * w + cx0..(cy0 + y) * w + cx0 + cw].iter().copied()).collect();
+        for comp in crate::detect::components(&crop, cw, ch) {
+            let (mut x0, mut x1, mut y0, mut y1) = (cw, 0, ch, 0);
+            for &i in &comp {
+                x0 = x0.min(i % cw);
+                x1 = x1.max(i % cw);
+                y0 = y0.min(i / cw);
+                y1 = y1.max(i / cw);
+            }
+            let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+            let line = if side < 2 { bw <= thin && bh >= 3 * bw } else { bh <= thin && bw >= 3 * bh };
+            if line {
+                for i in comp {
+                    ink[(cy0 + i / cw) * w + cx0 + i % cw] = 0;
+                }
             }
         }
     }
@@ -505,15 +524,19 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     let cells: [Vec<f32>; 3] = std::array::from_fn(|k| bands.iter().flat_map(|b| b[k].iter().copied()).collect());
     // as shares of a cell, which the resize keeps within 0..1
     let per = 1.0 / (GRAIN_CELL * GRAIN_CELL) as f32;
-    let up = |d: Vec<f32>| ops::resize(&blur(&Plane { w: qw, h: qh, d: d.iter().map(|v| v * per).collect() }, GRAIN_SIGMA / GRAIN_CELL as f64), w, h, Filter::Triangle);
+    let sm = |d: Vec<f32>| blur(&Plane { w: qw, h: qh, d: d.iter().map(|v| v * per).collect() }, GRAIN_SIGMA / GRAIN_CELL as f64);
     let [dev, cnt, lit] = cells;
-    let (dev, cnt, lit) = (up(dev), up(cnt), up(lit));
-    let grain: Vec<f32> = dev.d.iter().zip(&cnt.d).map(|(&d, &c)| 1.25 * d / c.max(1e-3)).collect();
-    let thr: Vec<f32> = grain.iter().map(|&g| 1.0 - (GRAIN_K * g).max(INK_MIN)).collect();
-    // and its own level there, which a slow shade left after the division
-    // keeps a little under white
-    let level: Vec<f32> = lit.d.iter().zip(&cnt.d).map(|(&l, &c)| if c > 1e-3 { l / c } else { 1.0 }).collect();
+    let (dev, cnt, lit) = (sm(dev), sm(cnt), sm(lit));
+    // the grain and the level on the cells, then brought up to the page
+    let g_c: Vec<f32> = dev.d.iter().zip(&cnt.d).map(|(&d, &c)| 1.25 * d / c.max(1e-3)).collect();
+    let l_c: Vec<f32> = lit.d.iter().zip(&cnt.d).map(|(&l, &c)| if c > 1e-3 { (l / c).min(1.0) } else { 1.0 }).collect();
     drop((dev, cnt, lit));
+    let (grain, level) = ops::par_map(2, |k| ops::resize(&Plane { w: qw, h: qh, d: if k == 0 { g_c.clone() } else { l_c.clone() } }, w, h, Filter::Triangle).d)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold((vec![], vec![]), |(a, b), v| if a.is_empty() { (v, b) } else { (a, v) });
+    let thr: Vec<f32> = grain.iter().map(|&g| 1.0 - (GRAIN_K * g).max(INK_MIN)).collect();
     mark("  ip: grain+level blurs");
     // an edge next to it: Sobel of the slightly blurred page
     let b = blur(&n, 1.0);
@@ -580,29 +603,35 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     mark("  ip: along");
     let lift = ((2 * LINE_REACH + 1) as f32).sqrt();
     let mut rules = vec![0u8; w * h];
-    let ink: Vec<u8> = (0..w * h)
-        .map(|i| {
-            // coloured ink (a stamp, a blue pen) is kept however pale: a
-            // shadow is grey. Its colour is the ink's hue against the light
-            // around it, and it is a mark, with an edge near: a warm or
-            // tinted light over a fold is neither
-            let tint = img.c.len() == 3 && {
-                let (r, g, b) = (img.c[0].d[i], img.c[1].d[i], img.c[2].d[i]);
-                let c = r.max(g).max(b) - r.min(g).min(b);
-                // strongly coloured (a stamp's pale fill), or coloured, dark
-                // enough and marked
-                c > 2.0 * TINT || (c > TINT && near[i] != 0 && n.d[i] < level[i] - TINT_DARK)
-            };
-            ((n.d[i] < thr[i] && near[i] != 0) || tint) as u8
-        })
-        .collect();
+    let ink: Vec<u8> = ops::par_map(h, |y| {
+        (y * w..(y + 1) * w)
+            .map(|i| {
+                // coloured ink (a stamp, a blue pen) is kept however pale: a
+                // shadow is grey. Its colour is the ink's hue against the
+                // light around it, and it is a mark, with an edge near: a
+                // warm or tinted light over a fold is neither
+                let tint = img.c.len() == 3 && {
+                    let (r, g, b) = (img.c[0].d[i], img.c[1].d[i], img.c[2].d[i]);
+                    let c = r.max(g).max(b) - r.min(g).min(b);
+                    // strongly coloured (a stamp's pale fill), or coloured,
+                    // dark enough and marked
+                    c > 2.0 * TINT || (c > TINT && near[i] != 0 && n.d[i] < level[i] - TINT_DARK)
+                };
+                ((n.d[i] < thr[i] && near[i] != 0) || tint) as u8
+            })
+            .collect::<Vec<u8>>()
+    })
+    .concat();
     mark("  ip: ink map");
     // a rule is dark along itself and light across: a stain is dark both ways
-    for i in 0..w * h {
-        let step = (LINE_K * grain[i] / lift).max(LINE_MIN);
-        let (dh, dv) = (hl[i] < level[i] - step, vl[i] < level[i] - step);
-        rules[i] = ((dh != dv) && n.d[i] < level[i] - step) as u8;
-    }
+    ops::rows(&mut rules, w, |y, row| {
+        for (x, r) in row.iter_mut().enumerate() {
+            let i = y * w + x;
+            let step = (LINE_K * grain[i] / lift).max(LINE_MIN);
+            let (dh, dv) = (hl[i] < level[i] - step, vl[i] < level[i] - step);
+            *r = ((dh != dv) && n.d[i] < level[i] - step) as u8;
+        }
+    });
     // a rule runs on: short bits of it are a shade's edge or the grain
     let long = (w.min(h) as f64 * RULE_LONG) as usize;
     let mut ink = ink;
@@ -633,13 +662,6 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     // what comes in from the page's border: the desk, a shadow or the curled
     // rim a rectify left along a side, dark and thick, and whatever touches
     // the border only a little way in
-    off_border(&mut ink, &n, w, h);
-    mark("  ip: off border");
-    // grain that passed for ink in a deep shadow: specks of a few pixels
-    let speck = (w.min(h) / SPECK_DIV).max(2);
-    // and small coloured crumbs: the back's print showing through a fold,
-    // tinted by the light (a colour mark worth keeping is larger)
-    let crumb = speck * CRUMB_K;
     let chroma = |i: usize| {
         if img.c.len() == 3 {
             let (r, g, b) = (img.c[0].d[i], img.c[1].d[i], img.c[2].d[i]);
@@ -648,41 +670,8 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
             0.0
         }
     };
-    for comp in crate::detect::components(&ink, w, h) {
-        let tinted = comp.len() <= crumb && comp.iter().map(|&i| chroma(i)).sum::<f32>() / comp.len() as f32 > TINT;
-        if comp.len() <= speck || tinted {
-            for i in comp {
-                ink[i] = 0;
-            }
-        }
-    }
-    // what lies along the page's own edge, thin across it: the sheet's rim,
-    // a curl, a shadow line the rectify left
-    let band = (w.min(h) as f64 * EDGE_BAND) as usize;
-    for comp in crate::detect::components(&ink, w, h) {
-        let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
-        for &i in &comp {
-            x0 = x0.min(i % w);
-            x1 = x1.max(i % w);
-            y0 = y0.min(i / w);
-            y1 = y1.max(i / w);
-        }
-        // a rim runs along the side: long along it, thin across (a line of
-        // small print at the foot is neither)
-        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
-        let along_v = bh >= RIM_LONG * bw;
-        let along_h = bw >= RIM_LONG * bh;
-        let thin_left = along_v && x0 <= band && x1 <= 2 * band;
-        let thin_right = along_v && x1 + band >= w - 1 && x0 + 2 * band >= w - 1;
-        let thin_top = along_h && y0 <= band && y1 <= 2 * band;
-        let thin_bottom = along_h && y1 + band >= h - 1 && y0 + 2 * band >= h - 1;
-        if thin_left || thin_right || thin_top || thin_bottom {
-            for i in comp {
-                ink[i] = 0;
-            }
-        }
-    }
-    mark("  ip: specks+rim");
+    off_border(&mut ink, &n, &chroma, w, h);
+    mark("  ip: off border");
     let share = ink.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64 * 100.0;
     let m = morph_k(&ink, w, h, &ops::square(1), true);
     let m = blur(&Plane { w, h, d: m.iter().map(|&v| v as f32).collect() }, 0.8);
@@ -824,7 +813,7 @@ pub fn text_lines(img: &Img, min_lines: usize) -> Option<Lines> {
     let bg = Plane { w: qw, h: qh, d: morph_k(&small.d, qw, qh, &ops::square(3), true) };
     let bg = ops::resize(&blur(&bg, 2.0), w, h, Filter::Triangle);
     let ink: Vec<u8> = g.d.iter().zip(&bg.d).map(|(&v, &b)| (v < DW_INK * b.max(0.05)) as u8).collect();
-    let kx = (w / 120).max(7) as usize;
+    let kx = (w / 120).max(7);
     let c = box_morph(&box_morph(&ink, w, h, kx, 1, true), w, h, kx, 1, false);
     let c = box_morph(&box_morph(&c, w, h, kx / 2, 0, false), w, h, kx / 2, 0, true);
     let comps = crate::detect::components(&c, w, h);

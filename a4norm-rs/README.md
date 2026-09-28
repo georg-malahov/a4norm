@@ -99,6 +99,12 @@ Some things depart from the script on purpose:
   and tinted top split into two light regions is no longer taken for a
   passport spread.
 
+- **`--magic`** (opt-in) cleans a sheet of paper like a phone scanner's
+  "magic colour": shadows and grain go, the paper turns white, a sheet bent in
+  the hand is flattened by its own edges, a finger at its edge goes. Spreads,
+  cards, photos and pages with a face photo keep the classic path, so it can
+  be passed on every scan. See [docs/magic.md](docs/magic.md).
+
 The goal is pages that cannot be told apart by eye or in print, not
 bit-identity.
 

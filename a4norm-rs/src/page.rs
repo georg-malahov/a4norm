@@ -159,6 +159,49 @@ fn median(v: &mut [u8]) -> u8 {
 /// Lay a flat tone over `img`, in place, through a mask at the analysis
 /// scale, grown by `disk`, brought up to size and softened: the repaint of
 /// the border flood and of a finger. `tone(k, x, y)` is the colour there.
+/// `repaint` over the mask's own box only: a finger is a small part of a
+/// page, and the whole page need not be resized and blurred for it.
+fn repaint_local(img: &mut Img, tone: &(dyn Fn(usize, usize, usize) -> f32 + Sync), mask: &[u8], w: usize, h: usize, disk: usize) {
+    let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
+    for (i, &v) in mask.iter().enumerate() {
+        if v != 0 {
+            x0 = x0.min(i % w);
+            x1 = x1.max(i % w);
+            y0 = y0.min(i / w);
+            y1 = y1.max(i / w);
+        }
+    }
+    if x0 > x1 {
+        return;
+    }
+    let g = disk + 4;
+    let (x0, y0, x1, y1) = (x0.saturating_sub(g), y0.saturating_sub(g), (x1 + g).min(w - 1), (y1 + g).min(h - 1));
+    let (cw, ch) = (x1 - x0 + 1, y1 - y0 + 1);
+    let crop: Vec<f32> = (y0..=y1).flat_map(|y| mask[y * w + x0..=y * w + x1].iter().map(|&v| v as f32)).collect();
+    let m = ops::morph_p(&Plane { w: cw, h: ch, d: crop }, &ops::disk(disk), true, 1);
+    // the box in the page's pixels
+    let (sx, sy) = (img.w as f64 / w as f64, img.h as f64 / h as f64);
+    let (px0, py0) = ((x0 as f64 * sx) as usize, (y0 as f64 * sy) as usize);
+    let (px1, py1) = ((((x1 + 1) as f64 * sx) as usize).min(img.w), (((y1 + 1) as f64 * sy) as usize).min(img.h));
+    let m = ops::blur(&ops::resize_auto(&m, px1 - px0, py1 - py0), 2.0);
+    if img.c.len() == 1 {
+        *img = img.rgb();
+    }
+    for (k, p) in img.c.iter_mut().enumerate() {
+        let ww = p.w;
+        ops::rows(&mut p.d, ww, |y, row| {
+            if y < py0 || y >= py1 {
+                return;
+            }
+            for x in px0..px1 {
+                let a = m.d[(y - py0) * m.w + x - px0];
+                row[x] = tone(k, x, y) * a + row[x] * (1.0 - a);
+            }
+        });
+    }
+    img.q8();
+}
+
 fn repaint(img: &mut Img, tone: &(dyn Fn(usize, usize, usize) -> f32 + Sync), mask: &[u8], w: usize, h: usize, disk: usize) {
     let m = Plane { w, h, d: mask.iter().map(|&v| v as f32).collect() };
     let m = ops::morph_p(&m, &ops::disk(disk), true, 1);
@@ -370,7 +413,21 @@ pub fn erase_fingers_within(img: &mut Img, axis: Option<bool>, band: usize) -> (
     let (w0, h0) = (img.w, img.h);
     let w = side;
     let h = 1.max(py_round(side as f64 * h0 as f64 / w0 as f64)) as usize;
-    let (v, c, buf) = d::raw_rgb(img, w, h);
+    // on a sheet (band > 0) a box average is enough to see skin by, and far
+    // cheaper than the page's own resize filter
+    let (v, c, buf) = if band > 0 {
+        let small = img::resize_with(img, w, h, ops::Filter::Box).rgb().to_rgb8();
+        let mut v = vec![0u8; w * h];
+        let mut c = vec![0u8; w * h];
+        for i in 0..w * h {
+            let (r, g, b) = (small[3 * i], small[3 * i + 1], small[3 * i + 2]);
+            v[i] = r.max(g).max(b);
+            c[i] = v[i] - r.min(g).min(b);
+        }
+        (v, c, small)
+    } else {
+        d::raw_rgb(img, w, h)
+    };
     let n = w * h;
     let mut sc = c.clone();
     sc.sort_unstable();
@@ -428,7 +485,7 @@ pub fn erase_fingers_within(img: &mut Img, axis: Option<bool>, band: usize) -> (
         }
     }
     if reach.iter().any(|&r| r != 0) {
-        let g = img.resize_auto(w, h).gray();
+        let g = if band > 0 { Img::from_planes(vec![Plane { w, h, d: buf.as_chunks::<3>().0.iter().map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0).collect() }]).gray() } else { img.resize_auto(w, h).gray() };
         let sd = ops::stddev(&g, 5).bytes();
         for comp in d::components(&reach, w, h) {
             let mut vals: Vec<u8> = comp.iter().map(|&i| sd[i]).collect();
@@ -473,7 +530,11 @@ pub fn erase_fingers_within(img: &mut Img, axis: Option<bool>, band: usize) -> (
         Some(true) => tones[(x >= w0 / 2) as usize][k],
         Some(false) => tones[(y >= h0 / 2) as usize][k],
     };
-    repaint(img, &tone, &reach, w, h, 2);
+    if band > 0 {
+        repaint_local(img, &tone, &reach, w, h, 2);
+    } else {
+        repaint(img, &tone, &reach, w, h, 2);
+    }
     (true, share)
 }
 
@@ -1327,7 +1388,9 @@ fn choose_fit(job: &Job, rectified: bool, t: &Trim) -> Fit {
     Fit { pw, ph, scale, off, mode: mode.unwrap(), dpi: page_dpi, lowres }
 }
 
-fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: bool) -> (Img, usize) {
+/// `clean`: the paper is already white and the specks gone (the magic
+/// paper), so the paper screen and the despeckle have nothing to do.
+fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: bool, clean: bool) -> (Img, usize) {
     let o = job.o;
     let f = choose_fit(job, rectified, t);
     let over = keep.as_ref().and_then(|k| photo_patch(k, f.scale, f.off, o));
@@ -1345,11 +1408,11 @@ fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: b
             page.c[kk].paste(&r, f.off.0 as isize, f.off.1 as isize);
         }
     }
-    if !copy {
+    if !copy && !clean {
         finish::paper_screen(&mut page, o.paper_thr);
     }
     page.q8();
-    if !o.no_despeckle && !copy {
+    if !o.no_despeckle && !copy && !clean {
         let share = clean_specks(&mut page, f.dpi);
         if share != 0.0 {
             job.say(format!("cleaned {:.3}% of the page of specks on open paper", share));
@@ -1507,8 +1570,9 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     let mut keep = if o.no_keep_photo || copy || receipt { None } else { keep_face_photo(&mut job, spread.is_some()) };
     crate::magic::mark("face photo");
     // a finger holding the sheet, skin coming in from the edge: repainted in
-    // the paper's tone (a page with a face photo keeps all its colour)
-    if rectified && !copy && keep.is_none() && !receipt {
+    // the paper's tone, with the magic paper (a page with a face photo keeps
+    // all its colour)
+    if o.magic && rectified && !copy && keep.is_none() && !receipt {
         let (got, share) = erase_fingers_within(&mut job.cur, None, FINGER_BAND);
         if got {
             job.say(format!("erased a finger at the sheet's edge ({:.1}% of the page)", share));
@@ -1565,7 +1629,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         crate::magic::mark("tone");
         step("tone");
     }
-    let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy);
+    let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy, magic && !copy);
     crate::magic::mark("lay out");
     step("page");
     *report = job.report;
