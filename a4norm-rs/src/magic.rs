@@ -15,6 +15,27 @@
 //!    pressed a little darker.
 
 use crate::img::Img;
+
+/// A4TIME=1: the time since the last mark, per labelled step (native only).
+pub fn mark(label: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::cell::Cell;
+        use std::time::Instant;
+        thread_local!(static LAST: Cell<Option<Instant>> = const { Cell::new(None) });
+        if std::env::var_os("A4TIME").is_some() {
+            let now = Instant::now();
+            LAST.with(|l| {
+                if let Some(t) = l.get() {
+                    eprintln!("time {:28} {:7.1} ms", label, (now - t).as_secs_f64() * 1000.0);
+                }
+                l.set(Some(now));
+            });
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = label;
+}
 use crate::ops::{self, blur, morph_k, Filter, Plane};
 
 /// The paper's light across the page, one channel.
@@ -80,6 +101,46 @@ pub fn divide_paper(img: &mut Img) {
     img.q8();
 }
 
+/// Whether any pixel is set in the (2r+1)^2 square around each pixel.
+fn box_any(m: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
+    // along rows, then down columns, with running counts
+    let rows: Vec<u16> = ops::par_map(h, |y| {
+        let row = &m[y * w..(y + 1) * w];
+        let at = |x: isize| if x >= 0 && (x as usize) < w { row[x as usize] as u16 } else { 0 };
+        let mut c: u16 = (0..=r as isize).map(at).sum();
+        let mut out = vec![0u16; w];
+        for x in 0..w {
+            out[x] = c;
+            c = c + at(x as isize + r as isize + 1) - at(x as isize - r as isize);
+        }
+        out
+    })
+    .concat();
+    let mut out = vec![0u8; w * h];
+    let mut c = vec![0u16; w];
+    for y in 0..=r.min(h - 1) {
+        for (a, &v) in c.iter_mut().zip(&rows[y * w..(y + 1) * w]) {
+            *a += v;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] = (c[x] > 0) as u8;
+        }
+        if y + r + 1 < h {
+            for x in 0..w {
+                c[x] += rows[(y + r + 1) * w + x];
+            }
+        }
+        if y >= r {
+            for x in 0..w {
+                c[x] -= rows[(y - r) * w + x];
+            }
+        }
+    }
+    out
+}
+
 /// 4-connected runs of `core` that hold at least one `seed` pixel.
 fn grow(core: &[u8], seed: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
@@ -121,50 +182,100 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     let (w, h) = (img.w, img.h);
     let n = img.gray();
     // the paper's grain around each pixel: its mean distance from white
-    let paper: Vec<f32> = n.d.iter().map(|&v| (v > 0.8) as u8 as f32).collect();
-    let dev: Vec<f32> = n.d.iter().zip(&paper).map(|(&v, &p)| (1.0 - v).abs() * p).collect();
-    let dev = blur(&Plane { w, h, d: dev }, GRAIN_SIGMA);
-    let cnt = blur(&Plane { w, h, d: paper.clone() }, GRAIN_SIGMA);
+    // (all three are smooth: summed over 4x4 cells, blurred there, brought
+    // back up)
+    let (qw, qh) = (w.div_ceil(GRAIN_CELL), h.div_ceil(GRAIN_CELL));
+    // one row of cells per task
+    let bands = ops::par_map(qh, |cy| {
+        let mut b = [vec![0f32; qw], vec![0f32; qw], vec![0f32; qw]];
+        for y in cy * GRAIN_CELL..((cy + 1) * GRAIN_CELL).min(h) {
+            for (x, &v) in n.row(y).iter().enumerate() {
+                if v > 0.8 {
+                    let c = x / GRAIN_CELL;
+                    b[0][c] += 1.0 - v;
+                    b[1][c] += 1.0;
+                    b[2][c] += v;
+                }
+            }
+        }
+        b
+    });
+    let cells: [Vec<f32>; 3] = std::array::from_fn(|k| bands.iter().flat_map(|b| b[k].iter().copied()).collect());
+    // as shares of a cell, which the resize keeps within 0..1
+    let per = 1.0 / (GRAIN_CELL * GRAIN_CELL) as f32;
+    let up = |d: Vec<f32>| ops::resize(&blur(&Plane { w: qw, h: qh, d: d.iter().map(|v| v * per).collect() }, GRAIN_SIGMA / GRAIN_CELL as f64), w, h, Filter::Triangle);
+    let [dev, cnt, lit] = cells;
+    let (dev, cnt, lit) = (up(dev), up(cnt), up(lit));
     let grain: Vec<f32> = dev.d.iter().zip(&cnt.d).map(|(&d, &c)| 1.25 * d / c.max(1e-3)).collect();
     let thr: Vec<f32> = grain.iter().map(|&g| 1.0 - (GRAIN_K * g).max(INK_MIN)).collect();
     // and its own level there, which a slow shade left after the division
     // keeps a little under white
-    let lit: Vec<f32> = n.d.iter().zip(&paper).map(|(&v, &p)| v * p).collect();
-    let lit = blur(&Plane { w, h, d: lit }, GRAIN_SIGMA);
     let level: Vec<f32> = lit.d.iter().zip(&cnt.d).map(|(&l, &c)| if c > 1e-3 { l / c } else { 1.0 }).collect();
     drop((dev, cnt, lit));
+    mark("  ip: grain+level blurs");
     // an edge next to it: Sobel of the slightly blurred page
     let b = blur(&n, 1.0);
-    let mut edge = vec![0u8; w * h];
-    for y in 1..h.saturating_sub(1) {
+    let edge: Vec<u8> = ops::par_map(h, |y| {
+        let mut row = vec![0u8; w];
+        if y == 0 || y + 1 >= h {
+            return row;
+        }
         for x in 1..w - 1 {
             let at = |dx: isize, dy: isize| b.d[(y as isize + dy) as usize * w + (x as isize + dx) as usize];
             let gx = at(1, -1) + 2.0 * at(1, 0) + at(1, 1) - at(-1, -1) - 2.0 * at(-1, 0) - at(-1, 1);
             let gy = at(-1, 1) + 2.0 * at(0, 1) + at(1, 1) - at(-1, -1) - 2.0 * at(0, -1) - at(1, -1);
-            edge[y * w + x] = (gx.hypot(gy) > EDGE) as u8;
+            row[x] = (gx * gx + gy * gy > EDGE * EDGE) as u8;
         }
-    }
+        row
+    })
+    .concat();
     drop(b);
-    let near = morph_k(&edge, w, h, &ops::disk(EDGE_REACH), true);
+    mark("  ip: sobel");
+    // near an edge: any edge pixel in the square around it, by running sums
+    let near = box_any(&edge, w, h, EDGE_REACH);
     drop(edge);
+    mark("  ip: near dilate");
     // a faint rule: averaged along a row or a column the grain goes, the rule
     // stays
+    let r = LINE_REACH;
     let along = |horiz: bool| -> Vec<f32> {
-        let mut out = vec![0f32; w * h];
-        let r = LINE_REACH as isize;
-        for y in 0..h {
-            for x in 0..w {
-                let mut s = 0.0;
-                for k in -r..=r {
-                    let (xx, yy) = if horiz { ((x as isize + k).clamp(0, w as isize - 1) as usize, y) } else { (x, (y as isize + k).clamp(0, h as isize - 1) as usize) };
-                    s += n.d[yy * w + xx];
+        let k = 1.0 / (2 * r + 1) as f32;
+        if horiz {
+            ops::par_map(h, |y| {
+                let row = n.row(y);
+                let at = |x: isize| row[x.clamp(0, w as isize - 1) as usize];
+                let mut s: f32 = (-(r as isize)..=r as isize).map(at).sum();
+                let mut out = vec![0f32; w];
+                for x in 0..w {
+                    out[x] = s * k;
+                    s += at(x as isize + r as isize + 1) - at(x as isize - r as isize);
                 }
-                out[y * w + x] = s / (2 * r + 1) as f32;
+                out
+            })
+            .concat()
+        } else {
+            let mut out = vec![0f32; w * h];
+            let at = |y: isize| &n.d[y.clamp(0, h as isize - 1) as usize * w..][..w];
+            let mut s = vec![0f32; w];
+            for dy in -(r as isize)..=r as isize {
+                for (a, &v) in s.iter_mut().zip(at(dy)) {
+                    *a += v;
+                }
             }
+            for y in 0..h {
+                for (o, &a) in out[y * w..(y + 1) * w].iter_mut().zip(&s) {
+                    *o = a * k;
+                }
+                let (add, sub) = (at(y as isize + r as isize + 1), at(y as isize - r as isize));
+                for x in 0..w {
+                    s[x] += add[x] - sub[x];
+                }
+            }
+            out
         }
-        out
     };
     let (hl, vl) = (along(true), along(false));
+    mark("  ip: along");
     let lift = ((2 * LINE_REACH + 1) as f32).sqrt();
     let mut rules = vec![0u8; w * h];
     let ink: Vec<u8> = (0..w * h)
@@ -180,6 +291,7 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
             ((n.d[i] < thr[i] && near[i] != 0) || tint) as u8
         })
         .collect();
+    mark("  ip: ink map");
     // a rule is dark along itself and light across: a stain is dark both ways
     for i in 0..w * h {
         let step = (LINE_K * grain[i] / lift).max(LINE_MIN);
@@ -204,10 +316,12 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
         }
     }
     drop((near, hl, vl));
+    mark("  ip: rules");
     // solid ink, dark all through: joined to the edged ink it touches
     let core: Vec<u8> = n.d.iter().map(|&v| (v < SOLID) as u8).collect();
     let solid = grow(&core, &ink, w, h);
     let mut ink: Vec<u8> = ink.iter().zip(&solid).map(|(&a, &b)| a | b).collect();
+    mark("  ip: solid grow");
     // grain that passed for ink in a deep shadow: specks of a few pixels
     let speck = (w.min(h) / SPECK_DIV).max(2);
     for comp in crate::detect::components(&ink, w, h) {
@@ -243,6 +357,7 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
             }
         }
     }
+    mark("  ip: specks+rim");
     let share = ink.iter().map(|&v| v as f64).sum::<f64>() / (w * h) as f64 * 100.0;
     let m = morph_k(&ink, w, h, &ops::square(1), true);
     let m = blur(&Plane { w, h, d: m.iter().map(|&v| v as f32).collect() }, 0.8);
@@ -250,12 +365,14 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
         ops::rows(&mut p.d, w, |y, row| {
             for (x, v) in row.iter_mut().enumerate() {
                 let i = y * w + x;
-                let t = ((*v - INK_BLACK) / (INK_WHITE - INK_BLACK)).clamp(0.0, 1.0).powf(INK_GAMMA);
+                let t = ((*v - INK_BLACK) / (INK_WHITE - INK_BLACK)).clamp(0.0, 1.0);
+                let t = t * t.sqrt();
                 *v = t * m.d[i] + (1.0 - m.d[i]);
             }
         });
     }
     img.q8();
+    mark("  ip: tone");
     share
 }
 
@@ -266,6 +383,7 @@ const BG_PRINT: f32 = 0.7;
 /// The paper's grain is averaged this widely; ink is darker than white by
 /// GRAIN_K times it, and at least INK_MIN.
 const GRAIN_SIGMA: f64 = 17.0;
+const GRAIN_CELL: usize = 4;
 const GRAIN_K: f32 = 4.0;
 const INK_MIN: f32 = 0.08;
 /// A Sobel step that counts as an edge, and how far from one ink may lie.
@@ -273,9 +391,8 @@ const EDGE: f32 = 0.12;
 const EDGE_REACH: usize = 4;
 /// Darker than this is ink all through, however far from its edge.
 const SOLID: f32 = 0.55;
-/// Ink's tone: this dark goes to black, and the curve presses it darker.
+/// Ink's tone: this dark goes to black, and a power of 1.5 presses it darker.
 const INK_BLACK: f32 = 0.2;
-const INK_GAMMA: f32 = 1.5;
 const INK_WHITE: f32 = 0.97;
 /// A rule is looked for along this many pixels either way, and must be
 /// this much darker than white.
@@ -391,18 +508,24 @@ pub fn text_lines(img: &Img, min_lines: usize) -> Option<Lines> {
 /// its own mean height, in line heights.
 pub fn bend(img: &Img) -> Option<[f64; 2]> {
     let l = text_lines(img, 3)?;
-    let mut per: Vec<Vec<(f64, f64)>> = vec![vec![]; l.lines];
-    for &(i, x, y) in &l.samples {
-        per[i].push((x, y * l.h as f64));
+    Some(bend_of(&l.samples, l.lines, l.h, l.hmed))
+}
+
+/// The same off samples: (line, x, y) in parts of the page, read on a copy
+/// `h` tall whose lines are `hmed` high.
+fn bend_of(samples: &[(usize, f64, f64)], lines: usize, h: usize, hmed: usize) -> [f64; 2] {
+    let mut per: Vec<Vec<f64>> = vec![vec![]; lines];
+    for &(i, _, y) in samples {
+        per[i].push(y * h as f64);
     }
     let mut halves: [Vec<f64>; 2] = [vec![], vec![]];
-    for pts in per.iter().filter(|p| p.len() >= 6) {
-        let n = pts.len() as f64;
-        let my = pts.iter().map(|p| p.1).sum::<f64>() / n;
+    for ys in per.iter().filter(|p| p.len() >= 6) {
+        let n = ys.len() as f64;
+        let my = ys.iter().sum::<f64>() / n;
         // off level: a line of a flat page runs straight across it, so its
         // tilt counts as much as its bend
-        let rms = (pts.iter().map(|p| (p.1 - my).powi(2)).sum::<f64>() / n).sqrt();
-        halves[(my / l.h as f64 >= 0.5) as usize].push(rms / l.hmed.max(1) as f64);
+        let rms = (ys.iter().map(|y| (y - my).powi(2)).sum::<f64>() / n).sqrt();
+        halves[(my / h as f64 >= 0.5) as usize].push(rms / hmed.max(1) as f64);
     }
     let med = |v: &mut Vec<f64>| -> f64 {
         if v.is_empty() {
@@ -411,7 +534,7 @@ pub fn bend(img: &Img) -> Option<[f64; 2]> {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    Some([med(&mut halves[0]), med(&mut halves[1])])
+    [med(&mut halves[0]), med(&mut halves[1])]
 }
 
 /// How much print touches each side of the page (left, right, top, bottom):
@@ -443,7 +566,15 @@ pub fn edge_ink(img: &Img) -> [f64; 4] {
     [out[0] / nv, out[1] / nv, out[2] / nh, out[3] / nh]
 }
 
-pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
+/// What straightening did: the largest shift in pixels and the lines it went
+/// by, or, when it would have left one half of the page more bent, how bent
+/// the halves were before and would have been after (the page untouched).
+pub enum Straight {
+    Done(f64, usize),
+    Worse([f64; 2], [f64; 2]),
+}
+
+pub fn straighten(img: &mut Img, worse: impl Fn(f64, f64) -> bool) -> Option<Straight> {
     let (w0, h0) = (img.w, img.h);
     let Lines { samples, lines, cover, hmed, h } = text_lines(img, DW_MIN_LINES)?;
     if lines < DW_MIN_LINES || cover < DW_COVER {
@@ -496,6 +627,23 @@ pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
     if worst > DW_MAX {
         return None;
     }
+    // judged before any pixel moves: the samples themselves moved by the
+    // field, as the page would be
+    let before = bend_of(&samples, lines, h, hmed);
+    let moved: Vec<(usize, f64, f64)> = samples
+        .iter()
+        .map(|&(l, x, y)| {
+            let mut yo = y;
+            for _ in 0..3 {
+                yo = y - d(x, yo);
+            }
+            (l, x, yo)
+        })
+        .collect();
+    let after = bend_of(&moved, lines, h, hmed);
+    if (0..2).any(|k| !after[k].is_nan() && !before[k].is_nan() && worse(before[k], after[k])) {
+        return Some(Straight::Worse(before, after));
+    }
     let shift = |x: usize, y: usize| -> f32 {
         let (gx, gy) = (x / G, y / G);
         let (fx, fy) = ((x % G) as f32 / G as f32, (y % G) as f32 / G as f32);
@@ -519,7 +667,7 @@ pub fn straighten(img: &mut Img) -> Option<(f64, usize)> {
         });
     }
     img.q8();
-    Some((worst * hf, lines))
+    Some(Straight::Done(worst * hf, lines))
 }
 
 /// The copy the lines are found on, its width in pixels.
@@ -640,13 +788,27 @@ fn fit_side(a: Pt, b: Pt, pts: &[Pt], inward: Pt) -> Option<[f64; 3]> {
     Some(coef)
 }
 
+/// A sheet's four bowed edges (top, right, bottom, left), their largest bow
+/// in photo pixels, and the flat sheet's size they imply.
+pub struct Edges {
+    sides: Vec<Side>,
+    pub bow: f64,
+    pub size: (f64, f64),
+}
+
+impl Edges {
+    /// The same corners with straight sides: the plain quad, to judge by.
+    pub fn straight(&self) -> Edges {
+        Edges { sides: self.sides.iter().map(|s| Side { a: s.a, b: s.b, bow: [0.0; 3] }).collect(), bow: 0.0, size: self.size }
+    }
+}
+
 /// A sheet whose edges bow (held in the hand, curling off the table) mapped
 /// flat by its four edge curves, a Coons patch: every straight line of print
 /// that ran parallel to an edge comes out straight. The quad gives the
 /// corners, the paper's outline the bow of each side. None when no side bows
 /// by more than a hair, or the outline cannot be read.
-pub fn curved_sheet(src: &crate::img::Src, quad: [Pt; 4]) -> Option<(Img, f64)> {
-    use crate::img::Pix;
+pub fn sheet_edges(src: &crate::img::Src, quad: [Pt; 4]) -> Option<Edges> {
     let vc = crate::detect::vc(src, CURVE_SIDE);
     let pm = crate::detect::paper_mask(&vc, crate::detect::Mode::Paper);
     let (w, h) = (pm.w, pm.h);
@@ -703,24 +865,31 @@ pub fn curved_sheet(src: &crate::img::Src, quad: [Pt; 4]) -> Option<(Img, f64)> 
     if worst < CURVE_MIN * diag || worst > CURVE_MAX * diag {
         return None;
     }
-    let ow = ((sides[0].len() + sides[2].len()) / 2.0).round().max(50.0) as usize;
-    let oh = ((sides[1].len() + sides[3].len()) / 2.0).round().max(50.0) as usize;
+    let ow = ((sides[0].len() + sides[2].len()) / 2.0).round().max(50.0);
+    let oh = ((sides[1].len() + sides[3].len()) / 2.0).round().max(50.0);
+    Some(Edges { sides, bow: worst, size: (ow, oh) })
+}
+
+/// The sheet mapped flat by its edges into a `w`x`h` image: one resampling
+/// from the photo, bilinear.
+pub fn warp_edges(src: &crate::img::Src, e: &Edges, ow: usize, oh: usize) -> Img {
+    use crate::img::Pix;
+    let sides = &e.sides;
     let corners = [sides[0].a, sides[0].b, sides[2].b, sides[2].a];
     let nc = src.nc();
     let (sw, sh) = src.dims();
-    let img = crate::img::warp(ow, oh, nc, |j, row: &mut [&mut [f32]]| {
+    let mut img = crate::img::warp(ow, oh, nc, |j, row: &mut [&mut [f32]]| {
         let v = (j as f64 + 0.5) / oh as f64;
         let (l, r) = (sides[3].at(v), sides[1].at(v));
+        let bil = |u: f64, k: usize| {
+            let g = |c: Pt| if k == 0 { c.0 } else { c.1 };
+            (1.0 - u) * (1.0 - v) * g(corners[0]) + u * (1.0 - v) * g(corners[1]) + u * v * g(corners[2]) + (1.0 - u) * v * g(corners[3])
+        };
         for i in 0..ow {
             let u = (i as f64 + 0.5) / ow as f64;
             let (t, b) = (sides[0].at(u), sides[2].at(u));
-            let bil = |k: usize| {
-                let p = [corners[0], corners[1], corners[2], corners[3]];
-                let g = |c: Pt| if k == 0 { c.0 } else { c.1 };
-                (1.0 - u) * (1.0 - v) * g(p[0]) + u * (1.0 - v) * g(p[1]) + u * v * g(p[2]) + (1.0 - u) * v * g(p[3])
-            };
-            let x = (1.0 - v) * t.0 + v * b.0 + (1.0 - u) * l.0 + u * r.0 - bil(0);
-            let y = (1.0 - v) * t.1 + v * b.1 + (1.0 - u) * l.1 + u * r.1 - bil(1);
+            let x = (1.0 - v) * t.0 + v * b.0 + (1.0 - u) * l.0 + u * r.0 - bil(u, 0);
+            let y = (1.0 - v) * t.1 + v * b.1 + (1.0 - u) * l.1 + u * r.1 - bil(u, 1);
             let (x, y) = ((x - 0.5).clamp(0.0, sw as f64 - 1.001), (y - 0.5).clamp(0.0, sh as f64 - 1.001));
             let (x0, y0) = (x.floor() as usize, y.floor() as usize);
             let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
@@ -730,9 +899,8 @@ pub fn curved_sheet(src: &crate::img::Src, quad: [Pt; 4]) -> Option<(Img, f64)> 
             }
         }
     });
-    let mut img = img;
     img.q8();
-    Some((img, worst))
+    img
 }
 
 /// The outline is read at this size; a side's points lie within SIDE_BAND of

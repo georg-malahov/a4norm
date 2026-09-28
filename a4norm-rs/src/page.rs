@@ -350,6 +350,8 @@ const FINGER_BAND: usize = 16;
 /// plain quad and still be kept.
 const CURVE_WORSE: f64 = 1.5;
 const CURVE_SLACK: f64 = 0.05;
+/// The curve is judged on copies this wide.
+const CURVE_CHECK_W: f64 = 800.0;
 /// Print along a side, a share of the strip, more than the quad leaves there.
 const CURVE_CUT: f64 = 0.01;
 const SPINE_BAND: f64 = 8.0;
@@ -1390,7 +1392,9 @@ pub type Progress<'a> = &'a dyn Fn(&str);
 /// One raster -> one A4 page, or the cards found in it. The photo is
 /// dropped as soon as the page no longer needs it.
 pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress) -> Result<Processed, Fail> {
+    crate::magic::mark("start");
     let found = locate(&src, o, report)?;
+    crate::magic::mark("locate");
     step("locate");
     let (mut spread, sheet) = match found {
         Found::Photo => return Ok(Processed::Page(fit_photo_page(&src, o, report))),
@@ -1429,30 +1433,46 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     } else {
         None
     };
-    let mut curved = curve_quad.and_then(|q| crate::magic::curved_sheet(&src, q));
-    // kept only when it leaves the lines of text straighter than the plain
-    // quad does, in both halves of the page
-    if let (Some((img, _)), Some(q)) = (&curved, curve_quad) {
-        let (plain, _, _) = rectify(&src, &q, o.rect_inset, None, false, None);
-        let (a, b) = (crate::magic::bend(img), crate::magic::bend(&plain));
+    let edges = curve_quad.and_then(|q| crate::magic::sheet_edges(&src, q));
+    crate::magic::mark("curved: edges");
+    // kept only when it leaves the lines of text no less level than the plain
+    // quad does, in both halves of the page, and cuts no print: judged on
+    // small copies, so a curve turned down costs little
+    let mut curved = None;
+    if let Some(e) = &edges {
+        let k = (CURVE_CHECK_W / e.size.0).min(1.0);
+        let (cw, ch) = ((e.size.0 * k).round() as usize, (e.size.1 * k).round() as usize);
+        let small = crate::magic::warp_edges(&src, e, cw, ch);
+        let plain = crate::magic::warp_edges(&src, &e.straight(), cw, ch);
+        crate::magic::mark("curved check: small copies");
+        let (a, b) = (crate::magic::bend(&small), crate::magic::bend(&plain));
         let better = match (a, b) {
             (Some(a), Some(b)) => (0..2).all(|k| a[k].is_nan() || b[k].is_nan() || a[k] <= b[k] * CURVE_WORSE + CURVE_SLACK),
             _ => false,
         };
-        // and it must not cut into the print along a side the quad kept
-        let (ea, eb) = (crate::magic::edge_ink(img), crate::magic::edge_ink(&plain));
+        let (ea, eb) = (crate::magic::edge_ink(&small), crate::magic::edge_ink(&plain));
         let cuts = (0..4).any(|k| ea[k] > eb[k] * 2.0 + CURVE_CUT);
-        if std::env::var_os("A4DBG").is_some() {
-            eprintln!("edge ink curved {:?} plain {:?}", ea, eb);
-        }
-        let why = if !better { "the lines would not come out straighter" } else { "it would cut into the print along a side" };
-        let better = better && !cuts;
-        if std::env::var_os("A4DBG").is_some() {
-            eprintln!("curved bend {:?} plain bend {:?} -> {}", a, b, better);
-        }
-        if !better {
+        crate::magic::mark("curved check: bend + edge ink");
+        if !better || cuts {
+            let why = if !better { "the lines would not come out straighter" } else { "it would cut into the print along a side" };
             job.say(format!("the sheet's bowed edges were not followed: {}", why));
-            curved = None;
+        } else {
+            // the size the plain quad would have been capped to
+            let (mut ww, mut hh) = e.size;
+            if o.fit == "auto" {
+                let mut cap = a4_px(o.dpi as f64);
+                if o.landscape {
+                    cap = (cap.1, cap.0);
+                }
+                if o.rotate == "auto" && !o.landscape && (ww > hh) != (cap.0 > cap.1) {
+                    cap = (cap.1, cap.0);
+                }
+                let k = 1f64.min(cap.0 as f64 / ww).min(cap.1 as f64 / hh);
+                ww = (ww * k).round();
+                hh = (hh * k).round();
+            }
+            curved = Some((crate::magic::warp_edges(&src, e, ww as usize, hh as usize), e.bow));
+            crate::magic::mark("curved: remap");
         }
     }
     if let Some((img, bow)) = curved {
@@ -1472,10 +1492,12 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     } else if let Some((q, w)) = &sheet {
         wh = rectify_sheet(&mut job, &src, q, w);
     }
+    crate::magic::mark("rectify");
     drop(src);
     if rectified {
         step("rectify");
         erase_outside(&mut job, wh.0, wh.1);
+        crate::magic::mark("border");
         step("border");
     }
     orient(&mut job);
@@ -1492,6 +1514,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         job.say("colour copy: light evened, tint and security print kept, nothing whitened".into());
     }
     let mut keep = if o.no_keep_photo || copy || receipt { None } else { keep_face_photo(&mut job, spread.is_some()) };
+    crate::magic::mark("face photo");
     // a finger holding the sheet, skin coming in from the edge: repainted in
     // the paper's tone (a page with a face photo keeps all its colour)
     if rectified && !copy && keep.is_none() && !receipt {
@@ -1500,6 +1523,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
             job.say(format!("erased a finger at the sheet's edge ({:.1}% of the page)", share));
         }
     }
+    crate::magic::mark("finger");
     // the magic paper is for paper: a page with a face photo is an ID's, and
     // keeps its security print as the classic path leaves it
     let magic = o.magic && keep.is_none();
@@ -1512,6 +1536,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         } else {
             finish::flat_field(&mut job.cur, o);
         }
+        crate::magic::mark("flat / divide paper");
         step("flat");
     }
     if !o.no_deskew && !rectified {
@@ -1525,34 +1550,32 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     } else if !o.no_neutralize && !copy {
         let share = finish::neutralize_ink(&mut job.cur, o);
         job.say(format!("ink neutralized, coloured ink kept on {:.3}% of the page", share));
+        crate::magic::mark("neutralize ink");
         step("ink");
     }
     if !copy {
         if magic {
             let ink = crate::magic::ink_or_paper(&mut job.cur);
+            crate::magic::mark("ink or paper");
             job.say(format!("magic paper: shadows divided out by the paper's own light, {:.1}% of the page kept as ink, the rest white", ink));
-            let before = crate::magic::bend(&job.cur);
-            let keep_img = job.cur.clone();
-            if let Some((shift, lines)) = crate::magic::straighten(&mut job.cur) {
-                // undone when one half of the page comes out more bent
-                let after = crate::magic::bend(&job.cur);
-                let worse = match (before, after) {
-                    (Some(b), Some(a)) => (0..2).any(|k| !a[k].is_nan() && !b[k].is_nan() && a[k] > b[k] * CURVE_WORSE + CURVE_SLACK),
-                    _ => true,
-                };
-                if worse {
-                    job.cur = keep_img;
-                    job.say(format!("bent lines left as they were: straightening would bend one half of the page more ({:?} -> {:?})", before, after));
-                } else {
+            match crate::magic::straighten(&mut job.cur, |b, a| a > b * CURVE_WORSE + CURVE_SLACK) {
+                Some(crate::magic::Straight::Done(shift, lines)) => {
                     job.say(format!("bent lines straightened: {} lines of text, moved by up to {:.0} px", lines, shift));
                 }
+                Some(crate::magic::Straight::Worse(before, after)) => {
+                    job.say(format!("bent lines left as they were: straightening would bend one half of the page more ({:.2?} -> {:.2?})", before, after));
+                }
+                None => {}
             }
+            crate::magic::mark("dewarp");
         } else {
             finish::tone(&mut job.cur, o);
         }
+        crate::magic::mark("tone");
         step("tone");
     }
     let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy);
+    crate::magic::mark("lay out");
     step("page");
     *report = job.report;
     Ok(Processed::Page(PageOut { img: page, photo: false, dpi }))
