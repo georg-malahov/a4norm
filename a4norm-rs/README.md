@@ -105,6 +105,16 @@ Some things depart from the script on purpose:
   cards, photos and pages with a face photo keep the classic path, so it can
   be passed on every scan. See [docs/magic.md](docs/magic.md).
 
+- **Corners by hand, a look per page** (opt-in):
+  - `--quad` (in the browser, `quad` on a file) takes the document's corners
+    from a person instead of searching for them;
+  - `--look auto|magic|color|original` chooses the cleaning;
+  - `--json` (in the browser, `photos` and `pages[].geom`) returns the quads
+    found and a key of the page's geometry, which a change of look alone
+    leaves the same.
+
+  See [docs/api.md](docs/api.md).
+
 The goal is pages that cannot be told apart by eye or in print, not
 bit-identity.
 

@@ -11,7 +11,8 @@ paper gets a different cleaning:
 Everything else keeps the classic path: an open passport spread (colour
 copy), an ID card, a photo, and any page on which a face photo is found. So a
 caller can pass `--magic` on every scan. The binary decides per page whether
-it applies, and the report says so.
+it applies, and the report says so. `--look magic` applies it to any page,
+when asked for by name (see [api.md](api.md)).
 
 ## What happens on a sheet, in order
 

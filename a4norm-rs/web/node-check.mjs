@@ -20,3 +20,25 @@ for (const names of runs) {
   writeFileSync(`/tmp/node-${names[0]}.pdf`, pdf);
   console.log(`   pdf ${pdf.length} bytes, starts ${new TextDecoder().decode(pdf.slice(0, 5))}`);
 }
+
+// What was found and the geometry: corners sent back give the same key, the
+// looks that move nothing keep it, two quads make one spread page.
+const eq = (a, b, what) => console.log(`   ${a === b ? "ok  " : "FAIL"} ${what}`);
+const invoice = { name: "landing-invoice.webp", bytes: readFileSync(new URL("landing-invoice.webp", ex)) };
+const args = ["--format", "jpg", "--dpi", "200", ...extra];
+const auto = m.process([invoice], args);
+const [ph] = auto.photos, [pg] = auto.pages;
+console.log(`api: ${ph.kind}, ${ph.quads.length / 8} quad(s) in ${ph.width}x${ph.height}, page ${ph.page}; ` +
+  `geom ${pg.geom.look}/${pg.geom.flat}, lines ${pg.geom.lines}\n   key ${pg.geom.key}`);
+const hand = m.process([{ ...invoice, quad: ph.quads, kind: ph.kind }], args);
+eq(hand.pages[0].geom.key, pg.geom.key, "the corners sent back: the same key");
+eq(hand.photos[0].hand, true, "the photo says its corners came by hand");
+for (const look of ["color", "original"]) {
+  const r = m.process([{ ...invoice, look }], args);
+  eq(r.pages[0].geom.key, pg.geom.key, `look ${look}: the same key`);
+}
+const q = ph.quads, mid = (i, j) => [(q[i] + q[j]) / 2, (q[i + 1] + q[j + 1]) / 2];
+const [mt, mb] = [mid(0, 2), mid(6, 4)];
+const spread = Float64Array.from([q[0], q[1], ...mt, ...mb, q[6], q[7], ...mt, q[2], q[3], q[4], q[5], ...mb]);
+const two = m.process([{ ...invoice, quad: spread }], args);
+eq(two.pages.length + two.photos[0].kind, "1spread", "16 numbers: one spread page");

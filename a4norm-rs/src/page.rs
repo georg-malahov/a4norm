@@ -222,7 +222,9 @@ fn repaint(img: &mut Img, tone: &(dyn Fn(usize, usize, usize) -> f32 + Sync), ma
 }
 
 /// Erase whatever leans in from outside the sheet, without cropping.
-pub fn clean_border(img: &mut Img, band_pct: f64, keep_pct: f64, struct_pct: f64, dark_pct: f64) -> Border {
+/// `paint`: false leaves the pixels as they are and only reports the band
+/// to cut, for a page that gets no cleaning.
+pub fn clean_border(img: &mut Img, band_pct: f64, keep_pct: f64, struct_pct: f64, dark_pct: f64, paint: bool) -> Border {
     let max_share = 25.0;
     let side = 520;
     let (w0, h0) = (img.w, img.h);
@@ -367,6 +369,9 @@ pub fn clean_border(img: &mut Img, band_pct: f64, keep_pct: f64, struct_pct: f64
                 reach[i] = 0;
             }
         }
+    }
+    if !paint {
+        return Border { done: true, share, cut, verdict: Some(verdict) };
     }
     let (mut rs, mut gs, mut bs) = (vec![], vec![], vec![]);
     for i in (0..n).step_by(3) {
@@ -598,6 +603,9 @@ pub fn copy_tone(img: &Img, width: usize, inside: Option<&Plane>) -> Img {
 pub struct Card {
     pub img: Img,
     pub front: bool,
+    /// its quad and its turn, for the page's key
+    pub geo: String,
+    pub look: &'static str,
 }
 
 /// Each card in the frame, rectified to its real size and turned upright.
@@ -628,11 +636,21 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
         if turn != 0 {
             raw = raw.rotate(90);
         }
-        let (got, share) = erase_fingers(&mut raw, None);
-        if got {
-            report.push(format!("card {}: erased a finger at the edge ({:.1}% of the card)", k + 1, share));
-        }
-        let side = card_face(&raw);
+        // --look original: the finger stays, but the card is judged as the
+        // other looks judge it, so it turns the same way
+        let side = if o.look == "original" {
+            card_face(&{
+                let mut c = raw.clone();
+                erase_fingers(&mut c, None);
+                c
+            })
+        } else {
+            let (got, share) = erase_fingers(&mut raw, None);
+            if got {
+                report.push(format!("card {}: erased a finger at the edge ({:.1}% of the card)", k + 1, share));
+            }
+            card_face(&raw)
+        };
         if side == Some("right") {
             turn = (turn + 180) % 360;
             raw = raw.rotate(180);
@@ -651,8 +669,22 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
                 mrz = ", machine-readable zone below";
             }
         }
-        let toned = copy_tone(&raw, cw_px, Some(&inside));
-        let mut sharp = toned.each(|p| ops::unsharp(p, 1.0, o.sharpen as f32, 0.02));
+        let mut sharp = match o.look.as_str() {
+            "original" => raw,
+            "magic" => {
+                // the face photo keeps the card's colour copy, the rest is paper
+                let toned = copy_tone(&raw, cw_px, Some(&inside));
+                crate::magic::divide_paper(&mut raw);
+                crate::magic::ink_or_paper(&mut raw);
+                if let Some((x, y, w, h)) = d::find_photo_block(&toned, None, None, None, Some(FACE_ASPECT)) {
+                    let (x, y) = (x.max(0) as usize, y.max(0) as usize);
+                    let (w, h) = ((w as usize).min(toned.w - x), (h as usize).min(toned.h - y));
+                    raw.over(&toned.crop(x, y, w, h), None, x as isize, y as isize);
+                }
+                raw.each(|p| ops::unsharp(p, 1.0, o.sharpen as f32, 0.02))
+            }
+            _ => copy_tone(&raw, cw_px, Some(&inside)).each(|p| ops::unsharp(p, 1.0, o.sharpen as f32, 0.02)),
+        };
         // rounded ID-1 corners on white, and a gray70 hairline
         let alpha = img::round_rect(cw_px, ch_px, radius, 0.0);
         let mut card = Img::solid(cw_px, ch_px, [1.0; 3]);
@@ -672,7 +704,12 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
             turn,
             if front { "face photo on the left — front" } else { "no face photo — back" },
         ) + mrz);
-        cards.push(Card { img: card, front });
+        let look = match o.look.as_str() {
+            "original" => "original",
+            "magic" => "magic",
+            _ => "color",
+        };
+        cards.push(Card { img: card, front, geo: format!("card {} turned {}", quad_key(q), turn), look });
     }
     cards
 }
@@ -708,6 +745,7 @@ pub struct PageOut {
     pub img: Img,
     pub photo: bool,
     pub dpi: usize,
+    pub geo: Geo,
 }
 
 /// The photo path: geometry, and nothing else.
@@ -742,7 +780,8 @@ pub fn fit_photo_page(src: &Src, o: &Opts, report: &mut Vec<String>) -> PageOut 
         "page: {}x{}px @ {}dpi (no flat-field, no tone, no paper-whitening, no sharpen — passthrough)",
         pw, ph, page_dpi
     ));
-    PageOut { img: page, photo: true, dpi: page_dpi }
+    let key = format!("photo {}x{}; fit {} {:+}{:+}; page {}x{} @{}", src.w, src.h, scale, off.0, off.1, pw, ph, page_dpi);
+    PageOut { img: page, photo: true, dpi: page_dpi, geo: Geo { key, look: "original", flat: "photo", lines: false } }
 }
 
 const LOWRES_DPI: f64 = 180.0;
@@ -899,6 +938,78 @@ fn photo_patch(keep: &Keep, scale: f64, off: (i64, i64), o: &Opts) -> Option<(Im
 
 // ---------------------------------------------------------- the page pipeline
 
+/// The document's corners set by hand: one quad a sheet or a receipt, two a
+/// spread's pages, one or two cards. In the photo's pixels, EXIF applied.
+#[derive(Clone, Debug)]
+pub struct Hand {
+    pub kind: String,
+    pub quads: Vec<Quad>,
+}
+
+impl Hand {
+    /// Eight numbers a quad; `kind` only where the count leaves it open
+    /// (8: a sheet, 16: a spread). Each quad's corners are put clockwise from
+    /// the one nearest the top left, however they came.
+    pub fn new(v: &[f64], kind: Option<&str>) -> Result<Hand, String> {
+        if v.is_empty() || !v.len().is_multiple_of(8) || v.iter().any(|x| !x.is_finite()) {
+            return Err(format!("eight numbers a quad wanted, got {}", v.len()));
+        }
+        let n = v.len() / 8;
+        let kind = kind.unwrap_or(if n == 2 { "spread" } else { "sheet" }).to_string();
+        let ok = match kind.as_str() {
+            "sheet" | "receipt" => n == 1,
+            "spread" => n == 2,
+            "cards" => n <= 2,
+            _ => false,
+        };
+        if !ok {
+            return Err(format!("{} quads for a {}", n, kind));
+        }
+        let quads = v.as_chunks::<8>().0.iter().map(|c| clockwise([(c[0], c[1]), (c[2], c[3]), (c[4], c[5]), (c[6], c[7])])).collect();
+        Ok(Hand { kind, quads })
+    }
+}
+
+/// A quad's corners clockwise (on screen, y down) from the top left.
+fn clockwise(q: Quad) -> Quad {
+    let c = (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+    let mut v = q.to_vec();
+    v.sort_by(|a, b| (a.1 - c.1).atan2(a.0 - c.0).partial_cmp(&(b.1 - c.1).atan2(b.0 - c.0)).unwrap());
+    let first = (0..4).min_by(|&i, &j| (v[i].0 + v[i].1).partial_cmp(&(v[j].0 + v[j].1)).unwrap()).unwrap();
+    [v[first], v[(first + 1) % 4], v[(first + 2) % 4], v[(first + 3) % 4]]
+}
+
+/// What was found on a photo, for the site to show and to correct: its kind
+/// ("sheet", "receipt", "spread", "cards", "photo", "none") and the quads the
+/// page was made from, in the photo's pixels.
+#[derive(Clone, Debug, Default)]
+pub struct Seen {
+    pub kind: &'static str,
+    pub quads: Vec<Quad>,
+    pub w: usize,
+    pub h: usize,
+    pub hand: bool,
+}
+
+/// A page's geometry: `key` strings together every decision that moves a
+/// photo's pixel to the page, so two runs with the same key put everything
+/// in the same place, whatever the tone and the cleaning did. `look`: the
+/// cleaning the page got; `flat`: how the perspective came out ("quad",
+/// "edges" -- the sheet's bowed edges --, "frame", "cards", "photo");
+/// `lines`: whether the lines of text were straightened.
+#[derive(Clone, Debug, Default)]
+pub struct Geo {
+    pub key: String,
+    pub look: &'static str,
+    pub flat: &'static str,
+    pub lines: bool,
+}
+
+/// A quad for a key: corners at 0.1 px, as the warp reads them.
+pub fn quad_key(q: &Quad) -> String {
+    q.iter().map(|p| format!("{:.1},{:.1}", p.0, p.1)).collect::<Vec<_>>().join(",")
+}
+
 /// One page on its way through the pipeline.
 pub struct Job<'a> {
     pub cur: Img,
@@ -907,11 +1018,16 @@ pub struct Job<'a> {
     pub page: (isize, isize),
     pub o: &'a Opts,
     pub report: Vec<String>,
+    /// every geometric decision, in order: the page's key
+    pub geo: Vec<String>,
 }
 
 impl Job<'_> {
     fn say(&mut self, s: String) {
         self.report.push(s);
+    }
+    fn geo(&mut self, s: String) {
+        self.geo.push(s);
     }
 }
 
@@ -1072,7 +1188,7 @@ pub fn locate(src: &Src, o: &Opts, report: &mut Vec<String>) -> Result<Found, Fa
     Ok(Found::Frame)
 }
 
-fn rectify_spread(job: &mut Job, src: &Src, s: &d::Spread) -> (usize, usize) {
+fn rectify_spread(job: &mut Job, src: &Src, s: &d::Spread, fingers: bool) -> (usize, usize) {
     let o = job.o;
     let pw_ = s.quads.iter().map(|q| (dist(q[0], q[1]) + dist(q[3], q[2])) / 2.0).sum::<f64>() / 2.0;
     let ph_ = s.quads.iter().map(|q| (dist(q[0], q[3]) + dist(q[1], q[2])) / 2.0).sum::<f64>() / 2.0;
@@ -1094,6 +1210,10 @@ fn rectify_spread(job: &mut Job, src: &Src, s: &d::Spread) -> (usize, usize) {
         "spread: two facing pages ({}), each rectified to {}x{} and joined at the fold -> {}x{}",
         s.why, w1, h1, w, h
     ));
+    job.geo(format!("spread {} | {} -> {}x{} {}", quad_key(&s.quads[0]), quad_key(&s.quads[1]), w1, h1, if s.horiz { "side by side" } else { "one above the other" }));
+    if !fingers {
+        return (w, h);
+    }
     let (got, share) = erase_fingers(&mut job.cur, Some(s.horiz));
     if got {
         job.say(format!("erased a finger at the outer edge ({:.1}% of the spread)", share));
@@ -1116,15 +1236,18 @@ fn rectify_sheet(job: &mut Job, src: &Src, quad: &Quad, why: &str) -> (usize, us
     let (img, w, h) = rectify(src, quad, o.rect_inset, cap, o.rotate == "auto" && !o.landscape, None);
     job.cur = img;
     job.say(format!("rectified the sheet quad ({}) -> {}x{}", why, w, h));
+    job.geo(format!("quad {} -> {}x{}", quad_key(quad), w, h));
     (w, h)
 }
 
-fn erase_outside(job: &mut Job, w: usize, h: usize) {
+/// `paint`: false only cuts the band the other looks cut, and repaints
+/// nothing (--look original).
+fn erase_outside(job: &mut Job, w: usize, h: usize, paint: bool) {
     let o = job.o;
     if o.no_edge_clean {
         return;
     }
-    let b = clean_border(&mut job.cur, o.edge_band, o.edge_keep, o.band_structure, o.band_dark);
+    let b = clean_border(&mut job.cur, o.edge_band, o.edge_keep, o.band_structure, o.band_dark, paint);
     if let Some(v) = b.verdict {
         let kept: Vec<String> = SIDES
             .iter()
@@ -1142,7 +1265,9 @@ fn erase_outside(job: &mut Job, w: usize, h: usize) {
         }
         return;
     }
-    job.say(format!("erased what leaned in from outside the sheet ({:.1}% of the page)", b.share));
+    if paint {
+        job.say(format!("erased what leaned in from outside the sheet ({:.1}% of the page)", b.share));
+    }
     let pad = py_round(w.max(h) as f64 * 0.004) as usize;
     let add = |c: usize| if c > 0 { c + pad } else { 0 };
     let (l, r, t, bb) = (add(b.cut[0]), add(b.cut[1]), add(b.cut[2]), add(b.cut[3]));
@@ -1151,7 +1276,11 @@ fn erase_outside(job: &mut Job, w: usize, h: usize) {
         c.q8();
         job.cur = c;
         job.say(format!("cut a solid band of it away: L/R/T/B = {}/{}/{}/{} px", l, r, t, bb));
-        let b2 = clean_border(&mut job.cur, o.edge_band, o.edge_keep, o.band_structure, o.band_dark);
+        job.geo(format!("cut {}/{}/{}/{}", l, r, t, bb));
+        if !paint {
+            return;
+        }
+        let b2 = clean_border(&mut job.cur, o.edge_band, o.edge_keep, o.band_structure, o.band_dark, true);
         if b2.done {
             job.say(format!("second pass on the new border ({:.1}%)", b2.share));
         }
@@ -1166,6 +1295,7 @@ fn orient(job: &mut Job) {
         let deg: i32 = o.rotate.parse().unwrap_or(0);
         job.cur = job.cur.rotate(deg);
         job.say(format!("rotated {}°", o.rotate));
+        job.geo(format!("rotated {}", deg));
     }
 }
 
@@ -1193,6 +1323,7 @@ fn trim_border(job: &mut Job) -> Trim {
         c.q8();
         job.cur = c;
     }
+    job.geo(format!("trim {}/{}/{}/{}", cut[0], cut[1], cut[2], cut[3]));
     let names = ["left", "right", "top", "bottom"];
     // the flags in the script's dict order: top, bottom, left, right
     let order = [2usize, 3, 0, 1];
@@ -1286,6 +1417,7 @@ fn deskew(job: &mut Job, t: &mut Trim, keep: Option<Keep>) -> Option<Keep> {
         }
     }
     job.say(format!("deskewed {:+.2}°, edge lean cut {}px", ang, lean));
+    job.geo(format!("deskew {} -> {}x{} at {:+}{:+}", deg, job.cur.w, job.cur.h, job.page.0, job.page.1));
     if keep.is_some() {
         job.say("face photo left to the page treatment: the page was deskewed after the photo was cut out".into());
         return None;
@@ -1390,7 +1522,8 @@ fn choose_fit(job: &Job, rectified: bool, t: &Trim) -> Fit {
 
 /// `clean`: the paper is already white and the specks gone (the magic
 /// paper), so the paper screen and the despeckle have nothing to do.
-fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: bool, clean: bool) -> (Img, usize) {
+/// `sharp`: false for a page that gets no finishing (--look original).
+fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: bool, clean: bool, sharp: bool) -> (Img, usize) {
     let o = job.o;
     let f = choose_fit(job, rectified, t);
     let over = keep.as_ref().and_then(|k| photo_patch(k, f.scale, f.off, o));
@@ -1403,7 +1536,9 @@ fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: b
     for (k, plane) in cur.c.into_iter().enumerate() {
         let mut r = ops::resize_auto(&plane, nw, nh);
         drop(plane);
-        ops::unsharp_in(&mut r, 1.0, o.sharpen as f32, 0.02);
+        if sharp {
+            ops::unsharp_in(&mut r, 1.0, o.sharpen as f32, 0.02);
+        }
         for kk in if grey { 0..3 } else { k..k + 1 } {
             page.c[kk].paste(&r, f.off.0 as isize, f.off.1 as isize);
         }
@@ -1423,6 +1558,7 @@ fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: b
         page.q8();
     }
     job.say(format!("fit: {}; scale {:.4}, offset {:+}{:+}", f.mode, f.scale, f.off.0, f.off.1));
+    job.geo(format!("fit {} {:+}{:+}; page {}x{} @{}", p, f.off.0, f.off.1, f.pw, f.ph, f.dpi));
     job.say(format!("page: {}x{}px @ {}dpi", f.pw, f.ph, f.dpi));
     if let Some(lr) = f.lowres {
         job.say(format!(
@@ -1443,19 +1579,57 @@ pub enum Processed {
 /// Progress: the stage just finished.
 pub type Progress<'a> = &'a dyn Fn(&str);
 
-/// One raster -> one A4 page, or the cards found in it. The photo is
-/// dropped as soon as the page no longer needs it.
-pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress) -> Result<Processed, Fail> {
+/// The document as the corners set by hand say it is: no search.
+fn from_hand(h: &Hand) -> Found {
+    const WHY: &str = "corners set by hand";
+    match h.kind.as_str() {
+        "cards" => Found::Cards(h.quads.clone(), WHY.into()),
+        "spread" => {
+            let c = |q: &Quad| (q.iter().map(|p| p.0).sum::<f64>() / 4.0, q.iter().map(|p| p.1).sum::<f64>() / 4.0);
+            let (a, b) = (c(&h.quads[0]), c(&h.quads[1]));
+            let horiz = (b.0 - a.0).abs() >= (b.1 - a.1).abs();
+            // the left page first, or the upper one
+            let swap = if horiz { b.0 < a.0 } else { b.1 < a.1 };
+            let quads = if swap { [h.quads[1], h.quads[0]] } else { [h.quads[0], h.quads[1]] };
+            Found::Spread(d::Spread { quads, horiz, why: WHY.into() })
+        }
+        "receipt" => Found::Sheet(h.quads[0], format!("{}, {}", WHY, d::RECEIPT)),
+        _ => Found::Sheet(h.quads[0], WHY.into()),
+    }
+}
+
+/// One raster -> one A4 page, or the cards found in it, and what was found
+/// on it. The photo is dropped as soon as the page no longer needs it.
+pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress) -> Result<(Processed, Seen), Fail> {
     crate::magic::mark("start");
-    let found = locate(&src, o, report)?;
+    // --look magic: the magic paper on any page; original: no cleaning at all
+    let force = o.look == "magic";
+    let orig = o.look == "original";
+    let found = match &o.hand {
+        Some(h) => from_hand(h),
+        None => locate(&src, o, report)?,
+    };
+    let found = match found {
+        Found::Photo if force => {
+            report.push("--look magic: cleaned as a document, not kept as a photo".into());
+            Found::Frame
+        }
+        f => f,
+    };
     crate::magic::mark("locate");
     step("locate");
+    let mut seen = Seen { kind: "none", quads: vec![], w: src.w, h: src.h, hand: o.hand.is_some() };
     let (mut spread, sheet) = match found {
-        Found::Photo => return Ok(Processed::Page(fit_photo_page(&src, o, report))),
+        Found::Photo => {
+            seen.kind = "photo";
+            return Ok((Processed::Page(fit_photo_page(&src, o, report)), seen));
+        }
         Found::Cards(q, why) => {
             let c = process_cards(&src, &q, &why, o, report);
             step("cards");
-            return Ok(Processed::Cards(c));
+            seen.kind = "cards";
+            seen.quads = q;
+            return Ok((Processed::Cards(c), seen));
         }
         Found::Spread(s) => (Some(s), None),
         Found::Sheet(q, w) => (None, Some((q, w))),
@@ -1466,11 +1640,21 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     let receipt = sheet.as_ref().is_some_and(|(_, why)| why.ends_with(d::RECEIPT));
     // the frame path works on the whole photo; a rectify makes its own page
     let cur = if rectified { Img::solid(1, 1, [1.0; 3]) } else { src.to_img() };
-    let mut job = Job { cur, page: (0, 0), o, report: std::mem::take(report) };
+    let mut job = Job { cur, page: (0, 0), o, report: std::mem::take(report), geo: vec![] };
+    if !rectified {
+        job.geo(format!("frame {}x{}", src.w, src.h));
+    }
+    if let Some((q, why)) = &sheet {
+        seen.kind = if why.ends_with(d::RECEIPT) { "receipt" } else { "sheet" };
+        seen.quads = vec![*q];
+    } else if let Some(s) = &spread {
+        seen.kind = "spread";
+        seen.quads = s.quads.to_vec();
+    }
     let mut wh = (0, 0);
     // a white sheet bent in the hand reads as one paper region folded in the
     // middle: under --magic it is a sheet, mapped flat by its own bowed edges
-    let bent_sheet = o.magic && spread.as_ref().is_some_and(|s| s.why.contains("folded in the middle") && !s.why.contains("paper mask"));
+    let bent_sheet = o.magic && o.hand.is_none() && spread.as_ref().is_some_and(|s| s.why.contains("folded in the middle") && !s.why.contains("paper mask"));
     let outer = |s: &d::Spread| {
         let pts: Vec<(f64, f64)> = s.quads.iter().flatten().copied().collect();
         let pick = |f: &dyn Fn(&(f64, f64)) -> f64, max: bool| {
@@ -1526,9 +1710,22 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
                 hh = (hh * k).round();
             }
             curved = Some((crate::magic::warp_edges(&src, e, ww as usize, hh as usize), e.bow));
+            job.geo(format!("edges {} bowed {} -> {}x{}", quad_key(&curve_quad.unwrap()), e.key(), ww, hh));
             crate::magic::mark("curved: remap");
         }
     }
+    if bent_sheet {
+        // what the site shows: the sheet's four outer corners
+        seen.kind = "sheet";
+        seen.quads = curve_quad.into_iter().collect();
+    }
+    let flat = if curved.is_some() {
+        "edges"
+    } else if rectified {
+        "quad"
+    } else {
+        "frame"
+    };
     if let Some((img, bow)) = curved {
         wh = (img.w, img.h);
         job.cur = img;
@@ -1542,7 +1739,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         wh = rectify_sheet(&mut job, &src, &q, "the outer corners of a sheet bent in the hand");
         spread = None;
     } else if let Some(s) = &spread {
-        wh = rectify_spread(&mut job, &src, s);
+        wh = rectify_spread(&mut job, &src, s, !orig);
     } else if let Some((q, w)) = &sheet {
         wh = rectify_sheet(&mut job, &src, q, w);
     }
@@ -1550,7 +1747,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     drop(src);
     if rectified {
         step("rectify");
-        erase_outside(&mut job, wh.0, wh.1);
+        erase_outside(&mut job, wh.0, wh.1, !orig);
         crate::magic::mark("border");
         step("border");
     }
@@ -1559,7 +1756,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     if bent_sheet {
         job.say("the folded region is white paper: a sheet bent in two, cleaned as paper".into());
     }
-    let copy = spread.is_some() && !o.spread_scan && !bent_sheet;
+    let copy = spread.is_some() && !o.spread_scan && !bent_sheet && !force && !orig;
     if copy {
         let w = job.cur.w;
         let mut c = copy_tone(&job.cur, w, None);
@@ -1567,7 +1764,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         job.cur = c;
         job.say("colour copy: light evened, tint and security print kept, nothing whitened".into());
     }
-    let mut keep = if o.no_keep_photo || copy || receipt { None } else { keep_face_photo(&mut job, spread.is_some()) };
+    let mut keep = if o.no_keep_photo || copy || receipt || orig { None } else { keep_face_photo(&mut job, spread.is_some()) };
     crate::magic::mark("face photo");
     // a finger holding the sheet, skin coming in from the edge: repainted in
     // the paper's tone, with the magic paper (a page with a face photo keeps
@@ -1581,11 +1778,12 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
     crate::magic::mark("finger");
     // the magic paper is for paper: a page with a face photo is an ID's, and
     // keeps its security print as the classic path leaves it
-    let magic = o.magic && keep.is_none();
+    // (asked for by name, it cleans the page around the face photo)
+    let magic = o.magic && (keep.is_none() || force);
     if o.magic && !magic {
         job.say("a face photo on the page: an ID, left to the classic paper".into());
     }
-    if !copy {
+    if !copy && !orig {
         if magic {
             crate::magic::divide_paper(&mut job.cur);
         } else {
@@ -1602,13 +1800,14 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         job.cur = Img::from_planes(vec![g.clone(), g.clone(), g]);
         job.cur.q8();
         job.say("grayscale output".into());
-    } else if !o.no_neutralize && !copy {
+    } else if !o.no_neutralize && !copy && !orig {
         let share = finish::neutralize_ink(&mut job.cur, o);
         job.say(format!("ink neutralized, coloured ink kept on {:.3}% of the page", share));
         crate::magic::mark("neutralize ink");
         step("ink");
     }
-    if !copy {
+    let mut straight = false;
+    if !copy && !orig {
         if magic {
             let ink = crate::magic::ink_or_paper(&mut job.cur);
             crate::magic::mark("ink or paper");
@@ -1616,6 +1815,8 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
             match crate::magic::straighten(&mut job.cur, |b, a| a > b * CURVE_WORSE + CURVE_SLACK) {
                 Some(crate::magic::Straight::Done(shift, lines)) => {
                     job.say(format!("bent lines straightened: {} lines of text, moved by up to {:.0} px", lines, shift));
+                    job.geo(format!("lines {} {}", lines, shift));
+                    straight = true;
                 }
                 Some(crate::magic::Straight::Worse(before, after)) => {
                     job.say(format!("bent lines left as they were: straightening would bend one half of the page more ({:.2?} -> {:.2?})", before, after));
@@ -1629,9 +1830,46 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         crate::magic::mark("tone");
         step("tone");
     }
-    let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy, magic && !copy);
+    let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy, (magic && !copy) || orig, !orig);
     crate::magic::mark("lay out");
     step("page");
     *report = job.report;
-    Ok(Processed::Page(PageOut { img: page, photo: false, dpi }))
+    let look = if orig {
+        "original"
+    } else if magic && !copy {
+        "magic"
+    } else {
+        "color"
+    };
+    let geo = Geo { key: job.geo.join("; "), look, flat, lines: straight };
+    Ok((Processed::Page(PageOut { img: page, photo: false, dpi, geo }), seen))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hand_corners_in_any_order() {
+        let tl_first = [10.0, 20.0, 110.0, 25.0, 105.0, 160.0, 5.0, 150.0];
+        let backwards = [5.0, 150.0, 105.0, 160.0, 110.0, 25.0, 10.0, 20.0];
+        let a = Hand::new(&tl_first, None).unwrap();
+        let b = Hand::new(&backwards, None).unwrap();
+        assert_eq!(a.kind, "sheet");
+        assert_eq!(a.quads, b.quads);
+        assert_eq!(a.quads[0][0], (10.0, 20.0));
+        assert_eq!(a.quads[0][2], (105.0, 160.0));
+    }
+
+    #[test]
+    fn hand_kinds_by_count() {
+        let q = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let two: Vec<f64> = q.iter().chain(q.iter()).copied().collect();
+        assert_eq!(Hand::new(&two, None).unwrap().kind, "spread");
+        assert_eq!(Hand::new(&two, Some("cards")).unwrap().quads.len(), 2);
+        assert!(Hand::new(&q, Some("spread")).is_err());
+        assert!(Hand::new(&two, Some("sheet")).is_err());
+        assert!(Hand::new(&q[..6], None).is_err());
+        assert!(Hand::new(&[f64::NAN; 8], None).is_err());
+    }
 }
