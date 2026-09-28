@@ -13,6 +13,3 @@ a4norm-rs/target*/
 web/dist/
 a4norm-rs/web/dist/
 a4norm-rs/web/check/node_modules
-
-# Official forms fetched by examples/forms/official.py: linked, not committed.
-examples/forms/official/
