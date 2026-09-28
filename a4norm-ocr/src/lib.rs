@@ -2,277 +2,286 @@
 //! recognizer, run by tract (pure Rust, so the same code builds for the
 //! browser). The models are not bundled: the caller hands their bytes in.
 //!
-//! Detection finds text lines on the page scaled so its long side is
-//! `det_long` pixels; recognition reads each line at a height of 48.
+//! One detection finds the text lines and the page's skew; each line is cut
+//! out along its tilted box and read, in parallel with the `par` feature.
+//! The result is a page's words with their boxes, its skew, the size of its
+//! print and its languages: A4Norm Forms' `PageInspection` without the
+//! geometry.
 
-use image::{imageops, imageops::FilterType, RgbImage};
-use std::io::Cursor;
-use tract_onnx::prelude::*;
+pub mod det;
+pub mod lang;
+pub mod rec;
 
+#[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
+pub mod pool;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-type Plan = std::sync::Arc<TypedRunnableModel>;
+use det::Frame;
+use image::RgbImage;
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+use tract_onnx::prelude::*;
 
-/// One recognised line: its text, the recognizer's mean confidence over the
-/// characters it kept, and its box in page pixels `[x0, y0, x1, y1]`.
+pub(crate) type Plan = Arc<TypedRunnableModel>;
+
+/// A word: its text, the recognizer's mean confidence over its characters,
+/// and its upright box `[x0, y0, x1, y1]` in page pixels.
 #[derive(Debug, Clone)]
-pub struct Line {
+pub struct Word {
     pub text: String,
     pub score: f32,
-    pub bbox: [u32; 4],
+    pub bbox: [f32; 4],
 }
+
+/// A text line as detected: its words left to right, its upright box, and
+/// its height across the line in page pixels.
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub words: Vec<Word>,
+    pub bbox: [f32; 4],
+    pub height: f32,
+}
+
+impl Line {
+    pub fn text(&self) -> String {
+        self.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// What the page holds, in its pixels.
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub width: u32,
+    pub height: u32,
+    /// radians; the lines run down to the right when positive
+    pub skew: f32,
+    /// top to bottom, then left to right
+    pub lines: Vec<Line>,
+    /// the size of the print, median over characters, in page pixels
+    pub printed: f32,
+    pub langs: Vec<&'static str>,
+}
+
+/// A line's box across the text is the body of its letters plus the room
+/// the detector leaves around them, in points per point of type size.
+const BOX_PER_PT: f32 = 1.39;
 
 pub struct Ocr {
     det: InferenceModel,
     rec: InferenceModel,
     /// Index 0 is the CTC blank; then the dictionary; then a space.
     chars: Vec<String>,
-    det_plans: Vec<((usize, usize), Plan)>,
-    rec_plans: Vec<(usize, Plan)>,
+    det_plans: Mutex<Vec<((usize, usize), Plan)>>,
+    rec_plans: Mutex<Vec<(usize, Plan)>>,
+    /// the long side of the page as detection sees it
     pub det_long: u32,
 }
 
-/// Recognition widths: a line is padded to the first that holds it, so a
-/// page needs only a few compiled shapes.
-const REC_WIDTHS: [usize; 6] = [160, 320, 640, 960, 1280, 1920];
-const REC_H: u32 = 48;
-
 impl Ocr {
-    /// `dict` is the recognizer's character list, one per line.
-    pub fn new(det_onnx: &[u8], rec_onnx: &[u8], dict: &str) -> TractResult<Ocr> {
-        let det = tract_onnx::onnx().with_ignore_value_info(true).with_ignore_output_shapes(true).model_for_read(&mut Cursor::new(det_onnx))?;
-        let rec = tract_onnx::onnx().with_ignore_value_info(true).with_ignore_output_shapes(true).model_for_read(&mut Cursor::new(rec_onnx))?;
-        let mut chars = vec![String::new()];
-        chars.extend(dict.lines().map(|l| l.to_string()));
-        chars.push(" ".to_string());
-        Ok(Ocr { det, rec, chars, det_plans: vec![], rec_plans: vec![], det_long: 960 })
-    }
-
-    fn det_plan(&mut self, h: usize, w: usize) -> TractResult<&Plan> {
-        if let Some(i) = self.det_plans.iter().position(|(s, _)| *s == (h, w)) {
-            return Ok(&self.det_plans[i].1);
-        }
-        let plan = self
-            .det
-            .clone()
-            .with_input_fact(0, f32::fact([1, 3, h, w]).into())?
-            .into_optimized()?
-            .into_runnable()?;
-        self.det_plans.push(((h, w), plan));
-        Ok(&self.det_plans.last().unwrap().1)
-    }
-
-    fn rec_plan(&mut self, w: usize) -> TractResult<&Plan> {
-        if let Some(i) = self.rec_plans.iter().position(|(s, _)| *s == w) {
-            return Ok(&self.rec_plans[i].1);
-        }
-        let plan = self
-            .rec
-            .clone()
-            .with_input_fact(0, f32::fact([1, 3, REC_H as usize, w]).into())?
-            .into_optimized()?
-            .into_runnable()?;
-        self.rec_plans.push((w, plan));
-        Ok(&self.rec_plans.last().unwrap().1)
-    }
-
-    /// Text line boxes in page pixels.
-    /// Text line boxes in page pixels, and the page's skew in radians (the
-    /// median slope of its long lines).
-    pub fn detect(&mut self, page: &RgbImage) -> TractResult<(Vec<[u32; 4]>, f32)> {
-        let (pw, ph) = page.dimensions();
-        let s = self.det_long as f32 / pw.max(ph) as f32;
-        let r32 = |v: f32| (((v / 32.0).round() as usize).max(1)) * 32;
-        let (w, h) = (r32(pw as f32 * s), r32(ph as f32 * s));
-        let small = imageops::resize(page, w as u32, h as u32, FilterType::Triangle);
-        // BGR, (x/255 - mean) / std, channels first
-        let (mean, std) = ([0.406f32, 0.456, 0.485], [0.225f32, 0.224, 0.229]);
-        let mut data = vec![0f32; 3 * h * w];
-        for (x, y, p) in small.enumerate_pixels() {
-            let i = y as usize * w + x as usize;
-            for c in 0..3 {
-                let v = p.0[2 - c] as f32 / 255.0;
-                data[c * h * w + i] = (v - mean[c]) / std[c];
-            }
-        }
-        let input = Tensor::from_shape(&[1, 3, h, w], &data)?;
-        let out = self.det_plan(h, w)?.run(tvec!(input.into()))?;
-        let prob = out[0].to_plain_array_view::<f32>()?;
-        let prob: Vec<f32> = prob.iter().copied().collect(); // [1,1,h,w]
-        let (boxes, mut slopes) = db_boxes(&prob, w, h, 0.3, 0.6, 1.5);
-        slopes.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let skew = if slopes.is_empty() { 0.0 } else { slopes[slopes.len() / 2].atan() };
-        let (sx, sy) = (pw as f32 / w as f32, ph as f32 / h as f32);
-        Ok((boxes
-            .into_iter()
-            .map(|[x0, y0, x1, y1]| {
-                [
-                    (x0 * sx).max(0.0) as u32,
-                    (y0 * sy).max(0.0) as u32,
-                    ((x1 * sx) as u32).min(pw),
-                    ((y1 * sy) as u32).min(ph),
-                ]
-            })
-            .collect(), skew))
-    }
-
-    /// Reads one line cut from the page.
-    pub fn read(&mut self, crop: &RgbImage) -> TractResult<(String, f32)> {
-        let (cw, ch) = crop.dimensions();
-        let tw = ((REC_H as f32 * cw as f32 / ch.max(1) as f32).ceil() as usize).max(8);
-        let bucket = *REC_WIDTHS.iter().find(|&&b| b >= tw).unwrap_or(&REC_WIDTHS[5]);
-        let tw = tw.min(bucket);
-        let img = imageops::resize(crop, tw as u32, REC_H, FilterType::Triangle);
-        let (h, w) = (REC_H as usize, bucket);
-        let mut data = vec![0f32; 3 * h * w]; // right padding: 0 after normalizing
-        for (x, y, p) in img.enumerate_pixels() {
-            let i = y as usize * w + x as usize;
-            for c in 0..3 {
-                data[c * h * w + i] = (p.0[2 - c] as f32 / 255.0 - 0.5) / 0.5;
-            }
-        }
-        let input = Tensor::from_shape(&[1, 3, h, w], &data)?;
-        let out = self.rec_plan(w)?.run(tvec!(input.into()))?;
-        let a = out[0].to_plain_array_view::<f32>()?; // [1, T, C]
-        let (t_len, classes) = (a.shape()[1], a.shape()[2]);
-        let flat: Vec<f32> = a.iter().copied().collect();
-        let (mut text, mut sum, mut n, mut prev) = (String::new(), 0f32, 0usize, 0usize);
-        for t in 0..t_len {
-            let row = &flat[t * classes..(t + 1) * classes];
-            let (k, &p) = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap();
-            if k != 0 && k != prev {
-                if k < self.chars.len() {
-                    text.push_str(self.chars[k].as_str());
-                    sum += p;
-                    n += 1;
-                }
-            }
-            prev = k;
-        }
-        Ok((text.trim().to_string(), if n > 0 { sum / n as f32 } else { 0.0 }))
-    }
-
-    /// Every text line on the page, top to bottom, with the skew the page
-    /// was levelled by first (radians; boxes are in the levelled page).
-    pub fn page(&mut self, page: &RgbImage) -> TractResult<(Vec<Line>, f32)> {
-        let (mut boxes, skew) = self.detect(page)?;
-        let levelled;
-        let page = if skew.abs() > 0.1f32.to_radians() {
-            levelled = rotate(page, skew);
-            boxes = self.detect(&levelled)?.0;
-            &levelled
-        } else {
-            page
+    /// The detector's and the recognizer's `inference.onnx`, and the
+    /// recognizer's `inference.yml`, which holds its character list.
+    pub fn new(det_onnx: &[u8], rec_onnx: &[u8], rec_yml: &str) -> TractResult<Ocr> {
+        // The exported graphs carry symbolic shapes that tract cannot unify
+        // with a concrete input: their declared facts are dropped.
+        let load = |b: &[u8]| {
+            tract_onnx::onnx()
+                .with_ignore_value_info(true)
+                .with_ignore_output_shapes(true)
+                .model_for_read(&mut Cursor::new(b))
         };
-        boxes.sort_by_key(|b| (b[1] / 8, b[0]));
-        let mut lines = Vec::with_capacity(boxes.len());
-        for b in boxes {
-            let (w, h) = (b[2].saturating_sub(b[0]), b[3].saturating_sub(b[1]));
-            if w < 4 || h < 4 {
-                continue;
-            }
-            let crop = imageops::crop_imm(page, b[0], b[1], w, h).to_image();
-            let (text, score) = self.read(&crop)?;
-            if !text.is_empty() {
-                lines.push(Line { text, score, bbox: b });
+        let dict = character_dict(rec_yml);
+        if dict.is_empty() {
+            return Err(TractError::msg("no PostProcess.character_dict in the recognizer's inference.yml"));
+        }
+        let mut chars = vec![String::new()];
+        chars.extend(dict);
+        chars.push(" ".to_string());
+        Ok(Ocr {
+            det: load(det_onnx)?,
+            rec: load(rec_onnx)?,
+            chars,
+            det_plans: Mutex::new(vec![]),
+            rec_plans: Mutex::new(vec![]),
+            det_long: 960,
+        })
+    }
+
+    fn det_plan(&self, shape: (usize, usize)) -> TractResult<Plan> {
+        if let Some((_, p)) = self.det_plans.lock().unwrap().iter().find(|(s, _)| *s == shape) {
+            return Ok(p.clone());
+        }
+        let plan = compile(&self.det, [1, 3, shape.0, shape.1])?;
+        self.det_plans.lock().unwrap().push((shape, plan.clone()));
+        Ok(plan)
+    }
+
+    fn rec_plan(&self, width: usize) -> TractResult<Plan> {
+        if let Some((_, p)) = self.rec_plans.lock().unwrap().iter().find(|(w, _)| *w == width) {
+            return Ok(p.clone());
+        }
+        let plan = compile(&self.rec, [1, 3, rec::H, width])?;
+        self.rec_plans.lock().unwrap().push((width, plan.clone()));
+        Ok(plan)
+    }
+
+    /// Every text line of the page and its words, the skew, the print size
+    /// and the languages.
+    pub fn page(&self, page: &RgbImage) -> TractResult<Page> {
+        let (pw, ph) = page.dimensions();
+        let shape = det::shape(pw, ph, self.det_long);
+        let (mut boxes, skew) = det::detect(&self.det_plan(shape)?, page, shape)?;
+        let f = Frame::new(skew);
+        boxes.retain(|b| b.u1 - b.u0 >= 4.0 && b.v1 - b.v0 >= 4.0);
+        // reading order: by the line's middle across, in bands of a third of
+        // a typical line, then along
+        let band = median(boxes.iter().map(|b| b.v1 - b.v0).collect()).max(1.0) / 3.0;
+        boxes.sort_by(|a, b| {
+            let (ka, kb) = (((a.v0 + a.v1) / 2.0 / band) as i64, ((b.v0 + b.v1) / 2.0 / band) as i64);
+            ka.cmp(&kb).then(a.u0.total_cmp(&b.u0))
+        });
+
+        let cuts: Vec<rec::Cut> = map(&boxes, |b| rec::cut(page, &f, b));
+        let mut widths: Vec<usize> = cuts.iter().map(|c| c.width).collect();
+        widths.sort_unstable();
+        widths.dedup();
+        let plans: Vec<(usize, Plan)> =
+            map(&widths, |&w| self.rec_plan(w).map(|p| (w, p))).into_iter().collect::<TractResult<_>>()?;
+        let read = map(&cuts, |c| {
+            let plan = &plans.iter().find(|(w, _)| *w == c.width).unwrap().1;
+            rec::read(plan, c, &self.chars)
+        });
+
+        let mut lines = vec![];
+        for ((b, spans), c) in boxes.iter().zip(read).zip(&cuts) {
+            let end = c.tw as f32 * c.scale; // a word ends at most where the line does
+            let words: Vec<Word> = spans?
+                .into_iter()
+                .map(|s| Word {
+                    bbox: f.bbox(b.u0 + s.u0, b.v0, b.u0 + s.u1.min(end), b.v1),
+                    text: s.text,
+                    score: s.score,
+                })
+                .collect();
+            if !words.is_empty() {
+                lines.push(Line { words, bbox: f.bbox(b.u0, b.v0, b.u1, b.v1), height: b.v1 - b.v0 });
             }
         }
-        Ok((lines, skew))
+        let printed = printed_size(&lines);
+        let words = lines.iter().flat_map(|l| &l.words).filter(|w| w.score >= 0.7);
+        let langs = lang::langs(words.map(|w| w.text.as_str()));
+        Ok(Page { width: pw, height: ph, skew, lines, printed, langs })
     }
 }
 
-/// DB post-processing on the probability map, with axis-aligned boxes (the
-/// page arrives straightened): threshold, 4-connected regions, the region's
-/// mean probability as its score, then the box grown by `unclip`.
-fn db_boxes(prob: &[f32], w: usize, h: usize, thresh: f32, box_thresh: f32, unclip: f32) -> (Vec<[f32; 4]>, Vec<f32>) {
-    let mut label = vec![0u32; w * h];
+/// The recognizer's characters: the `character_dict` list of its
+/// inference.yml, one `- c` per line, plain or in single quotes.
+pub fn character_dict(yml: &str) -> Vec<String> {
+    let mut lines = yml.lines().skip_while(|l| l.trim() != "character_dict:").skip(1);
     let mut out = vec![];
-    let mut slopes = vec![];
-    let mut stack = vec![];
-    let mut next = 0u32;
-    for start in 0..w * h {
-        if prob[start] <= thresh || label[start] != 0 {
-            continue;
-        }
-        next += 1;
-        label[start] = next;
-        stack.push(start);
-        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
-        let (mut sum, mut n) = (0f32, 0usize);
-        let (mut sx, mut sy, mut sxx, mut sxy) = (0f64, 0f64, 0f64, 0f64);
-        while let Some(i) = stack.pop() {
-            let (x, y) = (i % w, i / w);
-            let (fx, fy) = (x as f64, y as f64);
-            sx += fx;
-            sy += fy;
-            sxx += fx * fx;
-            sxy += fx * fy;
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
-            sum += prob[i];
-            n += 1;
-            let mut push = |j: usize| {
-                if prob[j] > thresh && label[j] == 0 {
-                    label[j] = next;
-                    stack.push(j);
-                }
-            };
-            if x > 0 { push(i - 1); }
-            if x + 1 < w { push(i + 1); }
-            if y > 0 { push(i - w); }
-            if y + 1 < h { push(i + w); }
-        }
-        let (bw, bh) = ((x1 - x0 + 1) as f32, (y1 - y0 + 1) as f32);
-        if bw.min(bh) < 3.0 || sum / (n as f32) < box_thresh {
-            continue;
-        }
-        if bw > 8.0 * bh && n > 200 {
-            let nf = n as f64;
-            let var = sxx / nf - (sx / nf).powi(2);
-            if var > 0.0 {
-                slopes.push(((sxy / nf - sx / nf * sy / nf) / var) as f32);
-            }
-        }
-        let d = bw * bh * unclip / (2.0 * (bw + bh));
-        out.push([x0 as f32 - d, y0 as f32 - d, x1 as f32 + 1.0 + d, y1 as f32 + 1.0 + d]);
-    }
-    (out, slopes)
-}
-
-/// The page turned by `angle` radians about its centre (bilinear, white
-/// outside), so that lines tilted by `angle` become level.
-pub fn rotate(page: &RgbImage, angle: f32) -> RgbImage {
-    let (w, h) = page.dimensions();
-    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-    let (s, c) = angle.sin_cos();
-    let mut out = RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
-    for y in 0..h {
-        for x in 0..w {
-            // where this output pixel comes from in the tilted page
-            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
-            let (sx, sy) = (cx + dx * c - dy * s, cy + dx * s + dy * c);
-            if sx < 0.0 || sy < 0.0 || sx >= (w - 1) as f32 || sy >= (h - 1) as f32 {
-                continue;
-            }
-            let (x0, y0) = (sx as u32, sy as u32);
-            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
-            let p = |xx, yy| page.get_pixel(xx, yy).0;
-            let (a, b, cc, d) = (p(x0, y0), p(x0 + 1, y0), p(x0, y0 + 1), p(x0 + 1, y0 + 1));
-            let mut v = [0u8; 3];
-            for k in 0..3 {
-                let top = a[k] as f32 * (1.0 - fx) + b[k] as f32 * fx;
-                let bot = cc[k] as f32 * (1.0 - fx) + d[k] as f32 * fx;
-                v[k] = (top * (1.0 - fy) + bot * fy).round() as u8;
-            }
-            out.put_pixel(x, y, image::Rgb(v));
-        }
+    while let Some(c) = lines.next().and_then(|l| l.trim_start().strip_prefix("- ")) {
+        out.push(match c.strip_prefix('\'').and_then(|c| c.strip_suffix('\'')) {
+            Some(q) => q.replace("''", "'"),
+            None => c.to_string(),
+        });
     }
     out
+}
+
+fn compile<const N: usize>(model: &InferenceModel, shape: [usize; N]) -> TractResult<Plan> {
+    Ok(model.clone().with_input_fact(0, f32::fact(shape).into())?.into_optimized()?.into_runnable()?)
+}
+
+/// `f` over `items`, on rayon's threads with the `par` feature.
+fn map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        items.par_iter().map(f).collect()
+    }
+    #[cfg(not(feature = "par"))]
+    items.iter().map(f).collect()
+}
+
+fn median(mut v: Vec<f32>) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f32::total_cmp);
+    v[v.len() / 2]
+}
+
+/// The size of the print in page pixels: each confidently read line's box
+/// height over BOX_PER_PT, the median over characters so that the body text
+/// outweighs a few big headings.
+fn printed_size(lines: &[Line]) -> f32 {
+    let mut sizes: Vec<(f32, usize)> = lines
+        .iter()
+        .filter(|l| l.words.iter().all(|w| w.score >= 0.8))
+        .map(|l| (l.height / BOX_PER_PT, l.words.iter().map(|w| w.text.chars().count()).sum()))
+        .collect();
+    sizes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: usize = sizes.iter().map(|s| s.1).sum();
+    let mut acc = 0;
+    for (s, n) in &sizes {
+        acc += n;
+        if 2 * acc >= total {
+            return *s;
+        }
+    }
+    0.0
+}
+
+impl Page {
+    /// A4Norm Forms' `PageInspection` for this page, without the geometry:
+    /// `sizePt`, `skewDeg`, `words` (boxes in points from the top left),
+    /// `printedSize` in points, `langs`. The page's pixels span `size_pt`.
+    pub fn to_json(&self, size_pt: [f32; 2]) -> String {
+        let (sx, sy) = (size_pt[0] / self.width as f32, size_pt[1] / self.height as f32);
+        let pt = |b: &[f32; 4]| format!("[{:.2},{:.2},{:.2},{:.2}]", b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy);
+        let words: Vec<String> = self
+            .lines
+            .iter()
+            .flat_map(|l| &l.words)
+            .map(|w| format!("{{\"text\":{},\"bbox\":{},\"score\":{:.3}}}", json_str(&w.text), pt(&w.bbox), w.score))
+            .collect();
+        let langs: Vec<String> = self.langs.iter().map(|l| format!("\"{l}\"")).collect();
+        format!(
+            "{{\"sizePt\":[{:.2},{:.2}],\"skewDeg\":{:.3},\"words\":[{}],\"printedSize\":{:.1},\"langs\":[{}]}}",
+            size_pt[0],
+            size_pt[1],
+            self.skew.to_degrees(),
+            words.join(","),
+            self.printed * sy,
+            langs.join(",")
+        )
+    }
+}
+
+pub fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// The first JPEG in a PDF, as a scanner writes a page: the bytes between
+/// `stream` and `endstream` of the first `/DCTDecode` object.
+pub fn pdf_jpeg(pdf: &[u8]) -> Option<&[u8]> {
+    let find = |hay: &[u8], needle: &[u8], from: usize| {
+        hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|i| i + from)
+    };
+    let dct = find(pdf, b"/DCTDecode", 0)?;
+    let s = find(pdf, b"stream", dct)? + 6;
+    let s = s + if pdf.get(s) == Some(&b'\r') { 2 } else { 1 };
+    let e = find(pdf, b"\xff\xd9", s)? + 2; // the JPEG's own end
+    Some(&pdf[s..e])
 }

@@ -5,15 +5,24 @@ edition = "2021"
 license = "MIT"
 description = "Text and its boxes on a page: PP-OCRv5 (mobile det + latin rec) on tract, native and WebAssembly"
 
+[features]
+default = []
+# lines read on rayon's threads
+par = ["dep:rayon"]
+# the browser's threaded build: rayon over Web Workers (needs atomics)
+wasm-threads = ["par"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 tract-onnx = { version = "0.23", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rayon = { version = "1", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
+js-sys = "0.3"
 # tract-onnx-opl draws rand; in the browser its entropy comes from crypto.getRandomValues
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
@@ -21,3 +30,8 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+# The browser build is made at opt-level "s" (web/build.sh); tract's matrix
+# kernels, where the time goes, stay at 3.
+[profile.release.package.tract-linalg]
+opt-level = 3
