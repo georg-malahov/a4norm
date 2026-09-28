@@ -1164,6 +1164,10 @@ pub struct Edges {
 }
 
 impl Edges {
+    /// The bows, for a page's key.
+    pub fn key(&self) -> String {
+        self.sides.iter().map(|s| s.bow.iter().map(|b| format!("{:.2}", b)).collect::<Vec<_>>().join(",")).collect::<Vec<_>>().join("/")
+    }
     /// The same corners with straight sides: the plain quad, to judge by.
     pub fn straight(&self) -> Edges {
         Edges { sides: self.sides.iter().map(|s| Side { a: s.a, b: s.b, bow: [0.0; 3] }).collect(), bow: 0.0, size: self.size }

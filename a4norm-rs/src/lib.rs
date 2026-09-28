@@ -18,7 +18,7 @@ pub mod page;
 pub mod wasm;
 
 use img::Img;
-use page::{Card, PageOut, Processed};
+use page::{Card, Geo, PageOut, Processed, Seen};
 
 /// A run that must stop, with the message the script would exit with.
 #[derive(Debug)]
@@ -97,6 +97,12 @@ pub struct Opts {
     pub no_keep_photo: bool,
     pub no_flatten_paper: bool,
     pub magic: bool,
+    /// --look: "" (as before), auto, magic, color or original
+    pub look: String,
+    /// --quad and --kind: the document's corners set by hand, every input
+    pub hand: Option<page::Hand>,
+    /// --json: what was found on each photo and each page's geometry
+    pub json: Option<String>,
 }
 
 impl Default for Opts {
@@ -162,6 +168,9 @@ impl Default for Opts {
             no_keep_photo: false,
             no_flatten_paper: false,
             magic: false,
+            look: String::new(),
+            hand: None,
+            json: None,
         }
     }
 }
@@ -171,7 +180,9 @@ pub const USAGE: &str = "usage: a4norm [-h] [-o OUTPUT] [--format {pdf,jpg}] [--
               [--gray] [--landscape] [--rotate {auto,0,90,180,270}] [--spread {auto,on,off}]
               [--cards {auto,off}] [--card-size {actual,fit}] [--edges {auto,off}]
               [--rectify {auto,on,off}] [--photo {auto,on,off}] [--fit {auto,edges,content,frame}]
-              [--margins MARGINS] [--dry-run] [--preview] [tuning flags...]
+              [--margins MARGINS] [--dry-run] [--preview] [--magic]
+              [--look {auto,magic,color,original}] [--quad X,Y,...] [--kind KIND]
+              [--json PATH] [tuning flags...]
               INPUT [INPUT ...]
 
 Photo of a document -> scanner-like A4 PDF. The tuning flags are the Python
@@ -182,12 +193,25 @@ script's: --trim-band --trim-step --trim-pad --trim-shave --photo-paper
 --sharpen --content-min --rotate-tol --deskew-min --no-trim --no-deskew
 --no-neutralize --spread-scan --no-despeckle --no-keep-photo --no-flatten-paper";
 
+impl Opts {
+    /// --look folded into the flags the pipeline reads: auto is --magic,
+    /// magic forces it, color and original turn it off.
+    pub fn set_look(&mut self) {
+        match self.look.as_str() {
+            "auto" | "magic" => self.magic = true,
+            "color" | "original" => self.magic = false,
+            _ => {}
+        }
+    }
+}
+
 /// The command line, as the script's argparse reads it.
 pub fn parse_args(args: &[String]) -> Result<Opts, Fail> {
     let mut o = Opts::default();
     let err = |m: String| Fail(format!("{}\na4norm: error: {}", USAGE, m));
     let mut i = 0;
     let mut positional_only = false;
+    let (mut quad, mut kind): (Option<String>, Option<String>) = (None, None);
     type Set = fn(&mut Opts);
     let bools: &[(&str, Set)] = &[
         ("--separate", |o| o.separate = true),
@@ -271,6 +295,10 @@ pub fn parse_args(args: &[String]) -> Result<Opts, Fail> {
             "--photo" => o.photo = choice(&val, &["auto", "on", "off"])?,
             "--fit" => o.fit = choice(&val, &["auto", "edges", "content", "frame"])?,
             "--margins" => o.margins = val,
+            "--look" => o.look = choice(&val, &["auto", "magic", "color", "original"])?,
+            "--quad" => quad = Some(val),
+            "--kind" => kind = Some(choice(&val, &["sheet", "receipt", "spread", "cards"])?),
+            "--json" => o.json = Some(val),
             "--trim-band" => o.trim_band = f(&val)?,
             "--trim-step" => o.trim_step = f(&val)?,
             "--trim-pad" => o.trim_pad = n(&val)?.max(0) as usize,
@@ -301,6 +329,14 @@ pub fn parse_args(args: &[String]) -> Result<Opts, Fail> {
     if o.inputs.is_empty() {
         return Err(err("the following arguments are required: INPUT".into()));
     }
+    if let Some(q) = quad {
+        let v: Result<Vec<f64>, _> = q.split(',').map(|x| x.trim().parse::<f64>()).collect();
+        let v = v.map_err(|_| err(format!("argument --quad: numbers wanted, x,y per corner: '{}'", q)))?;
+        o.hand = Some(page::Hand::new(&v, kind.as_deref()).map_err(|e| err(format!("argument --quad: {}", e)))?);
+    } else if kind.is_some() {
+        return Err(err("argument --kind: goes with --quad".into()));
+    }
+    o.set_look();
     let m: Vec<Option<f64>> = o.margins.split(',').map(|x| x.trim().parse().ok()).collect();
     match m.as_slice() {
         [Some(l), Some(r), Some(t)] => {
@@ -313,27 +349,47 @@ pub fn parse_args(args: &[String]) -> Result<Opts, Fail> {
     Ok(o)
 }
 
-/// One finished page of the document.
+/// One finished page of the document: its geometry, and the rasters it
+/// was made from (two photos of one card each make one page).
 pub struct Page {
     pub img: Img,
     pub photo: bool,
     pub dpi: usize,
+    pub geo: Geo,
+    pub sources: Vec<usize>,
 }
 
 /// A source: its name and its rasters (a photo is one; a PDF may be many).
+/// `look` and `hand` stand in for --look and --quad on this source alone.
 pub struct Source {
     pub name: String,
     pub rasters: Vec<img::Src>,
+    pub look: Option<String>,
+    pub hand: Option<page::Hand>,
+}
+
+impl Source {
+    pub fn new(name: String, rasters: Vec<img::Src>) -> Source {
+        Source { name, rasters, look: None, hand: None }
+    }
+}
+
+/// A run's pages, and what was found on each raster, in input order;
+/// `page` is the index of the page the raster went to.
+pub struct Done {
+    pub pages: Vec<Page>,
+    pub photos: Vec<(Seen, usize)>,
 }
 
 /// Every raster of every source through the pipeline, the cards paired up,
 /// one page per group -- the script's build() short of writing files.
 /// `out` receives the lines the script prints; `progress` the share of the
 /// whole run done, 0..1, rising.
-pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: &dyn Fn(&str, f64)) -> Result<Vec<Page>, Fail> {
+pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: &dyn Fn(&str, f64)) -> Result<Done, Fail> {
     struct Item {
         res: Processed,
         report: Vec<String>,
+        seen: Seen,
     }
     let total = sources.iter().map(|s| s.rasters.len()).sum::<usize>().max(1) as f64;
     let weight = |s: &str| match s {
@@ -353,6 +409,21 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
         if n_src > 1 {
             out(&format!("  [{}/{}] {}", si + 1, n_src, basename(&s.name)));
         }
+        let own;
+        let so = if s.look.is_some() || s.hand.is_some() {
+            let mut c = o.clone();
+            if let Some(l) = &s.look {
+                c.look = l.clone();
+            }
+            if s.hand.is_some() {
+                c.hand = s.hand.clone();
+            }
+            c.set_look();
+            own = c;
+            &own
+        } else {
+            o
+        };
         for r in s.rasters {
             let mut rep = vec![];
             let base = k as f64 / total;
@@ -361,8 +432,8 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
                 done.set(v);
                 progress(st, v * 0.97);
             };
-            let res = page::process_page(r, o, &mut rep, &step)?;
-            items.push(Item { res, report: rep });
+            let (res, seen) = page::process_page(r, so, &mut rep, &step)?;
+            items.push(Item { res, report: rep, seen });
             k += 1;
         }
     }
@@ -380,14 +451,18 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
         }
     }
     let mut pages = vec![];
+    let mut photos: Vec<(Seen, usize)> = items.iter().map(|it| (it.seen.clone(), 0)).collect();
     for (pno, g) in groups.iter().enumerate() {
         out(&format!("  page {}:", pno + 1));
+        for &kk in g {
+            photos[kk].1 = pno;
+        }
         let first = &items[g[0]];
-        if let Processed::Page(PageOut { img, photo, dpi }) = &first.res {
+        if let Processed::Page(PageOut { img, photo, dpi, geo }) = &first.res {
             for line in &first.report {
                 out(&format!("    - {}", line));
             }
-            pages.push(Page { img: img.clone(), photo: *photo, dpi: *dpi });
+            pages.push(Page { img: img.clone(), photo: *photo, dpi: *dpi, geo: geo.clone(), sources: g.clone() });
             continue;
         }
         let mut cards: Vec<&Card> = vec![];
@@ -415,9 +490,44 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
             o.dpi,
             if o.card_size == "fit" { "page width" } else { "real size" }
         ));
-        pages.push(Page { img: pg, photo: false, dpi: o.dpi });
+        let mut key: Vec<String> = cards.iter().map(|c| c.geo.clone()).collect();
+        key.push(format!("cards {} @{}", o.card_size, o.dpi));
+        let geo = Geo { key: key.join("; "), look: cards[0].look, flat: "cards", lines: false };
+        pages.push(Page { img: pg, photo: false, dpi: o.dpi, geo, sources: g.clone() });
     }
-    Ok(pages)
+    Ok(Done { pages, photos })
+}
+
+impl Done {
+    /// --json: what was found on each raster and each page's geometry, the
+    /// fields the browser's process() returns beside the pages.
+    pub fn json(&self) -> String {
+        let q = |v: &[detect::Quad]| v.iter().flat_map(|q| q.iter().flat_map(|p| [p.0, p.1])).map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let photos: Vec<String> = self
+            .photos
+            .iter()
+            .map(|(s, p)| format!("{{\"kind\":\"{}\",\"quads\":[{}],\"width\":{},\"height\":{},\"page\":{},\"hand\":{}}}", s.kind, q(&s.quads), s.w, s.h, p, s.hand))
+            .collect();
+        let pages: Vec<String> = self
+            .pages
+            .iter()
+            .map(|p| {
+                format!(
+                    "{{\"dpi\":{},\"width\":{},\"height\":{},\"geom\":{{\"sources\":[{}],\"key\":\"{}\",\"look\":\"{}\",\"flat\":\"{}\",\"lines\":{}}}}}",
+                    p.dpi,
+                    p.img.w,
+                    p.img.h,
+                    p.sources.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(","),
+                    esc(&p.geo.key),
+                    p.geo.look,
+                    p.geo.flat,
+                    p.geo.lines
+                )
+            })
+            .collect();
+        format!("{{\"photos\":[{}],\"pages\":[{}]}}\n", photos.join(","), pages.join(","))
+    }
 }
 
 /// A page as the JPEG the script encodes: photos at --photo-quality with

@@ -219,10 +219,14 @@ fn build(group: &[String], out: &str, o: &Opts) -> Result<Vec<String>, Fail> {
                 std::fs::write(&p, &r.px).ok();
                 eprintln!("dumped {}x{}", r.w, r.h);
             }
-            sources.push(Source { name: s.clone(), rasters });
+            sources.push(Source::new(s.clone(), rasters));
         }
         mem::report("decode");
-        let pages = run(sources, o, &mut |l| say!("{}", l), &|st, _| mem::report(st))?;
+        let done = run(sources, o, &mut |l| say!("{}", l), &|st, _| mem::report(st))?;
+        if let Some(j) = &o.json {
+            std::fs::write(j, done.json()).map_err(|e| Fail(format!("a4norm: {}: {}", j, e)))?;
+        }
+        let pages = done.pages;
         if o.dry_run {
             say!("  (dry run — nothing written)");
             return Ok(vec![]);

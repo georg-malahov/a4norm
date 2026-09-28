@@ -5,7 +5,10 @@
 //! await initThreadPool(navigator.hardwareConcurrency);   // threaded build only
 //! const r = process([{ bytes, name }], ['--format', 'jpg', '--dpi', '200'],
 //!                   (stage, done) => ...);                // done: 0..1, rising
-//! // r = { pages: [{ jpg: Uint8Array, dpi }], report: "photo-0.jpg\n  page 1:\n    - ..." }
+//! // r = { pages: [{ jpg: Uint8Array, dpi, geom }], photos: [...],
+//! //       report: "photo-0.jpg\n  page 1:\n    - ..." }
+//! // a file may carry its own look and corners set by hand (docs/api.md):
+//! //   { bytes, name, look: 'magic', quad: Float64Array, kind: 'spread' }
 //! const pdf = pack(jpgs, dpis, gray);
 //! // pages turned without touching their JPEGs: quarter turns clockwise each
 //! const turnedPdf = pack(jpgs, dpis, gray, new Int32Array([0, 1, 0, 2]));
@@ -52,7 +55,20 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
         let src = io::decode(&bytes, &name).map_err(|e| JsValue::from_str(&e.0))?;
         drop(bytes);
         names.push(name.clone());
-        sources.push(Source { name, rasters: vec![src] });
+        let mut s = Source::new(name, vec![src]);
+        s.look = get(&f, "look").as_string();
+        if let Some(l) = &s.look {
+            if !["auto", "magic", "color", "original"].contains(&l.as_str()) {
+                return Err(JsValue::from_str(&format!("a4norm: look '{}': auto, magic, color or original", l)));
+            }
+        }
+        let quad = get(&f, "quad");
+        if !quad.is_undefined() && !quad.is_null() {
+            let v: Vec<f64> = Array::from(&quad).iter().filter_map(|x| x.as_f64()).collect();
+            let kind = get(&f, "kind").as_string();
+            s.hand = Some(crate::page::Hand::new(&v, kind.as_deref()).map_err(|e| JsValue::from_str(&format!("a4norm: {}: quad: {}", s.name, e)))?);
+        }
+        sources.push(s);
     }
     argv.extend(names.iter().cloned());
     let o = parse_args(&argv).map_err(|e| JsValue::from_str(&e.0))?;
@@ -64,21 +80,45 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
             let _ = p.call2(&JsValue::NULL, &JsValue::from_str(stage), &JsValue::from_f64(done));
         }
     };
-    let pages = run(sources, &o, &mut |l| {
+    let done = run(sources, &o, &mut |l| {
         report.push_str(l);
         report.push('\n');
     }, &tick)
     .map_err(|e| JsValue::from_str(&e.0))?;
+    let num = |v: usize| JsValue::from_f64(v as f64);
     let out = Array::new();
-    for p in &pages {
+    for p in &done.pages {
         let page = Object::new();
         set(&page, "jpg", &Uint8Array::from(encode_page(p, &o).as_slice()));
-        set(&page, "dpi", &JsValue::from_f64(p.dpi as f64));
+        set(&page, "dpi", &num(p.dpi));
+        let geom = Object::new();
+        set(&geom, "sources", &p.sources.iter().map(|&s| num(s)).collect::<Array>());
+        set(&geom, "key", &JsValue::from_str(&p.geo.key));
+        set(&geom, "look", &JsValue::from_str(p.geo.look));
+        set(&geom, "flat", &JsValue::from_str(p.geo.flat));
+        set(&geom, "lines", &JsValue::from_bool(p.geo.lines));
+        set(&geom, "width", &num(p.img.w));
+        set(&geom, "height", &num(p.img.h));
+        set(&page, "geom", &geom);
         out.push(&page);
+    }
+    let photos = Array::new();
+    for (s, pno) in &done.photos {
+        let ph = Object::new();
+        let flat: Vec<f64> = s.quads.iter().flat_map(|q| q.iter().flat_map(|p| [p.0, p.1])).collect();
+        set(&ph, "kind", &JsValue::from_str(s.kind));
+        // f64: sent back as they came, the corners give the same key
+        set(&ph, "quads", &js_sys::Float64Array::from(flat.as_slice()).into());
+        set(&ph, "width", &num(s.w));
+        set(&ph, "height", &num(s.h));
+        set(&ph, "page", &num(*pno));
+        set(&ph, "hand", &JsValue::from_bool(s.hand));
+        photos.push(&ph);
     }
     tick("done", 1.0);
     let r = Object::new();
     set(&r, "pages", &out);
+    set(&r, "photos", &photos);
     set(&r, "report", &JsValue::from_str(&report));
     Ok(r)
 }
