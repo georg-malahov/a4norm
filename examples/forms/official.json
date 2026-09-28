@@ -1,0 +1,156 @@
+[
+ {
+  "id": "frankfurt-aufenthaltstitel",
+  "title": "Aufenthaltstitel – Antrag auf Erteilung bzw. Verlängerung",
+  "authority": "Stadt Frankfurt am Main, Ausländerbehörde",
+  "url": "https://frankfurt.de/-/media/frankfurtde/service-und-rathaus/verwaltung/aemter-und-institutionen/ordnungsamt/auslaenderbehoerde/pdf/aufenthaltstitel---antrag-auf-erteilung-bzw-verlaengerung.pdf",
+  "version": "Stand Juni 2021",
+  "downloaded": "2026-09-28T20:29Z",
+  "sha256": "47f84813c2583617c6bf58eb40811dc591bb3218f39e861d28d6d256cf4c44df",
+  "bytes": 254228,
+  "note": "AcroForm; DE/EN/FR/ES/HR/TR in every label"
+ },
+ {
+  "id": "berlin-aufenthaltstitel",
+  "title": "Antrag auf Erteilung eines Aufenthaltstitels (deutsch, englisch, französisch, italienisch)",
+  "authority": "Landesamt für Einwanderung Berlin",
+  "url": "https://www.berlin.de/einwanderung/_assets/antrag-aufenthaltstitel-deutsch-engl-frz-ital.pdf",
+  "version": "14.01.2025",
+  "downloaded": "2026-09-28T20:28Z",
+  "sha256": "8d6d2a68e72c70e5013648780c91ae0855029af94b0a6549f8ed895896c75918",
+  "bytes": 192181,
+  "note": "text PDF; DE/EN/FR/IT"
+ },
+ {
+  "id": "bayern-wohngeld-druck",
+  "title": "Wohngeld – Antrag auf Mietzuschuss (zum Ausdrucken)",
+  "authority": "Bayerisches Staatsministerium für Wohnen, Bau und Verkehr",
+  "url": "https://www.stmb.bayern.de/assets/stmi/wohnen/wohngeld/35_mz_antrag.pdf",
+  "version": "Stand: Januar 2023",
+  "downloaded": "2026-09-28T20:28Z",
+  "sha256": "f023d064eb1c9f8753a4dddeb6da62721761498cacd9951b98f7f8be2a05c4b2",
+  "bytes": 536670,
+  "note": "no fields; AES, owner password"
+ },
+ {
+  "id": "bayern-wohngeld-bildschirm",
+  "title": "Wohngeld – Antrag auf Mietzuschuss (am Bildschirm ausfüllbar)",
+  "authority": "Bayerisches Staatsministerium für Wohnen, Bau und Verkehr",
+  "url": "https://www.stmb.bayern.de/assets/stmi/wohnen/wohngeld/35_mz_antrag_bildschirm.pdf",
+  "version": "Stand: Januar 2023",
+  "downloaded": "2026-09-28",
+  "sha256": "35a760c0c3b4a6ab5b97e6e1a93310b01e0400c21c23af45f243e24c6970cfb2",
+  "bytes": 770414,
+  "note": "387 widgets; AES, owner password"
+ },
+ {
+  "id": "ba-kg1-kindergeld",
+  "title": "KG 1 – Antrag auf Kindergeld",
+  "authority": "Bundesagentur für Arbeit, Familienkasse",
+  "url": "https://www.arbeitsagentur.de/datei/kg1-antrag-kindergeld_ba036550.pdf",
+  "version": "Stand September 2025",
+  "downloaded": "2026-09-28",
+  "sha256": "53651bbe336039b6ca3852f1fa7288b4841349afd1978a4b91469fea15eaac43",
+  "bytes": 1508259,
+  "note": "static XFA + AcroForm; AES, owner password"
+ },
+ {
+  "id": "ba-kg1-anlage-kind",
+  "title": "KG 1 Anlage Kind",
+  "authority": "Bundesagentur für Arbeit, Familienkasse",
+  "url": "https://www.arbeitsagentur.de/datei/kg1-anlagekind_ba033765.pdf",
+  "version": "Stand September 2025",
+  "downloaded": "2026-09-28",
+  "sha256": "baf78a8dbaa84490964772b5f37a6a9b2ff3e5c4683b9ef3d678b3d638926f6f",
+  "bytes": 1423074,
+  "note": "static XFA + AcroForm; AES, owner password"
+ },
+ {
+  "id": "ba-jobcenter-hauptantrag",
+  "title": "Hauptantrag Bürgergeld (SGB II)",
+  "authority": "Bundesagentur für Arbeit / Jobcenter",
+  "url": "https://www.arbeitsagentur.de/datei/antrag-sgb2_ba042689.pdf",
+  "version": "PDF of 2026-02-05",
+  "downloaded": "2026-09-28",
+  "sha256": "5901f5fb3ab2d3d1be882326b5f016183bde902f5baa0d9dc4caf907f1707282",
+  "bytes": 492597,
+  "note": "AcroForm; comb cells"
+ },
+ {
+  "id": "muenchen-aufenthaltstitel",
+  "title": "Antrag auf Erteilung eines Aufenthaltstitels",
+  "authority": "Landeshauptstadt München, Kreisverwaltungsreferat",
+  "url": "https://stadt.muenchen.de/dam/jcr:c38c3e57-d9ed-4917-b2b5-229f7f008e4c/antragaufenthaltstitel.pdf",
+  "version": "PDF of 2025-06-30",
+  "downloaded": "2026-09-28",
+  "sha256": "1e11bf83f3945d0d18c5d5d0c708788465ac7fde2806b3db7586cdf2310852e1",
+  "bytes": 256859,
+  "note": "AcroForm; DE/EN"
+ },
+ {
+  "id": "zbfs-elterngeld",
+  "title": "Antrag auf Elterngeld (gesamt)",
+  "authority": "Zentrum Bayern Familie und Soziales",
+  "url": "https://www.zbfs.bayern.de/imperia/md/content/zbfs_intranet/produktgruppe_i/formulare/beeg-antrag/052025_elterngeldantrag_gesamt.pdf",
+  "version": "05/2025",
+  "downloaded": "2026-09-28",
+  "sha256": "3ca0389ca824e664c74c9fb0c32a255683db5f8b273469a03424e3b9ed5d1584",
+  "bytes": 1653521,
+  "note": "32 pages, 1024 widgets; low fields"
+ },
+ {
+  "id": "zbfs-familiengeld",
+  "title": "Antrag auf Bayerisches Familiengeld",
+  "authority": "Zentrum Bayern Familie und Soziales",
+  "url": "https://www.zbfs.bayern.de/imperia/md/content/zbfs_intranet/produktgruppe_i/formulare/familiengeld/familiengeldantrag.pdf",
+  "version": "Stand: Mai 2021",
+  "downloaded": "2026-09-28",
+  "sha256": "e1f7d4207aa38ae6dc7fe2412a07ee037129b864f7d07946933541906ef49366",
+  "bytes": 387285,
+  "note": "AcroForm"
+ },
+ {
+  "id": "mkk-familienversicherung",
+  "title": "Antrag auf Familienversicherung",
+  "authority": "mkk – meine krankenkasse (BKK, Körperschaft des öffentlichen Rechts)",
+  "url": "https://www.meine-krankenkasse.de/fileadmin/Dokumente/Formulare/Versicherung/antrag-familienversicherung-mkk.pdf",
+  "version": "PDF of 2026-01-05",
+  "downloaded": "2026-09-28",
+  "sha256": "c771aaad42cdf7466d2d3f7be0b99bb2c4387e080f94e8f67fa7ab52860a0b16",
+  "bytes": 1026398,
+  "note": "AcroForm"
+ },
+ {
+  "id": "bafoeg-formblatt-1",
+  "title": "BAföG Formblatt 1 – Antrag auf Ausbildungsförderung",
+  "authority": "Bundesministerium für Bildung und Forschung",
+  "url": "https://www.xn--bafg-7qa.de/bafoeg/shareddocs/downloads/formblaetter/v2025/formblatt_1.pdf?__blob=publicationFile&v=11",
+  "version": "v2025",
+  "downloaded": "2026-09-28",
+  "sha256": "db226f6a2357bb2095246a5291f9e91b67286775378bdfa0d4e0c008d3b8ffcf",
+  "bytes": 416207,
+  "note": "AcroForm"
+ },
+ {
+  "id": "drv-v0100",
+  "title": "V0100 – Antrag auf Kontenklärung",
+  "authority": "Deutsche Rentenversicherung",
+  "url": "https://www.deutsche-rentenversicherung.de/SharedDocs/Formulare/DE/_pdf/V0100.pdf?__blob=publicationFile&v=7",
+  "version": "Version 39021",
+  "downloaded": "2026-09-28",
+  "sha256": "dc44df1b5c26ef63912c6d7e1798ef4842984a5420fcfe8d580d2715a03086af",
+  "bytes": 646044,
+  "note": "AcroForm"
+ },
+ {
+  "id": "finanzamt-est-1a-2025",
+  "title": "ESt 1 A 2025 – Einkommensteuererklärung",
+  "authority": "Finanzverwaltung; the copy of the Finanzamt Neubrandenburg (Rente im Ausland)",
+  "url": "https://www.finanzamt-rente-im-ausland.de/export/sites/fmria/de/.galleries/formulare/Formulare-2025-Einkommensteuer/ESt_1_A_2025.pdf",
+  "version": "2025",
+  "downloaded": "2026-09-28",
+  "sha256": "8a559bf4040025250875383c4c9c7a12b71b35f264f4a5ab18ce7e9bb9eab914",
+  "bytes": 64811,
+  "note": "flat, no fields"
+ }
+]
