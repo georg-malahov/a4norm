@@ -101,6 +101,36 @@ pub fn divide_paper(img: &mut Img) {
     img.q8();
 }
 
+/// Binary erosion or dilation by a (2rx+1)x(2ry+1) rectangle with running
+/// counts: the cost does not grow with the rectangle. Outside the image
+/// counts as unset for a dilation and as set for an erosion.
+fn box_morph(m: &[u8], w: usize, h: usize, rx: usize, ry: usize, dilate: bool) -> Vec<u8> {
+    let pad = (!dilate) as u32;
+    let rows: Vec<u32> = ops::par_map(h, |y| {
+        let row = &m[y * w..(y + 1) * w];
+        let at = |x: isize| if x >= 0 && (x as usize) < w { row[x as usize] as u32 } else { pad };
+        let mut c: u32 = (-(rx as isize)..=rx as isize).map(at).sum();
+        let mut out = vec![0u32; w];
+        for x in 0..w {
+            out[x] = c;
+            c = c + at(x as isize + rx as isize + 1) - at(x as isize - rx as isize);
+        }
+        out
+    })
+    .concat();
+    let full = ((2 * rx + 1) * (2 * ry + 1)) as u32;
+    let at = |y: isize, x: usize| if y >= 0 && (y as usize) < h { rows[y as usize * w + x] } else { pad * (2 * rx + 1) as u32 };
+    let mut out = vec![0u8; w * h];
+    let mut c: Vec<u32> = (0..w).map(|x| (-(ry as isize)..=ry as isize).map(|y| at(y, x)).sum()).collect();
+    for y in 0..h {
+        for x in 0..w {
+            out[y * w + x] = if dilate { (c[x] > 0) as u8 } else { (c[x] == full) as u8 };
+            c[x] = c[x] + at(y as isize + ry as isize + 1, x) - at(y as isize - ry as isize, x);
+        }
+    }
+    out
+}
+
 /// Whether any pixel is set in the (2r+1)^2 square around each pixel.
 fn box_any(m: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
     // along rows, then down columns, with running counts
@@ -208,7 +238,10 @@ fn fill_rules(ink: &mut [u8], n: &Plane, level: &[f32], w: usize, h: usize) {
                     path.pop();
                 }
                 let span = last - a0 + 1;
-                if span >= long && on as f64 >= RULE_ON * span as f64 && inked as f64 >= RULE_INKED * on as f64 {
+                // a printed rule stops short of the margins; a fold runs from
+                // edge to edge
+                let fold = span as f64 >= RULE_FOLD * len as f64;
+                if span >= long && !fold && on as f64 >= RULE_ON * span as f64 && inked as f64 >= RULE_INKED * on as f64 {
                     for (a, c) in path {
                         ink[at(a, c)] = 1;
                     }
@@ -229,7 +262,7 @@ fn fill_rules(ink: &mut [u8], n: &Plane, level: &[f32], w: usize, h: usize) {
 /// edge (a footer, a publisher's line) touches nothing and stays.
 fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
     let r = (w.min(h) / THICK_DIV).max(3);
-    let thick = morph_k(&morph_k(ink, w, h, &ops::disk(r), false), w, h, &ops::disk(r), true);
+    let thick = box_morph(&box_morph(ink, w, h, r, r, false), w, h, r, r, true);
     let touch = |x0: usize, x1: usize, y0: usize, y1: usize| x0 <= BORDER_TOUCH || y0 <= BORDER_TOUCH || x1 + BORDER_TOUCH >= w - 1 || y1 + BORDER_TOUCH >= h - 1;
     let bbox = |comp: &[usize]| {
         let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
@@ -257,7 +290,7 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
             }
         }
     }
-    let bg = morph_k(&bg, w, h, &ops::disk(r + 1), true);
+    let bg = box_morph(&bg, w, h, r + 1, r + 1, true);
     // text printed on that shadow is darker than it, and stays
     for ((v, &b), &g) in ink.iter_mut().zip(&bg).zip(&n.d) {
         if b != 0 && g > EDGE_TEXT {
@@ -274,7 +307,8 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
         // grey blotches near a side: shade, not print (print is dark after
         // the division, a pencil mark is thin and away from the side)
         let z = (w.min(h) as f64 * GREY_ZONE) as usize;
-        let near = y1 + z >= h - 1 || y0 <= z || x0 <= z || x1 + z >= w - 1;
+        // lying wholly by a side, not merely reaching it
+        let near = y0 + 2 * z >= h - 1 || y1 <= 2 * z || x1 <= 2 * z || x0 + 2 * z >= w - 1;
         let grey = near && {
             let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -303,10 +337,9 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
     let strip = (w.min(h) as f64 * RIM_STRIP) as usize;
     let long = (w.min(h) as f64 * RIM_BAND_LONG) as usize;
     let thick = RIM_BAND_THICK;
-    let rect = |hw: usize, hh: usize| -> ops::Kernel { (-(hh as isize)..=hh as isize).map(|dy| (dy, hw)).collect() };
     for vertical in [true, false] {
-        let k = if vertical { rect(thick, long) } else { rect(long, thick) };
-        let band = morph_k(&morph_k(ink, w, h, &k, false), w, h, &k, true);
+        let (rx, ry) = if vertical { (thick, long) } else { (long, thick) };
+        let band = box_morph(&box_morph(ink, w, h, rx, ry, false), w, h, rx, ry, true);
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
@@ -637,6 +670,8 @@ const RULE_GAP: f64 = 0.01;
 const RULE_FILL_LONG: f64 = 0.08;
 const RULE_ON: f64 = 0.6;
 const RULE_INKED: f64 = 0.3;
+/// A line over this share of the page's length is a fold, not a rule.
+const RULE_FOLD: f64 = 0.85;
 /// Thick is what survives an opening of short side / THICK_DIV; a part that
 /// touches the border within BORDER_TOUCH px and reaches no more than
 /// BORDER_DEPTH of the page in is off the border.
@@ -655,7 +690,7 @@ const GREY_BLOT: f32 = 0.5;
 /// A piece no thicker than this share of the page, lying along a side
 /// within GREY_ZONE, is the sheet's edge.
 const EDGE_THIN: f64 = 0.004;
-const EDGE_LINE_ZONE: f64 = 0.06;
+const EDGE_LINE_ZONE: f64 = 0.03;
 /// A rim band: in the outer RIM_STRIP of the page, at least RIM_BAND_LONG of
 /// it long and 2*RIM_BAND_THICK+1 px thick.
 const RIM_STRIP: f64 = 0.025;
