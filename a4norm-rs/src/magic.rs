@@ -141,6 +141,196 @@ fn box_any(m: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
     out
 }
 
+/// Rules along rows and columns whose ink has gaps: a pixel is a ridge when
+/// it is darker than the page at both sides across the line (a shade's edge
+/// is dark on one side only). Along a row, ridges with short gaps between
+/// them that run on for a good share of the page, mostly ink already, are
+/// made ink along all their length.
+fn fill_rules(ink: &mut [u8], n: &Plane, level: &[f32], w: usize, h: usize) {
+    let d = RIDGE_OFF;
+    let ridge = |horiz: bool| -> Vec<u8> {
+        ops::par_map(h, |y| {
+            let mut row = vec![0u8; w];
+            for x in 0..w {
+                let i = y * w + x;
+                let v = n.d[i];
+                let (a, b) = if horiz {
+                    if y < d || y + d >= h {
+                        continue;
+                    }
+                    (n.d[i - d * w], n.d[i + d * w])
+                } else {
+                    if x < d || x + d >= w {
+                        continue;
+                    }
+                    (n.d[i - d], n.d[i + d])
+                };
+                row[x] = (v < a.min(b) - RIDGE_STEP && v < level[i] - RIDGE_STEP) as u8;
+            }
+            row
+        })
+        .concat()
+    };
+    let gap = (w.min(h) as f64 * RULE_GAP) as usize;
+    let long = (w.min(h) as f64 * RULE_FILL_LONG) as usize;
+    // never along a side close to it: that is the sheet's own edge
+    let zl = (w.min(h) as f64 * EDGE_LINE_ZONE) as usize;
+    // A rule traced from each ridge pixel along its length (a: along, c:
+    // across). It may step one pixel across at a time, as a rule on a sheet
+    // that is not quite square does, and cross gaps of up to `gap` straight.
+    let trace = |ink: &mut [u8], r: &[u8], horiz: bool| {
+        let (len, wid) = if horiz { (w, h) } else { (h, w) };
+        let at = |a: usize, c: usize| if horiz { c * w + a } else { a * w + c };
+        let mut seen = vec![0u8; w * h];
+        for c0 in zl..wid.saturating_sub(zl) {
+            for a0 in 0..len {
+                if r[at(a0, c0)] == 0 || seen[at(a0, c0)] != 0 {
+                    continue;
+                }
+                let mut path = vec![(a0, c0)];
+                let (mut c, mut last, mut on, mut inked) = (c0, a0, 1usize, ink[at(a0, c0)] as usize);
+                seen[at(a0, c0)] = 1;
+                let mut a = a0 + 1;
+                while a < len && a - last <= gap {
+                    let hit = [c, c.saturating_sub(1), (c + 1).min(wid - 1)].into_iter().find(|&cc| r[at(a, cc)] != 0);
+                    if let Some(cc) = hit {
+                        c = cc;
+                        last = a;
+                        on += 1;
+                        inked += ink[at(a, c)] as usize;
+                        seen[at(a, c)] = 1;
+                    }
+                    path.push((a, c));
+                    a += 1;
+                }
+                // the path up to its last ridge
+                while path.last().is_some_and(|p| p.0 > last) {
+                    path.pop();
+                }
+                let span = last - a0 + 1;
+                if span >= long && on as f64 >= RULE_ON * span as f64 && inked as f64 >= RULE_INKED * on as f64 {
+                    for (a, c) in path {
+                        ink[at(a, c)] = 1;
+                    }
+                }
+            }
+        }
+    };
+    let rh = ridge(true);
+    trace(ink, &rh, true);
+    drop(rh);
+    let rv = ridge(false);
+    trace(ink, &rv, false);
+}
+
+/// Ink from the page's border: thick dark parts that reach the border (the
+/// desk, a shadow, a curled rim) with a margin round them, then whatever
+/// still touches the border only a little way in. Text a little in from the
+/// edge (a footer, a publisher's line) touches nothing and stays.
+fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
+    let r = (w.min(h) / THICK_DIV).max(3);
+    let thick = morph_k(&morph_k(ink, w, h, &ops::disk(r), false), w, h, &ops::disk(r), true);
+    let touch = |x0: usize, x1: usize, y0: usize, y1: usize| x0 <= BORDER_TOUCH || y0 <= BORDER_TOUCH || x1 + BORDER_TOUCH >= w - 1 || y1 + BORDER_TOUCH >= h - 1;
+    let bbox = |comp: &[usize]| {
+        let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
+        for &i in comp {
+            x0 = x0.min(i % w);
+            x1 = x1.max(i % w);
+            y0 = y0.min(i / w);
+            y1 = y1.max(i / w);
+        }
+        (x0, x1, y0, y1)
+    };
+    // thick and dark, touching the border or lying along a side near it
+    // (a curled rim's shadow runs a little in from the page's own edge)
+    let zone = (w.min(h) as f64 * EDGE_ZONE) as usize;
+    let mut bg = vec![0u8; w * h];
+    for comp in crate::detect::components(&thick, w, h) {
+        let (x0, x1, y0, y1) = bbox(&comp);
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        let along_h = bw >= RIM_LONG * bh && bw as f64 >= EDGE_ALONG * w as f64;
+        let along_v = bh >= RIM_LONG * bw && bh as f64 >= EDGE_ALONG * h as f64;
+        let by_side = (along_h && (y1 <= zone || y0 + zone >= h - 1)) || (along_v && (x1 <= zone || x0 + zone >= w - 1));
+        if touch(x0, x1, y0, y1) || by_side {
+            for i in comp {
+                bg[i] = 1;
+            }
+        }
+    }
+    let bg = morph_k(&bg, w, h, &ops::disk(r + 1), true);
+    // text printed on that shadow is darker than it, and stays
+    for ((v, &b), &g) in ink.iter_mut().zip(&bg).zip(&n.d) {
+        if b != 0 && g > EDGE_TEXT {
+            *v = 0;
+        }
+    }
+    let depth = (w.min(h) as f64 * BORDER_DEPTH) as usize;
+    for comp in crate::detect::components(ink, w, h) {
+        let (x0, x1, y0, y1) = bbox(&comp);
+        let shallow = (x0 <= BORDER_TOUCH && x1 <= depth)
+            || (x1 + BORDER_TOUCH >= w - 1 && x0 + depth >= w - 1)
+            || (y0 <= BORDER_TOUCH && y1 <= depth)
+            || (y1 + BORDER_TOUCH >= h - 1 && y0 + depth >= h - 1);
+        // grey blotches near a side: shade, not print (print is dark after
+        // the division, a pencil mark is thin and away from the side)
+        let z = (w.min(h) as f64 * GREY_ZONE) as usize;
+        let near = y1 + z >= h - 1 || y0 <= z || x0 <= z || x1 + z >= w - 1;
+        let grey = near && {
+            let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2] > GREY_BLOT
+        };
+        // thin pieces along a side close to it: the sheet's own edge line
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        let thin = (w.min(h) as f64 * EDGE_THIN) as usize;
+        let zl = (w.min(h) as f64 * EDGE_LINE_ZONE) as usize;
+        let edge_line = (bh <= thin && bw >= 3 * bh && (y1 + zl >= h - 1 || y0 <= zl)) || (bw <= thin && bh >= 3 * bw && (x1 + zl >= w - 1 || x0 <= zl));
+        if shallow || edge_line {
+            for i in comp {
+                ink[i] = 0;
+            }
+        } else if grey {
+            // its grey goes; letters inside it, darker, stay
+            for i in comp {
+                if n.d[i] > EDGE_TEXT {
+                    ink[i] = 0;
+                }
+            }
+        }
+    }    // a grey band along a side, thick and long, that print runs into (staff
+    // lines, a table's rules): the sheet's rim, cut out of what it touches.
+    // Thin rules and dark print survive.
+    let strip = (w.min(h) as f64 * RIM_STRIP) as usize;
+    let long = (w.min(h) as f64 * RIM_BAND_LONG) as usize;
+    let thick = RIM_BAND_THICK;
+    let rect = |hw: usize, hh: usize| -> ops::Kernel { (-(hh as isize)..=hh as isize).map(|dy| (dy, hw)).collect() };
+    for vertical in [true, false] {
+        let k = if vertical { rect(thick, long) } else { rect(long, thick) };
+        let band = morph_k(&morph_k(ink, w, h, &k, false), w, h, &k, true);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let by_side = if vertical { x < strip || x + strip >= w } else { y < strip || y + strip >= h };
+                if band[i] != 0 && by_side && n.d[i] > EDGE_TEXT {
+                    ink[i] = 0;
+                }
+            }
+        }
+    }
+    // once the shade is gone, the sheet's edge line it hid is on its own
+    let thin = (w.min(h) as f64 * EDGE_THIN) as usize;
+    let zl = (w.min(h) as f64 * EDGE_LINE_ZONE) as usize;
+    for comp in crate::detect::components(ink, w, h) {
+        let (x0, x1, y0, y1) = bbox(&comp);
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        if (bh <= thin && bw >= 3 * bh && (y1 + zl >= h - 1 || y0 <= zl)) || (bw <= thin && bh >= 3 * bw && (x1 + zl >= w - 1 || x0 <= zl)) {
+            for i in comp {
+                ink[i] = 0;
+            }
+        }
+    }
+}
+
 /// 4-connected runs of `core` that hold at least one `seed` pixel.
 fn grow(core: &[u8], seed: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![0u8; w * h];
@@ -281,12 +471,15 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     let ink: Vec<u8> = (0..w * h)
         .map(|i| {
             // coloured ink (a stamp, a blue pen) is kept however pale: a
-            // shadow is grey
-            let tint = if img.c.len() == 3 {
+            // shadow is grey. Its colour is the ink's hue against the light
+            // around it, and it is a mark, with an edge near: a warm or
+            // tinted light over a fold is neither
+            let tint = img.c.len() == 3 && {
                 let (r, g, b) = (img.c[0].d[i], img.c[1].d[i], img.c[2].d[i]);
-                r.max(g).max(b) - r.min(g).min(b) > TINT
-            } else {
-                false
+                let c = r.max(g).max(b) - r.min(g).min(b);
+                // strongly coloured (a stamp's pale fill), or coloured, dark
+                // enough and marked
+                c > 2.0 * TINT || (c > TINT && near[i] != 0 && n.d[i] < level[i] - TINT_DARK)
             };
             ((n.d[i] < thr[i] && near[i] != 0) || tint) as u8
         })
@@ -322,10 +515,30 @@ pub fn ink_or_paper(img: &mut Img) -> f64 {
     let solid = grow(&core, &ink, w, h);
     let mut ink: Vec<u8> = ink.iter().zip(&solid).map(|(&a, &b)| a | b).collect();
     mark("  ip: solid grow");
+    // a long thin rule, faint in places: kept whole
+    fill_rules(&mut ink, &n, &level, w, h);
+    mark("  ip: rules filled");
+    // what comes in from the page's border: the desk, a shadow or the curled
+    // rim a rectify left along a side, dark and thick, and whatever touches
+    // the border only a little way in
+    off_border(&mut ink, &n, w, h);
+    mark("  ip: off border");
     // grain that passed for ink in a deep shadow: specks of a few pixels
     let speck = (w.min(h) / SPECK_DIV).max(2);
+    // and small coloured crumbs: the back's print showing through a fold,
+    // tinted by the light (a colour mark worth keeping is larger)
+    let crumb = speck * CRUMB_K;
+    let chroma = |i: usize| {
+        if img.c.len() == 3 {
+            let (r, g, b) = (img.c[0].d[i], img.c[1].d[i], img.c[2].d[i]);
+            r.max(g).max(b) - r.min(g).min(b)
+        } else {
+            0.0
+        }
+    };
     for comp in crate::detect::components(&ink, w, h) {
-        if comp.len() <= speck {
+        let tinted = comp.len() <= crumb && comp.iter().map(|&i| chroma(i)).sum::<f32>() / comp.len() as f32 > TINT;
+        if comp.len() <= speck || tinted {
             for i in comp {
                 ink[i] = 0;
             }
@@ -401,14 +614,53 @@ const LINE_MIN: f32 = 0.04;
 const LINE_K: f32 = 3.0;
 /// A pixel this far from grey is coloured ink, kept whatever its edges.
 const TINT: f32 = 0.12;
+/// and at least this much darker than the paper: the print on the back
+/// showing through is pale.
+const TINT_DARK: f32 = 0.08;
 /// Ink blobs of at most short side / SPECK_DIV pixels are grain.
 const SPECK_DIV: usize = 250;
+/// A coloured blob up to CRUMB_K specks is a crumb.
+const CRUMB_K: usize = 12;
 /// A rule is at least this share of the page long.
 const RULE_LONG: f64 = 0.05;
 /// Ink inside this share of the page from its edge, and no deeper than
 /// twice that, is the sheet's rim.
 const EDGE_BAND: f64 = 0.015;
 const RIM_LONG: usize = 4;
+/// A rule's ridge: darker by RIDGE_STEP than the page RIDGE_OFF px to both
+/// sides across it. Runs with gaps of at most RULE_GAP of the page, at least
+/// RULE_FILL_LONG long, ridge along RULE_ON of it and ink along RULE_INKED of
+/// the ridge, are filled.
+const RIDGE_OFF: usize = 3;
+const RIDGE_STEP: f32 = 0.03;
+const RULE_GAP: f64 = 0.01;
+const RULE_FILL_LONG: f64 = 0.08;
+const RULE_ON: f64 = 0.6;
+const RULE_INKED: f64 = 0.3;
+/// Thick is what survives an opening of short side / THICK_DIV; a part that
+/// touches the border within BORDER_TOUCH px and reaches no more than
+/// BORDER_DEPTH of the page in is off the border.
+const THICK_DIV: usize = 300;
+const BORDER_TOUCH: usize = 2;
+const BORDER_DEPTH: f64 = 0.03;
+/// A thick band lying along a side within EDGE_ZONE of the page, at least
+/// EDGE_ALONG of the side long, is the rim's shadow.
+const EDGE_ZONE: f64 = 0.07;
+const EDGE_ALONG: f64 = 0.2;
+/// Darker than this is print on the shade; a blot within GREY_ZONE of a side
+/// whose median is lighter than GREY_BLOT is shade.
+const EDGE_TEXT: f32 = 0.4;
+const GREY_ZONE: f64 = 0.035;
+const GREY_BLOT: f32 = 0.5;
+/// A piece no thicker than this share of the page, lying along a side
+/// within GREY_ZONE, is the sheet's edge.
+const EDGE_THIN: f64 = 0.004;
+const EDGE_LINE_ZONE: f64 = 0.06;
+/// A rim band: in the outer RIM_STRIP of the page, at least RIM_BAND_LONG of
+/// it long and 2*RIM_BAND_THICK+1 px thick.
+const RIM_STRIP: f64 = 0.025;
+const RIM_BAND_LONG: f64 = 0.03;
+const RIM_BAND_THICK: usize = 2;
 /// The strip along a side where cut print is looked for.
 const EDGE_INK: f64 = 0.02;
 

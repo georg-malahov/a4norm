@@ -427,14 +427,6 @@ pub fn erase_fingers_within(img: &mut Img, axis: Option<bool>, band: usize) -> (
             }
         }
     }
-    if std::env::var_os("A4DBG").is_some() {
-        let pts: Vec<(usize, usize)> = (0..n).filter(|&i| skin[i] != 0).map(|i| (i % w, i / w)).collect();
-        let xs: Vec<usize> = pts.iter().map(|p| p.0).collect();
-        eprintln!("finger pre-std: reach {} skin x range {:?} {:?} w {} h {}", reach.iter().map(|&v| v as usize).sum::<usize>(), xs.iter().min(), xs.iter().max(), w, h);
-        let mut hist = std::collections::BTreeMap::new();
-        for p in &pts { *hist.entry(p.0 / 20).or_insert(0) += 1; }
-        eprintln!("  x/20 hist {:?}", hist);
-    }
     if reach.iter().any(|&r| r != 0) {
         let g = img.resize_auto(w, h).gray();
         let sd = ops::stddev(&g, 5).bytes();
@@ -450,7 +442,6 @@ pub fn erase_fingers_within(img: &mut Img, axis: Option<bool>, band: usize) -> (
         }
     }
     let share = 100.0 * reach.iter().map(|&r| r as f64).sum::<f64>() / n as f64;
-    if std::env::var_os("A4DBG").is_some() { eprintln!("finger: c_min {} skin {} share {:.2}", c_min, skin.iter().map(|&v| v as usize).sum::<usize>(), share); }
     if !(0.05..=FINGER_MAX).contains(&share) {
         return (false, share);
     }
