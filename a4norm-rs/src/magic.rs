@@ -369,6 +369,7 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
                 }
             }
         }
+    }
     // a grey band along a side, thick and long, that print runs into (staff
     // lines, a table's rules): the sheet's rim, cut out of what it touches.
     // Thin rules and dark print survive.
