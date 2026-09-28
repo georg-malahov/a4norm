@@ -2,7 +2,9 @@
 
 A German patient intake form ("Patientendaten und Datenschutzerklärung") from a demo
 service, laid out like a real MRI practice's form. The practice ("Ihr MRT Praxis,
-Musterstadt") and the patient are made up; the values come from a fake-data generator.
+Musterstadt") and the patient are made up; the values come from a fake-data generator. The
+phone number is a Bundesnetzagentur "drama number" (Berlin 030 23125 000–999), which is never
+given to anyone.
 
 | File | What it is |
 |---|---|
