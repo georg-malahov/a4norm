@@ -1,0 +1,23 @@
+[package]
+name = "a4norm-ocr"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Text and its boxes on a page: PP-OCRv5 (mobile det + latin rec) on tract, native and WebAssembly"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+tract-onnx = { version = "0.23", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+# tract-onnx-opl draws rand; in the browser its entropy comes from crypto.getRandomValues
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
