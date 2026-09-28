@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Fetch the official forms of official.json into examples/forms/official/
-(git-ignored) and check each against its sha256.
+"""The official forms of official.json in examples/forms/official/: check
+them, fetch a missing one, or see whether the authorities still publish them.
 
-    python3 examples/forms/official.py [--from DIR] [ID ...]
+    python3 examples/forms/official.py [ID ...]             check, fetch the missing
+    python3 examples/forms/official.py --online [ID ...]    are they still current?
+    python3 examples/forms/official.py --from DIR [ID ...]  take copies from DIR
 
-The forms are not in the repository: authorities' forms are free to use
-(§ 5 UrhG) but not to change, and they are updated. The list says where each
-one comes from, which version it was, when it was fetched and its sha256.
+The files are in the repository as the authorities publish them (see
+official/README.md); the list says where each comes from, which version it
+is, when it was fetched and its sha256.
 
 Some sites refuse scripts (Berlin answers 429, Frankfurt a Cloudflare
-challenge). Such a form is reported as unavailable and a test that needs it
-skips; a copy fetched in a browser can be put in with --from, and it is taken
-only if its sha256 matches. A form whose bytes changed is reported, not taken:
-the authority has a new version, and the list needs updating by hand.
+challenge): such a form is reported as unavailable. A copy fetched in a
+browser goes in with --from, taken only if its sha256 matches. A form whose
+bytes at the URL changed is reported, not taken: the authority has a new
+version, and the list and the file are updated by hand.
 
-Exit status: 0 when every form asked for is here and matches (unavailable
-ones included in that only if a copy is already here), 1 when one changed.
+Exit status: 1 when a file here does not match, or --online found a change.
 """
 
 import hashlib
@@ -49,7 +50,8 @@ def fetch(url: str) -> tuple[bytes | None, str]:
 
 
 def main(argv: list[str]) -> int:
-    src = None
+    src, online = None, "--online" in argv
+    argv = [a for a in argv if a != "--online"]
     if "--from" in argv:
         i = argv.index("--from")
         src, argv = Path(argv[i + 1]), argv[:i] + argv[i + 2:]
@@ -57,11 +59,25 @@ def main(argv: list[str]) -> int:
     if argv:
         forms = [f for f in forms if f["id"] in argv]
     DIR.mkdir(exist_ok=True)
-    changed = 0
+    bad = 0
     for f in forms:
         path = DIR / f"{f['id']}.pdf"
-        if path.exists() and sha256(path.read_bytes()) == f["sha256"]:
-            print(f"ok          {f['id']}")
+        if online:
+            b, how = fetch(f["url"])
+            if b is None:
+                print(f"unavailable {f['id']}: {how}")
+            elif sha256(b) == f["sha256"]:
+                print(f"current     {f['id']}")
+            else:
+                bad += 1
+                print(f"CHANGED     {f['id']}: now sha256 {sha256(b)}, {len(b)} bytes (listed {f['bytes']})")
+            continue
+        if path.exists():
+            if sha256(path.read_bytes()) == f["sha256"]:
+                print(f"ok          {f['id']}")
+            else:
+                bad += 1
+                print(f"MISMATCH    {f['id']}: the file here is not the listed one")
             continue
         b, how = None, "no copy given"
         if src:
@@ -73,12 +89,12 @@ def main(argv: list[str]) -> int:
         if b is None:
             print(f"unavailable {f['id']}: {how}")
         elif sha256(b) != f["sha256"]:
-            changed += 1
+            bad += 1
             print(f"CHANGED     {f['id']}: sha256 {sha256(b)}, {len(b)} bytes (listed {f['bytes']})")
         else:
             path.write_bytes(b)
             print(f"ok          {f['id']}: {how}")
-    return 1 if changed else 0
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

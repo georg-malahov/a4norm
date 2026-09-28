@@ -33,21 +33,22 @@ cryptography`). The encrypted one gets a new random file ID each time.
 All of them open in pdf.js, in PDFKit (Preview, Safari) and in poppler; the encrypted one
 without asking for a password.
 
-## Official forms: linked, not committed
+## Official forms
 
-`official.json` lists 14 forms of German authorities: what each is, who publishes it, the
-version, when it was fetched, its URL, size and sha256. `official.py` fetches them into
-`official/` (git-ignored) and checks the sha256:
+`official/` holds 14 blank forms of German authorities, byte for byte as they publish them.
+They are **not under the MIT licence**: amtliche Werke (§ 5 Abs. 2 UrhG), downloaded from
+public sources for tests. `official/README.md` names for each the authority, the source URL,
+the version, the download date and the sha256.
+
+`official.json` lists the same, and `official.py` checks them:
 
 ```sh
-python3 examples/forms/official.py                      # all of them
-python3 examples/forms/official.py ba-kg1-kindergeld
-python3 examples/forms/official.py --from ~/Downloads   # copies fetched in a browser
+python3 examples/forms/official.py                      # the files here match the list
+python3 examples/forms/official.py --online             # the authorities still publish these versions
+python3 examples/forms/official.py --from ~/Downloads   # a missing one, from copies fetched in a browser
 ```
 
-Authorities' forms are free to use (§ 5 Abs. 2 UrhG) but not to change, and they are
-replaced by new versions, so the repository keeps where they are rather than the files.
-Frankfurt (a Cloudflare check) and Berlin (429) refuse scripts: the script reports them as
-unavailable, a test that needs them skips, and a copy fetched in a browser goes in with
-`--from`, taken only if its sha256 matches. A form whose bytes changed is reported and not
-taken; the list is then updated by hand.
+Frankfurt (a Cloudflare check) and Berlin (429) refuse scripts and show as unavailable
+online. A form whose bytes at its URL changed is reported and not taken; the list and the
+file are then updated by hand, and a form that carries a form publisher's imprint or
+"Nachdruck verboten" stays a link in the list only.
