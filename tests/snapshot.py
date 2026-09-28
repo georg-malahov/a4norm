@@ -43,7 +43,7 @@ FLAGS = [
 
 def jobs():
     out = []
-    for ex in sorted(glob.glob(os.path.join(ROOT, "examples", "*"))):
+    for ex in sorted(glob.glob(os.path.join(ROOT, "examples", "*.*"))):
         for fl in FLAGS:
             out.append((f"{os.path.basename(ex)} {' '.join(fl)}".strip(),
                         fl, [ex]))
