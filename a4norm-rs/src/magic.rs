@@ -120,12 +120,25 @@ fn box_morph(m: &[u8], w: usize, h: usize, rx: usize, ry: usize, dilate: bool) -
     .concat();
     let full = ((2 * rx + 1) * (2 * ry + 1)) as u32;
     let at = |y: isize, x: usize| if y >= 0 && (y as usize) < h { rows[y as usize * w + x] } else { pad * (2 * rx + 1) as u32 };
+    // down the columns, a block of columns per task
+    const COLS: usize = 64;
+    let blocks: Vec<Vec<u8>> = ops::par_map(w.div_ceil(COLS), |k| {
+        let (x0, x1) = (k * COLS, ((k + 1) * COLS).min(w));
+        let mut c: Vec<u32> = (x0..x1).map(|x| (-(ry as isize)..=ry as isize).map(|y| at(y, x)).sum()).collect();
+        let mut out = vec![0u8; (x1 - x0) * h];
+        for y in 0..h {
+            for (j, x) in (x0..x1).enumerate() {
+                out[y * (x1 - x0) + j] = if dilate { (c[j] > 0) as u8 } else { (c[j] == full) as u8 };
+                c[j] = c[j] + at(y as isize + ry as isize + 1, x) - at(y as isize - ry as isize, x);
+            }
+        }
+        out
+    });
     let mut out = vec![0u8; w * h];
-    let mut c: Vec<u32> = (0..w).map(|x| (-(ry as isize)..=ry as isize).map(|y| at(y, x)).sum()).collect();
-    for y in 0..h {
-        for x in 0..w {
-            out[y * w + x] = if dilate { (c[x] > 0) as u8 } else { (c[x] == full) as u8 };
-            c[x] = c[x] + at(y as isize + ry as isize + 1, x) - at(y as isize - ry as isize, x);
+    for (k, b) in blocks.iter().enumerate() {
+        let (x0, x1) = (k * COLS, ((k + 1) * COLS).min(w));
+        for y in 0..h {
+            out[y * w + x0..y * w + x1].copy_from_slice(&b[y * (x1 - x0)..(y + 1) * (x1 - x0)]);
         }
     }
     out
@@ -208,52 +221,77 @@ fn fill_rules(ink: &mut [u8], n: &Plane, level: &[f32], w: usize, h: usize) {
     // A rule traced from each ridge pixel along its length (a: along, c:
     // across). It may step one pixel across at a time, as a rule on a sheet
     // that is not quite square does, and cross gaps of up to `gap` straight.
-    let trace = |ink: &mut [u8], r: &[u8], horiz: bool| {
+    let trace = |ink: &[u8], r: &[u8], horiz: bool| -> Vec<usize> {
         let (len, wid) = if horiz { (w, h) } else { (h, w) };
         let at = |a: usize, c: usize| if horiz { c * w + a } else { a * w + c };
-        let mut seen = vec![0u8; w * h];
-        for c0 in zl..wid.saturating_sub(zl) {
-            for a0 in 0..len {
-                if r[at(a0, c0)] == 0 || seen[at(a0, c0)] != 0 {
-                    continue;
+        // a printed rule keeps off the page's margins; a fold runs into them
+        let margin = (len as f64 * RULE_MARGIN) as usize;
+        // bands of starting lines, each traced on its own; what they fill
+        // is gathered and set afterwards
+        let lo = zl;
+        let hi = wid.saturating_sub(zl).max(lo);
+        let band = ((hi - lo) / 64).max(8);
+        let bands: Vec<Vec<usize>> = ops::par_map((hi - lo).div_ceil(band), |k| {
+            let mut out = vec![];
+            let (b0, b1) = (lo + k * band, (lo + (k + 1) * band).min(hi));
+            // ridge pixels already on a traced path, within this band
+            let mut seen = vec![false; (b1 - b0) * len];
+            let mut pre = vec![0u32; len + 1];
+            for c0 in b0..b1 {
+                // ridge within a pixel across, summed along: a rule can only
+                // start where the next `long` pixels are mostly ridge
+                for a in 0..len {
+                    let any = (c0.saturating_sub(1)..=(c0 + 1).min(wid - 1)).any(|cc| r[at(a, cc)] != 0);
+                    pre[a + 1] = pre[a] + any as u32;
                 }
-                let mut path = vec![(a0, c0)];
-                let (mut c, mut last, mut on, mut inked) = (c0, a0, 1usize, ink[at(a0, c0)] as usize);
-                seen[at(a0, c0)] = 1;
-                let mut a = a0 + 1;
-                while a < len && a - last <= gap {
-                    let hit = [c, c.saturating_sub(1), (c + 1).min(wid - 1)].into_iter().find(|&cc| r[at(a, cc)] != 0);
-                    if let Some(cc) = hit {
-                        c = cc;
-                        last = a;
-                        on += 1;
-                        inked += ink[at(a, c)] as usize;
-                        seen[at(a, c)] = 1;
+                let need = (RULE_ON * long as f64 * 0.9) as u32;
+                for a0 in 0..len {
+                    if r[at(a0, c0)] == 0 || seen[(c0 - b0) * len + a0] {
+                        continue;
                     }
-                    path.push((a, c));
-                    a += 1;
-                }
-                // the path up to its last ridge
-                while path.last().is_some_and(|p| p.0 > last) {
-                    path.pop();
-                }
-                let span = last - a0 + 1;
-                // a printed rule stops short of the margins; a fold runs from
-                // edge to edge
-                let fold = span as f64 >= RULE_FOLD * len as f64;
-                if span >= long && !fold && on as f64 >= RULE_ON * span as f64 && inked as f64 >= RULE_INKED * on as f64 {
-                    for (a, c) in path {
-                        ink[at(a, c)] = 1;
+                    if pre[(a0 + long).min(len)] - pre[a0] < need {
+                        continue;
+                    }
+                    let mut path = vec![(a0, c0)];
+                    let (mut c, mut last, mut on, mut inked) = (c0, a0, 1usize, ink[at(a0, c0)] as usize);
+                    let mut a = a0 + 1;
+                    while a < len && a - last <= gap {
+                        let hit = [c, c.saturating_sub(1), (c + 1).min(wid - 1)].into_iter().find(|&cc| r[at(a, cc)] != 0);
+                        if let Some(cc) = hit {
+                            c = cc;
+                            last = a;
+                            on += 1;
+                            inked += ink[at(a, c)] as usize;
+                            if (b0..b1).contains(&c) {
+                                seen[(c - b0) * len + a] = true;
+                            }
+                        }
+                        path.push((a, c));
+                        a += 1;
+                    }
+                    // the path up to its last ridge
+                    while path.last().is_some_and(|p| p.0 > last) {
+                        path.pop();
+                    }
+                    let span = last - a0 + 1;
+                    let fold = span as f64 >= RULE_FOLD * len as f64 || a0 < margin || last + margin >= len;
+                    if span >= long && !fold && on as f64 >= RULE_ON * span as f64 && inked as f64 >= RULE_INKED * on as f64 {
+                        out.extend(path.into_iter().map(|(a, c)| at(a, c)));
                     }
                 }
             }
-        }
+            out
+        });
+        bands.concat()
     };
     let rh = ridge(true);
-    trace(ink, &rh, true);
+    let fh = trace(ink, &rh, true);
     drop(rh);
     let rv = ridge(false);
-    trace(ink, &rv, false);
+    let fv = trace(ink, &rv, false);
+    for i in fh.into_iter().chain(fv) {
+        ink[i] = 1;
+    }
 }
 
 /// Ink from the page's border: thick dark parts that reach the border (the
@@ -331,20 +369,57 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
                 }
             }
         }
-    }    // a grey band along a side, thick and long, that print runs into (staff
+    // a grey band along a side, thick and long, that print runs into (staff
     // lines, a table's rules): the sheet's rim, cut out of what it touches.
     // Thin rules and dark print survive.
     let strip = (w.min(h) as f64 * RIM_STRIP) as usize;
     let long = (w.min(h) as f64 * RIM_BAND_LONG) as usize;
     let thick = RIM_BAND_THICK;
+    // only the strips along the sides are looked at, with room for the
+    // opening's reach
     for vertical in [true, false] {
         let (rx, ry) = if vertical { (thick, long) } else { (long, thick) };
-        let band = box_morph(&box_morph(ink, w, h, rx, ry, false), w, h, rx, ry, true);
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                let by_side = if vertical { x < strip || x + strip >= w } else { y < strip || y + strip >= h };
-                if band[i] != 0 && by_side && n.d[i] > EDGE_TEXT {
+        let reach = if vertical { strip + rx } else { strip + ry };
+        let sides: [(usize, usize); 2] = if vertical { [(0, reach.min(w)), (w.saturating_sub(reach), w)] } else { [(0, reach.min(h)), (h.saturating_sub(reach), h)] };
+        for (s0, s1) in sides {
+            let (cx0, cy0, cw, ch) = if vertical { (s0, 0, s1 - s0, h) } else { (0, s0, w, s1 - s0) };
+            if cw == 0 || ch == 0 {
+                continue;
+            }
+            let crop: Vec<u8> = (0..ch).flat_map(|y| ink[(cy0 + y) * w + cx0..(cy0 + y) * w + cx0 + cw].iter().copied()).collect();
+            let band = box_morph(&box_morph(&crop, cw, ch, rx, ry, false), cw, ch, rx, ry, true);
+            for y in 0..ch {
+                for x in 0..cw {
+                    let (gx, gy) = (cx0 + x, cy0 + y);
+                    let i = gy * w + gx;
+                    let by_side = if vertical { gx < strip || gx + strip >= w } else { gy < strip || gy + strip >= h };
+                    if band[y * cw + x] != 0 && by_side && n.d[i] > EDGE_TEXT {
+                        ink[i] = 0;
+                    }
+                }
+            }
+        }
+    }
+    // a fold's crease: a long thin grey line that runs on into a margin (a
+    // printed rule keeps off the margins, and is dark)
+    let margin_x = (w as f64 * RULE_MARGIN) as usize;
+    let margin_y = (h as f64 * RULE_MARGIN) as usize;
+    let crease_thin = (w.min(h) as f64 * CREASE_THIN) as usize;
+    for comp in crate::detect::components(ink, w, h) {
+        let (x0, x1, y0, y1) = bbox(&comp);
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        // thin on average (a crease wavers, so its box is taller than it)
+        let across = bw as f64 >= CREASE_LONG * w as f64 && comp.len() <= crease_thin * bw && bh as f64 <= CREASE_WAVE * h as f64 && (x0 <= margin_x || x1 + margin_x >= w);
+        let down = bh as f64 >= CREASE_LONG * h as f64 && comp.len() <= crease_thin * bh && bw as f64 <= CREASE_WAVE * w as f64 && (y0 <= margin_y || y1 + margin_y >= h);
+        if !(across || down) {
+            continue;
+        }
+        let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if v[v.len() / 2] > CREASE_GREY {
+            // its grey goes; letters it runs through, darker, stay
+            for i in comp {
+                if n.d[i] > CREASE_TEXT {
                     ink[i] = 0;
                 }
             }
@@ -672,6 +747,17 @@ const RULE_ON: f64 = 0.6;
 const RULE_INKED: f64 = 0.3;
 /// A line over this share of the page's length is a fold, not a rule.
 const RULE_FOLD: f64 = 0.85;
+/// A line reaching into the outer RULE_MARGIN of the page at either end is a
+/// fold or the sheet's edge, not a printed rule.
+const RULE_MARGIN: f64 = 0.04;
+/// A crease: at least CREASE_LONG of the page long, no thicker than
+/// CREASE_THIN of it, reaching a margin, lighter than CREASE_GREY.
+const CREASE_LONG: f64 = 0.5;
+const CREASE_THIN: f64 = 0.012;
+const CREASE_GREY: f32 = 0.45;
+const CREASE_WAVE: f64 = 0.05;
+/// Print under a crease is darker than this.
+const CREASE_TEXT: f32 = 0.4;
 /// Thick is what survives an opening of short side / THICK_DIV; a part that
 /// touches the border within BORDER_TOUCH px and reaches no more than
 /// BORDER_DEPTH of the page in is off the border.
@@ -733,9 +819,8 @@ pub fn text_lines(img: &Img, min_lines: usize) -> Option<Lines> {
     let bg = ops::resize(&blur(&bg, 2.0), w, h, Filter::Triangle);
     let ink: Vec<u8> = g.d.iter().zip(&bg.d).map(|(&v, &b)| (v < DW_INK * b.max(0.05)) as u8).collect();
     let kx = (w / 120).max(7) as usize;
-    let rect = |half: usize, rows: isize| -> ops::Kernel { (-rows..=rows).map(|dy| (dy, half)).collect() };
-    let c = morph_k(&morph_k(&ink, w, h, &rect(kx, 1), true), w, h, &rect(kx, 1), false);
-    let c = morph_k(&morph_k(&c, w, h, &rect(kx / 2, 0), false), w, h, &rect(kx / 2, 0), true);
+    let c = box_morph(&box_morph(&ink, w, h, kx, 1, true), w, h, kx, 1, false);
+    let c = box_morph(&box_morph(&c, w, h, kx / 2, 0, false), w, h, kx / 2, 0, true);
     let comps = crate::detect::components(&c, w, h);
     let boxes: Vec<(usize, usize, usize, usize, &Vec<usize>)> = comps
         .iter()
@@ -1180,9 +1265,11 @@ pub fn warp_edges(src: &crate::img::Src, e: &Edges, ow: usize, oh: usize) -> Img
             let (x, y) = ((x - 0.5).clamp(0.0, sw as f64 - 1.001), (y - 0.5).clamp(0.0, sh as f64 - 1.001));
             let (x0, y0) = (x.floor() as usize, y.floor() as usize);
             let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+            let (i00, i01) = ((y0 * sw + x0) * 3, ((y0 + 1) * sw + x0) * 3);
+            let px = &src.px;
             for (k, p) in row.iter_mut().enumerate() {
-                let at = |xx: usize, yy: usize| src.at(k, yy * sw + xx);
-                p[i] = (at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx) * (1.0 - fy) + (at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+                let (a, b, c, d) = (px[i00 + k] as f32, px[i00 + 3 + k] as f32, px[i01 + k] as f32, px[i01 + 3 + k] as f32);
+                p[i] = ((a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy) / 255.0;
             }
         }
     });
