@@ -1,7 +1,7 @@
 // The OCR module in a browser, as malahov.io would run it: in a worker on a
 // cross-origin-isolated page, the threaded build on a pool. Prints each
-// page's time (the first run compiles the plans), what it read, and the
-// time of init and release.
+// page's time (the first run compiles the plans), what it read and found,
+// and the time of init and release.
 //   node a4norm-ocr/web/check.mjs [chromium|webkit] [st|mt] [THREADS] [DIST] [MODELS]
 // Playwright comes from a4norm-rs/web/check (npm install there), or from the
 // folder in PLAYWRIGHT.
@@ -28,7 +28,9 @@ const src = \`self.onmessage = async ({ data: { build, threads, files } }) => { 
     const bytes = await get('/examples/forms/' + f);
     const r1 = await time(f + ' first', () => ocr.inspectImage(bytes, 595.28, 841.89));
     const r = await time(f, () => ocr.inspectImage(bytes, 595.28, 841.89));
-    out.push({ f, words: r.words.length, same: JSON.stringify(r) === JSON.stringify(r1), langs: r.langs, skew: r.skewDeg, print: r.printedSize, text: r.words.slice(0, 10).map((w) => w.text).join(' ') });
+    const g = await time(f + ' geometry', () => m.formGeometryImage(bytes, 595.28, 841.89));
+    const n = (o) => [o.lines.length, o.rects.length, o.combs.length, o.boxes.length].join('/');
+    out.push({ f, words: r.words.length, same: JSON.stringify(r) === JSON.stringify(r1), langs: r.langs, skew: r.skewDeg, print: r.printedSize, text: r.words.slice(0, 10).map((w) => w.text).join(' '), geometry: n(r) + ' (alone ' + n(g) + '), field ' + r.typicalFieldHeight });
   }
   if (build === 'mt') await time('release', () => m.releaseThreadPool());
   self.postMessage({ ms, out });
@@ -70,4 +72,4 @@ if (r.error) {
   process.exit(1);
 }
 console.log(`${name} ${build}: ${JSON.stringify(r.ms)}`);
-for (const o of r.out) console.log(`  ${o.f}: ${o.words} words, same twice ${o.same}, langs ${o.langs}, skew ${o.skew.toFixed(2)}°, print ${o.print.toFixed(1)} pt\n    ${o.text}`);
+for (const o of r.out) console.log(`  ${o.f}: ${o.words} words, same twice ${o.same}, langs ${o.langs}, skew ${o.skew.toFixed(2)}°, print ${o.print.toFixed(1)} pt\n    lines/rects/combs/boxes ${o.geometry}\n    ${o.text}`);

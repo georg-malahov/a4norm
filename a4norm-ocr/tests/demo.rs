@@ -117,3 +117,25 @@ fn words_sit_on_the_page() {
     assert!(b[1] < 97.0 && b[3] > 97.0, "{b:?}");
     assert!(json.starts_with("{\"sizePt\":[595.28,841.89],\"skewDeg\":0.6"), "{}", &json[..60]);
 }
+
+#[test]
+fn the_whole_inspection() {
+    let Some(ocr) = ocr() else {
+        return eprintln!("skipped: no models (a4norm-ocr/models.sh)");
+    };
+    // the values on the filled page sit on its lines; the lines stay
+    let read = |name: &str| {
+        let bytes = std::fs::read(format!("{FORMS}{name}")).unwrap();
+        let img = image::load_from_memory(pdf_jpeg(&bytes).unwrap_or(&bytes)).unwrap().to_rgb8();
+        let (p, g) = ocr.inspect(&img, [595.28, 841.89]).unwrap();
+        let json = a4norm_ocr::inspection_json(&p, &g, [595.28, 841.89]);
+        (g.candidates.iter().map(|c| (c.id, std::mem::discriminant(&c.kind))).collect::<Vec<_>>(), json)
+    };
+    let (blank, _) = read("demo-blank-scan.jpg");
+    let (filled, json) = read("demo-filled-scan.jpg");
+    assert_eq!(blank.len(), 24);
+    assert_eq!(filled, blank, "the same candidates, numbered the same, filled or not");
+    for key in ["\"words\":[", "\"lines\":[{\"id\":1,", "\"boxes\":[{\"id\":", "\"typicalFieldHeight\":"] {
+        assert!(json.contains(key), "{key}");
+    }
+}
