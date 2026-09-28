@@ -347,7 +347,10 @@ fn off_border(ink: &mut [u8], n: &Plane, w: usize, h: usize) {
         let z = (w.min(h) as f64 * GREY_ZONE) as usize;
         // lying wholly by a side, not merely reaching it
         let near = y0 + 2 * z >= h - 1 || y1 <= 2 * z || x1 <= 2 * z || x0 + 2 * z >= w - 1;
-        let grey = near && {
+        // and larger than a letter: small grey print (an address, a
+        // footer) sits near a side too
+        let big = comp.len() as f64 >= (w.min(h) as f64 * BLOT_MIN).powi(2);
+        let grey = near && big && {
             let mut v: Vec<f32> = comp.iter().map(|&i| n.d[i]).collect();
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             v[v.len() / 2] > GREY_BLOT
@@ -774,6 +777,8 @@ const EDGE_ALONG: f64 = 0.2;
 const EDGE_TEXT: f32 = 0.4;
 const GREY_ZONE: f64 = 0.035;
 const GREY_BLOT: f32 = 0.5;
+/// A blot covers at least (BLOT_MIN of the page)^2 pixels.
+const BLOT_MIN: f64 = 0.02;
 /// A piece no thicker than this share of the page, lying along a side
 /// within GREY_ZONE, is the sheet's edge.
 const EDGE_THIN: f64 = 0.004;
