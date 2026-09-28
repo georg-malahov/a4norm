@@ -74,6 +74,33 @@ jobs:
           path: regression-out/
           if-no-files-found: ignore
 
+  # The OCR module of A4Norm Forms (a4norm-ocr/): not in the images, and not a
+  # gate for them. Its tests read the demo form back against the text of the
+  # PDF it came from; the models are fetched by their pinned sha256.
+  ocr:
+    name: OCR tests (a4norm-ocr)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: a4norm-ocr/models
+          key: ocr-models-${{ hashFiles('a4norm-ocr/models.sh') }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            a4norm-ocr/target
+          key: ocr-cargo-${{ hashFiles('a4norm-ocr/Cargo.lock') }}
+
+      - name: Fetch the models
+        run: a4norm-ocr/models.sh
+
+      - name: Rust tests
+        run: cd a4norm-ocr && cargo test --release --locked
+
   image:
     needs: test
     runs-on: ubuntu-latest

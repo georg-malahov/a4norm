@@ -6,3 +6,5 @@ tests/corpus/
 a4norm-rs/target*/
 a4norm-rs/web/dist/
 a4norm-rs/web/check/node_modules
+a4norm-ocr/target/
+a4norm-ocr/models/
