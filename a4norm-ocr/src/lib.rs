@@ -9,6 +9,7 @@
 //! geometry.
 
 pub mod det;
+pub mod geometry;
 pub mod lang;
 pub mod rec;
 
@@ -232,7 +233,41 @@ fn printed_size(lines: &[Line]) -> f32 {
     0.0
 }
 
+impl Ocr {
+    /// The page read and its geometry found, for a page whose pixels span
+    /// `size_pt`: A4Norm Forms' whole `PageInspection`. The words tell the
+    /// geometry where letters are.
+    pub fn inspect(&self, page: &RgbImage, size_pt: [f32; 2]) -> TractResult<(Page, geometry::Geometry)> {
+        let p = self.page(page)?;
+        let g = geometry::find(page, px_pt(page.width(), size_pt), &p.word_boxes());
+        Ok((p, g))
+    }
+}
+
+/// Pixels per point along the page's width, for a page of `size_pt`.
+pub fn px_pt(width: u32, size_pt: [f32; 2]) -> f32 {
+    width as f32 / size_pt[0]
+}
+
+/// `PageInspection` JSON: the words and the geometry of a page whose pixels
+/// span `size_pt`.
+pub fn inspection_json(p: &Page, g: &geometry::Geometry, size_pt: [f32; 2]) -> String {
+    let text = p.to_json(size_pt);
+    format!("{},{}}}", &text[..text.len() - 1], g.json_fields(px_pt(p.width, size_pt)))
+}
+
 impl Page {
+    /// The boxes of the words that are words: a letter or digit at least,
+    /// read with some confidence ("□" read as a character is a box).
+    pub fn word_boxes(&self) -> Vec<[f32; 4]> {
+        self.lines
+            .iter()
+            .flat_map(|l| &l.words)
+            .filter(|w| w.score >= 0.6 && w.text.chars().any(char::is_alphanumeric))
+            .map(|w| w.bbox)
+            .collect()
+    }
+
     /// A4Norm Forms' `PageInspection` for this page, without the geometry:
     /// `sizePt`, `skewDeg`, `words` (boxes in points from the top left),
     /// `printedSize` in points, `langs`. The page's pixels span `size_pt`.

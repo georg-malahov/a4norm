@@ -76,7 +76,8 @@ jobs:
 
   # The OCR module of A4Norm Forms (a4norm-ocr/): not in the images, and not a
   # gate for them. Its tests read the demo form back against the text of the
-  # PDF it came from; the models are fetched by their pinned sha256.
+  # PDF it came from and find its fields, and those of official forms; the
+  # models are fetched by their pinned sha256.
   ocr:
     name: OCR tests (a4norm-ocr)
     runs-on: ubuntu-latest
@@ -97,6 +98,10 @@ jobs:
 
       - name: Fetch the models
         run: a4norm-ocr/models.sh
+
+      # the geometry tests render the demo PDF and the official forms
+      - name: Install poppler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
 
       - name: Rust tests
         run: cd a4norm-ocr && cargo test --release --locked
