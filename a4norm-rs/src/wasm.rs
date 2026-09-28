@@ -12,6 +12,9 @@
 //! const pdf = pack(jpgs, dpis, gray);
 //! // pages turned without touching their JPEGs: quarter turns clockwise each
 //! const turnedPdf = pack(jpgs, dpis, gray, new Int32Array([0, 1, 0, 2]));
+//! // threaded build, once idle: the threads leave and their workers close;
+//! // initThreadPool starts them again (docs/threads.md)
+//! await releaseThreadPool();
 //!
 //! // Edit panel: fill round spots from their surroundings
 //! const jpg2 = inpaint(jpg, new Float32Array([x, y, r, ...]), 88);   // page px
@@ -32,7 +35,16 @@ use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 #[cfg(feature = "wasm-threads")]
-pub use wasm_bindgen_rayon::init_thread_pool;
+pub use crate::pool::{init_thread_pool, release_thread_pool};
+
+/// `f` on the thread pool in the threaded build (src/pool.rs), here in the
+/// other. `on` gets `f`'s progress on this thread, the one JS runs on.
+fn work<R: Send>(f: impl FnOnce(&dyn Fn(&str, f64)) -> R + Send, on: impl Fn(&str, f64)) -> R {
+    #[cfg(feature = "wasm-threads")]
+    return crate::pool::run(f, on);
+    #[cfg(not(feature = "wasm-threads"))]
+    f(&on)
+}
 
 fn get(o: &JsValue, k: &str) -> JsValue {
     Reflect::get(o, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED)
@@ -80,16 +92,20 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
             let _ = p.call2(&JsValue::NULL, &JsValue::from_str(stage), &JsValue::from_f64(done));
         }
     };
-    let done = run(sources, &o, &mut |l| {
-        report.push_str(l);
-        report.push('\n');
-    }, &tick)
+    let (done, jpgs) = work(|tick| {
+        let done = run(sources, &o, &mut |l| {
+            report.push_str(l);
+            report.push('\n');
+        }, tick)?;
+        let jpgs: Vec<Vec<u8>> = done.pages.iter().map(|p| encode_page(p, &o)).collect();
+        Ok::<_, crate::Fail>((done, jpgs))
+    }, tick)
     .map_err(|e| JsValue::from_str(&e.0))?;
     let num = |v: usize| JsValue::from_f64(v as f64);
     let out = Array::new();
-    for p in &done.pages {
+    for (p, jpg) in done.pages.iter().zip(&jpgs) {
         let page = Object::new();
-        set(&page, "jpg", &Uint8Array::from(encode_page(p, &o).as_slice()));
+        set(&page, "jpg", &Uint8Array::from(jpg.as_slice()));
         set(&page, "dpi", &num(p.dpi));
         let geom = Object::new();
         set(&geom, "sources", &p.sources.iter().map(|&s| num(s)).collect::<Array>());
@@ -130,19 +146,23 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
 /// nothing and loses nothing.
 #[wasm_bindgen]
 pub fn pack(jpgs: Array, dpis: Vec<u32>, gray: bool, turns: Option<Vec<i32>>) -> Result<Uint8Array, JsValue> {
-    let mut pages = vec![];
-    for (i, j) in jpgs.iter().enumerate() {
-        let bytes = Uint8Array::new(&j).to_vec();
-        if gray {
-            let src = io::decode(&bytes, "page").map_err(|e| JsValue::from_str(&e.0))?;
-            let g = crate::img::Img::from_planes(vec![crate::img::gray_resized(&src, src.w, src.h)]);
-            pages.push(io::encode_jpeg(&g, 88, false, dpis[i] as usize));
-        } else {
-            pages.push(bytes);
+    let jpgs: Vec<Vec<u8>> = jpgs.iter().map(|j| Uint8Array::new(&j).to_vec()).collect();
+    let pdf = work(|_| {
+        let mut pages = vec![];
+        for (i, bytes) in jpgs.into_iter().enumerate() {
+            if gray {
+                let src = io::decode(&bytes, "page")?;
+                let g = crate::img::Img::from_planes(vec![crate::img::gray_resized(&src, src.w, src.h)]);
+                pages.push(io::encode_jpeg(&g, 88, false, dpis[i] as usize));
+            } else {
+                pages.push(bytes);
+            }
         }
-    }
-    let d: Vec<usize> = dpis.iter().map(|&x| x as usize).collect();
-    Ok(Uint8Array::from(io::write_pdf_turned(&pages, &d, &turns.unwrap_or_default()).as_slice()))
+        let d: Vec<usize> = dpis.iter().map(|&x| x as usize).collect();
+        Ok::<_, crate::Fail>(io::write_pdf_turned(&pages, &d, &turns.unwrap_or_default()))
+    }, |_, _| {})
+    .map_err(|e| JsValue::from_str(&e.0))?;
+    Ok(Uint8Array::from(pdf.as_slice()))
 }
 
 /// A finished page with round spots filled from what surrounds them, the
@@ -153,7 +173,7 @@ pub fn pack(jpgs: Array, dpis: Vec<u32>, gray: bool, turns: Option<Vec<i32>>) ->
 pub fn inpaint(jpg: Vec<u8>, dots: Vec<f32>, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
     let spots: Vec<(f64, f64, f64)> = dots.chunks_exact(3).map(|d| (d[0] as f64, d[1] as f64, d[2] as f64)).collect();
     let q = quality.unwrap_or(crate::Opts::default().quality);
-    let out = crate::edit::inpaint_jpeg(&jpg, &spots, q).map_err(|e| JsValue::from_str(&e.0))?;
+    let out = work(|_| crate::edit::inpaint_jpeg(&jpg, &spots, q), |_, _| {}).map_err(|e| JsValue::from_str(&e.0))?;
     Ok(Uint8Array::from(out.as_slice()))
 }
 
@@ -168,16 +188,20 @@ pub fn recompress(jpgs: Array, opts: JsValue) -> Result<Array, JsValue> {
     let quality = num("quality", crate::Opts::default().quality as f64).clamp(1.0, 100.0) as u8;
     let gray = get(&opts, "gray").as_bool().unwrap_or(false);
     let pages: Vec<Vec<u8>> = jpgs.iter().map(|j| Uint8Array::new(&j).to_vec()).collect();
-    let out = Array::new();
-    for group in pages.chunks(4) {
-        let done = crate::ops::par_map(group.len(), |i| crate::edit::recompress(&group[i], dpi, quality, gray));
-        for r in done {
-            let (jpg, d) = r.map_err(|e| JsValue::from_str(&e.0))?;
-            let page = Object::new();
-            set(&page, "jpg", &Uint8Array::from(jpg.as_slice()));
-            set(&page, "dpi", &JsValue::from_f64(d as f64));
-            out.push(&page);
+    let done = work(|_| {
+        let mut done = vec![];
+        for group in pages.chunks(4) {
+            done.extend(crate::ops::par_map(group.len(), |i| crate::edit::recompress(&group[i], dpi, quality, gray)));
         }
+        done
+    }, |_, _| {});
+    let out = Array::new();
+    for r in done {
+        let (jpg, d) = r.map_err(|e| JsValue::from_str(&e.0))?;
+        let page = Object::new();
+        set(&page, "jpg", &Uint8Array::from(jpg.as_slice()));
+        set(&page, "dpi", &JsValue::from_f64(d as f64));
+        out.push(&page);
     }
     Ok(out)
 }
@@ -188,7 +212,7 @@ pub fn recompress(jpgs: Array, opts: JsValue) -> Result<Array, JsValue> {
 #[wasm_bindgen]
 pub fn rotate(jpg: Vec<u8>, quarter_turns: i32, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
     let q = quality.unwrap_or(crate::Opts::default().quality);
-    let out = crate::edit::rotate(&jpg, quarter_turns, q).map_err(|e| JsValue::from_str(&e.0))?;
+    let out = work(|_| crate::edit::rotate(&jpg, quarter_turns, q), |_, _| {}).map_err(|e| JsValue::from_str(&e.0))?;
     Ok(Uint8Array::from(out.as_slice()))
 }
 
@@ -206,14 +230,16 @@ pub fn detect(rgba: &[u8], w: u32, h: u32) -> Result<Object, JsValue> {
     }
     let px: Vec<u8> = rgba[..w * h * 4].chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
     let src = crate::img::Src { w, h, px };
-    let o = crate::Opts::default();
-    let mut report = vec![];
-    let (kind, quads): (&str, Vec<crate::detect::Quad>) = match crate::page::locate(&src, &o, &mut report) {
-        Ok(crate::page::Found::Sheet(q, why)) => (if why.ends_with(crate::detect::RECEIPT) { "receipt" } else { "sheet" }, vec![q]),
-        Ok(crate::page::Found::Cards(qs, _)) => ("cards", qs),
-        Ok(crate::page::Found::Spread(s)) => ("spread", s.quads.to_vec()),
-        _ => ("none", vec![]),
-    };
+    let (kind, quads): (&str, Vec<crate::detect::Quad>) = work(|_| {
+        let o = crate::Opts::default();
+        let mut report = vec![];
+        match crate::page::locate(&src, &o, &mut report) {
+            Ok(crate::page::Found::Sheet(q, why)) => (if why.ends_with(crate::detect::RECEIPT) { "receipt" } else { "sheet" }, vec![q]),
+            Ok(crate::page::Found::Cards(qs, _)) => ("cards", qs),
+            Ok(crate::page::Found::Spread(s)) => ("spread", s.quads.to_vec()),
+            _ => ("none", vec![]),
+        }
+    }, |_, _| {});
     let flat: Vec<f32> = quads.iter().flat_map(|q| q.iter().flat_map(|p| [p.0 as f32, p.1 as f32])).collect();
     let out = Object::new();
     set(&out, "kind", &JsValue::from_str(kind));
@@ -226,6 +252,6 @@ pub fn detect(rgba: &[u8], w: u32, h: u32) -> Result<Object, JsValue> {
 /// size; PNG and WebP decode whole. `quality` defaults to 80.
 #[wasm_bindgen]
 pub fn thumbnail(bytes: &[u8], max_side: u32, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
-    let out = crate::edit::thumbnail(bytes, max_side as usize, quality.unwrap_or(80)).map_err(|e| JsValue::from_str(&e.0))?;
+    let out = work(|_| crate::edit::thumbnail(bytes, max_side as usize, quality.unwrap_or(80)), |_, _| {}).map_err(|e| JsValue::from_str(&e.0))?;
     Ok(Uint8Array::from(out.as_slice()))
 }

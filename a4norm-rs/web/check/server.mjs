@@ -1,12 +1,12 @@
 // A cross-origin-isolated page for the browser check: COOP same-origin +
 // COEP require-corp on everything, as malahov.io serves the scanner.
-//   node server.mjs PORT  -> /dist/ (the build), /examples/, /photos/ (PHOTOS)
+//   node server.mjs PORT  -> /dist/ (the build, or DIST), /examples/, /photos/ (PHOTOS)
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 const here = new URL(".", import.meta.url).pathname;
 const roots = {
-  "/dist/": join(here, "../dist/"),
+  "/dist/": process.env.DIST || join(here, "../dist/"),
   "/examples/": join(here, "../../../examples/"),
   "/photos/": process.env.PHOTOS || "/nonexistent/",
   "/": here,
