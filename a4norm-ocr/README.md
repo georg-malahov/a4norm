@@ -203,7 +203,7 @@ candidate?, lost?}]}`:
 - `x`, `y` are the first line's baseline at its start, or a cross's middle, in points from
   the top left;
 - `kind` is `text`, `comb` or `check`;
-- `lost` says that a character Helvetica cannot set became "?".
+- `lost` says that a character the font lacks (not in Arimo: Chinese, say) became "?".
 
 **Snapping a drawn box.**
 - A choice snaps to the check box it overlaps.
@@ -218,8 +218,13 @@ left to right.
 - One size for the document: `base = clamp(round(printed + 2), 9, 0.72 × field)`, from the
   medians of the pages' `printedSize` and `typicalFieldHeight`. It is below 9 pt only when
   the fields are that low.
-- A value that does not fit is made smaller, only as far as it has to, not below 7 pt
-  (`minSize`).
+- A value that does not fit is made smaller, not below 7 pt (`minSize`), to a step of a
+  short ladder: `base`, `base − 1`, … Fields whose room differs by a few tenths of a point
+  take the same size.
+- When more than half the text values of a page had to be made smaller, the others come
+  down to the step most of those took, unless their field is notably higher (half again
+  the usual room). On KG 1, p. 2 that leaves two sizes: 11 pt in the fields, 12 pt on the
+  one open line. Combs and boxes keep their own sizes.
 - Then it is broken over two lines at the space that evens them, if the field is
   2 × 1.15 × size high.
 - Else it is set at 7 pt with `overflow: true`.
@@ -251,8 +256,8 @@ scans are compared once laid on the PDF.
 ## The filled form as a PDF (`src/pdf.rs`)
 
 ```js
-const r = fillPdf(JSON.stringify({ inspections, template, answers }), pdfBytes, pagePictures);
-const r = fillScan(JSON.stringify({ inspections, template, answers }), pageJpegs);
+const r = fillPdf(JSON.stringify({ inspections, template, answers, images }), pdfBytes, pagePictures, imageBytes);
+const r = fillScan(JSON.stringify({ inspections, template, answers, images }), pageJpegs, imageBytes);
 // r: {pdf: Uint8Array, fallback, baseSize, placed}
 ```
 
@@ -273,18 +278,32 @@ XObjects, and the answers over them as vector text:
 - When the source cannot be read at all, `pagePictures` (JPEG, the pages as inspected)
   stand in, as for a scan, with `fallback: true`. Without them it is an error.
 
-**Text.** Helvetica with WinAnsi (umlauts, ß, €, typographic quotes and dashes), not
-embedded, since every viewer has it. The colour is `#1a1a1a`; a check box gets a cross.
+**Pictures over the page** (a signature from a pad, a stamp):
+- The request's `images: [{page, box, key?}]` place them. `box` is in points from the
+  page's top left; each picture is fitted in its box, its shape kept, in the middle.
+- Their bytes (PNG or JPEG) come apart, in the same order: `fillPdf`'s and `fillScan`'s
+  last argument, optional.
+- A PNG's alpha becomes a soft mask, so a signature has no white box around it.
+- The page stays vector: each picture is an image XObject of its own. The file grows by
+  about the picture's size: 5.3 KB of PNG signature → 5.9 KB.
+
+**Text.** Arimo (`fonts/`, SIL OFL 1.1; Arial's metrics), with Latin Extended, Cyrillic and
+Greek, so "Yılmaz", "Şahin", "Łukasz", "Đorđević", "Ștefan" and "Müller-Straße" are set as
+written. The module carries the font, and a PDF embeds only the glyphs its answers use: a
+CID font with a ToUnicode map, so the text copies as written. For the demo form that is
+~10 KB. The colour is `#1a1a1a`; a check box gets a cross.
 
 On the demo form, filled with its 12 values and two choices:
 
 | Source | Bytes in → out |
 |---|---|
-| `demo-blank.pdf` | 4 800 → 5 472 |
-| `demo-blank-encrypted.pdf` | 5 220 → 5 369 |
-| `demo-blank-acroform.pdf` | 11 793 → 6 165 |
-| `demo-blank-a4norm-scan.pdf` (the JPEG) | 530 985 → 532 255 |
-| KG 1, 5 pages, AES, static XFA | 1 508 259 → 924 068 (XFA and fields dropped) |
+| `demo-blank.pdf` | 4 800 → 14 951 |
+| `demo-blank-encrypted.pdf` | 5 220 → 14 848 |
+| `demo-blank-acroform.pdf` | 11 793 → 15 644 |
+| `demo-blank-a4norm-scan.pdf` (the JPEG) | 530 985 → 541 673 |
+| KG 1, 5 pages, AES, static XFA | 1 508 259 → 932 118 (XFA and fields dropped) |
+
+Of the ~10 KB added, ~9 KB are the embedded glyphs.
 
 - The form's text stays selectable.
 - The three demo PDFs give the same page, pixel for pixel in poppler and in pdf.js.
@@ -339,12 +358,13 @@ matrix kernels (`tract-linalg`) at 3, then `wasm-opt -Oz`:
 
 | | wasm | gzip -9 |
 |---|---|---|
-| `st/a4norm_ocr_bg.wasm` | 9.0 MB | 2.8 MB |
-| `mt/a4norm_ocr_bg.wasm` | 9.0 MB | 2.8 MB |
+| `st/a4norm_ocr_bg.wasm` | 10.2 MB | 3.3 MB |
+| `mt/a4norm_ocr_bg.wasm` | 10.2 MB | 3.3 MB |
 | models (fetched apart) | 12.9 MB | |
 
-The OCR alone came to 8.2 MB (2.4 MB gzip). The geometry adds ~60 KB, and filling and
-writing the PDF (serde, lopdf) ~720 KB. At opt-level 3 throughout, the OCR module was
+The OCR alone came to 8.2 MB (2.4 MB gzip). The geometry adds ~60 KB; filling and writing
+the PDF (serde, lopdf) ~720 KB; the font and its subsetting (Arimo, ttf-parser, subsetter)
+~1.2 MB. At opt-level 3 throughout, the OCR module was
 13.3 MB and slower in the browser (8.1 s against 7.4 s); at "s" throughout it was 7.9 MB
 but took 12–13 s.
 

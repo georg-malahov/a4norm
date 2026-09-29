@@ -2,7 +2,7 @@
 //! printed places on its three pictures, and the rules of the sizes.
 
 use a4norm_ocr::fill::{self, Inspection, Mark, Request, Template};
-use a4norm_ocr::{helvetica, inspection_json, pdf_jpeg, Ocr};
+use a4norm_ocr::{font, inspection_json, pdf_jpeg, Ocr};
 use image::RgbImage;
 use serde_json::json;
 use std::process::Command;
@@ -34,7 +34,7 @@ fn picture(name: &str) -> Option<RgbImage> {
 fn request(ins: Inspection) -> Request {
     let template: Template = serde_json::from_str(&std::fs::read_to_string(format!("{FORMS}demo-template.json")).unwrap()).unwrap();
     let answers = serde_json::from_str(&std::fs::read_to_string(format!("{FORMS}demo-answers.json")).unwrap()).unwrap();
-    Request { inspections: vec![ins], template, answers, color: None, min_size: None }
+    Request { inspections: vec![ins], template, answers, color: None, min_size: None, images: vec![] }
 }
 
 /// The candidates' ends, to lay one picture on another.
@@ -127,6 +127,7 @@ fn place(field: &str, id: usize, value: &str) -> Request {
         answers: [(field.to_string(), json!(value))].into(),
         color: None,
         min_size: None,
+        images: vec![],
     }
 }
 
@@ -136,7 +137,7 @@ fn extents(l: &fill::Layout) -> Vec<[f32; 4]> {
         .iter()
         .filter_map(|m| match m {
             Mark::Text { x, y, size, text, .. } => {
-                Some([*x, y - helvetica::CAP * size, x + helvetica::width(text, *size), y + helvetica::DESCENT * size])
+                Some([*x, y - font::CAP * size, x + font::width(text, *size), y + font::DESCENT * size])
             }
             _ => None,
         })
@@ -180,7 +181,7 @@ fn a_comb_takes_a_character_per_cell() {
     assert_eq!(marks.len(), 11);
     let cell = 200.0 / 11.0;
     for (i, (x, t)) in marks.iter().enumerate() {
-        let mid = x + helvetica::width(t, l.placed[0].size) / 2.0;
+        let mid = x + font::width(t, l.placed[0].size) / 2.0;
         assert!((mid - (50.0 + (i as f32 + 0.5) * cell)).abs() < 0.01, "{i}: {t} at {x}");
     }
     assert!(!l.placed[0].overflow);
@@ -219,12 +220,54 @@ fn a_value_runs_on_over_its_candidates() {
         answers: [("address".to_string(), json!("Musterweg 12, Hinterhaus, 12345 Musterstadt"))].into(),
         color: None,
         min_size: None,
+        images: vec![],
     };
     let l = fill::layout(&r);
     let rows: Vec<(f32, String)> = l.marks.iter().map(|m| if let Mark::Text { y, text, .. } = m { (*y, text.clone()) } else { panic!() }).collect();
     assert_eq!(rows.len(), 2);
     assert!(rows[0].0 < 60.0 && rows[1].0 < 80.0 && rows[1].0 > 60.0, "{rows:?}");
     assert_eq!(format!("{} {}", rows[0].1, rows[1].1), "Musterweg 12, Hinterhaus, 12345 Musterstadt");
-    assert!(helvetica::width(&rows[0].1, l.base) <= 100.0 - 3.0);
+    assert!(font::width(&rows[0].1, l.base) <= 100.0 - 3.0);
     assert_eq!((l.placed[0].candidate, l.placed[0].lines), (Some(1), 2));
+}
+
+#[test]
+fn sizes_come_in_steps() {
+    // six fields under labels of slightly different heights, as on KG 1:
+    // each would take its own size (12, 11.8, … 10.4); on the ladder, and
+    // brought down to the step most of them take, they come to two sizes,
+    // the lower only where the higher does not fit
+    let mut ins = page();
+    ins.printed_size = 10.0;
+    ins.typical_field_height = 25.0;
+    let mut rects = vec![];
+    let mut words = vec![];
+    let mut fields = vec![];
+    let mut answers = std::collections::HashMap::new();
+    for i in 0..6 {
+        let y = 200.0 + i as f32 * 40.0;
+        // the label's foot a little lower each time: 10.4 to 12.9 pt left
+        let foot = y + 12.0 + 0.5 * i as f32;
+        rects.push(json!({"id": 10 + i, "box": [50.0, y, 250.0, y + 25.0]}));
+        words.push(json!({"text": "Familienname", "bbox": [52.0, y + 2.0, 110.0, foot]}));
+        fields.push(json!({"key": format!("f{i}"), "place": {"page": 1, "candidate": 10 + i}}));
+        answers.insert(format!("f{i}"), json!("Musterfrau"));
+    }
+    ins.rects = serde_json::from_value(json!(rects)).unwrap();
+    ins.words = serde_json::from_value(json!(words)).unwrap();
+    let r = Request {
+        inspections: vec![ins],
+        template: serde_json::from_value(json!({"fields": fields})).unwrap(),
+        answers,
+        color: None,
+        min_size: None,
+        images: vec![],
+    };
+    let l = fill::layout(&r);
+    assert_eq!(l.base, 12.0);
+    let all: Vec<f32> = l.placed.iter().map(|p| p.size).collect();
+    let sizes: std::collections::BTreeSet<u32> = all.iter().map(|s| (s * 10.0).round() as u32).collect();
+    assert_eq!(sizes.len(), 2, "{all:?}");
+    assert!(all.iter().all(|s| s.fract() == 0.0 && *s < 12.0), "steps of the ladder below 12: {all:?}");
+    assert!(all.iter().filter(|&&s| s == 11.0).count() >= 4, "most at the common step: {all:?}");
 }

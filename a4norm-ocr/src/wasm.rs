@@ -105,24 +105,29 @@ pub fn fill_layout(request: &str) -> Result<JsValue, JsError> {
 /// The filled form from a PDF: a new PDF of its own pages with the answers
 /// over them (`src/pdf.rs`). `pictures` (JPEG, the pages as they were
 /// inspected) stand in for pages that cannot be read; may be empty.
+/// `imageBytes` (PNG or JPEG, optional) are the pictures the request's
+/// `images` place over the pages, in their order: a signature, a stamp.
 /// `{pdf, fallback, baseSize, placed}`.
 #[wasm_bindgen(js_name = fillPdf)]
-pub fn fill_pdf(request: &str, source: &[u8], pictures: js_sys::Array) -> Result<JsValue, JsError> {
+pub fn fill_pdf(request: &str, source: &[u8], pictures: js_sys::Array, image_bytes: Option<js_sys::Array>) -> Result<JsValue, JsError> {
     let req: crate::fill::Request = serde_json::from_str(request).map_err(err)?;
-    let pics = bytes_list(&pictures);
+    let (pics, imgs) = (bytes_list(&pictures), image_bytes.as_ref().map(bytes_list).unwrap_or_default());
     let refs: Vec<&[u8]> = pics.iter().map(Vec::as_slice).collect();
-    let (layout, out) = crate::pdf::fill_pdf(&req, source, &refs).map_err(|e| JsError::new(&e))?;
+    let img_refs: Vec<&[u8]> = imgs.iter().map(Vec::as_slice).collect();
+    let (layout, out) = crate::pdf::fill_pdf(&req, source, &refs, &img_refs).map_err(|e| JsError::new(&e))?;
     filled(&layout, out)
 }
 
 /// The filled form from scanned pages (JPEG): each page its picture, and
-/// the answers over it. `{pdf, fallback: false, baseSize, placed}`.
+/// the answers over it; `imageBytes` as for `fillPdf`.
+/// `{pdf, fallback: false, baseSize, placed}`.
 #[wasm_bindgen(js_name = fillScan)]
-pub fn fill_scan(request: &str, pages: js_sys::Array) -> Result<JsValue, JsError> {
+pub fn fill_scan(request: &str, pages: js_sys::Array, image_bytes: Option<js_sys::Array>) -> Result<JsValue, JsError> {
     let req: crate::fill::Request = serde_json::from_str(request).map_err(err)?;
-    let pics = bytes_list(&pages);
+    let (pics, imgs) = (bytes_list(&pages), image_bytes.as_ref().map(bytes_list).unwrap_or_default());
     let refs: Vec<&[u8]> = pics.iter().map(Vec::as_slice).collect();
-    let (layout, out) = crate::pdf::fill_scan(&req, &refs).map_err(|e| JsError::new(&e))?;
+    let img_refs: Vec<&[u8]> = imgs.iter().map(Vec::as_slice).collect();
+    let (layout, out) = crate::pdf::fill_scan(&req, &refs, &img_refs).map_err(|e| JsError::new(&e))?;
     filled(&layout, out)
 }
 
