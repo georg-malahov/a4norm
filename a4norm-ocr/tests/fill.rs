@@ -34,7 +34,7 @@ fn picture(name: &str) -> Option<RgbImage> {
 fn request(ins: Inspection) -> Request {
     let template: Template = serde_json::from_str(&std::fs::read_to_string(format!("{FORMS}demo-template.json")).unwrap()).unwrap();
     let answers = serde_json::from_str(&std::fs::read_to_string(format!("{FORMS}demo-answers.json")).unwrap()).unwrap();
-    Request { inspections: vec![ins], template, answers, color: None, min_size: None, images: vec![] }
+    Request { inspections: vec![ins], template, answers, color: None, min_size: None, images: vec![], texts: vec![] }
 }
 
 /// The candidates' ends, to lay one picture on another.
@@ -128,6 +128,7 @@ fn place(field: &str, id: usize, value: &str) -> Request {
         color: None,
         min_size: None,
         images: vec![],
+        texts: vec![],
     }
 }
 
@@ -221,6 +222,7 @@ fn a_value_runs_on_over_its_candidates() {
         color: None,
         min_size: None,
         images: vec![],
+        texts: vec![],
     };
     let l = fill::layout(&r);
     let rows: Vec<(f32, String)> = l.marks.iter().map(|m| if let Mark::Text { y, text, .. } = m { (*y, text.clone()) } else { panic!() }).collect();
@@ -262,6 +264,7 @@ fn sizes_come_in_steps() {
         color: None,
         min_size: None,
         images: vec![],
+        texts: vec![],
     };
     let l = fill::layout(&r);
     assert_eq!(l.base, 12.0);
@@ -270,4 +273,109 @@ fn sizes_come_in_steps() {
     assert_eq!(sizes.len(), 2, "{all:?}");
     assert!(all.iter().all(|s| s.fract() == 0.0 && *s < 12.0), "steps of the ladder below 12: {all:?}");
     assert!(all.iter().filter(|&&s| s == 11.0).count() >= 4, "most at the common step: {all:?}");
+}
+
+#[test]
+fn a_value_moved_and_set_larger_by_hand() {
+    // the value as placed, then 4 pt right and 3 pt up at 16 pt: the size
+    // exactly (above the base, larger than the room), the text moved as a
+    // whole
+    let plain = fill::layout(&place("name", 1, "Greenholt"));
+    let mut r = place("name", 1, "Greenholt");
+    r.template = serde_json::from_value(json!({"fields": [
+        {"key": "name", "place": {"page": 1, "candidate": 1}, "size": 16.0, "shift": [4.0, -3.0]}
+    ]}))
+    .unwrap();
+    let l = fill::layout(&r);
+    let (a, b) = (&plain.placed[0], &l.placed[0]);
+    assert_eq!((b.size, b.lines, b.overflow), (16.0, 1, false), "{b:?}");
+    assert!((b.x - a.x - 4.0).abs() < 1e-3, "{a:?} {b:?}");
+    let Mark::Text { x, y, size, .. } = &l.marks[0] else { panic!() };
+    assert_eq!((*x, *y, *size), (b.x, b.y, 16.0));
+    // its foot still clears the line, 3 pt higher
+    assert!(extents(&l)[0][3] <= 60.0 - 3.0, "{:?}", extents(&l));
+    // too long for the line at 16 pt: two lines, still 16 pt
+    let mut r = place("address", 1, "Hauptstraße 123a, 12345 Musterstadt-Nord");
+    r.template = serde_json::from_value(json!({"fields": [{"key": "address", "place": {"page": 1, "candidate": 1}, "size": 16.0}]})).unwrap();
+    let p = &fill::layout(&r).placed[0];
+    assert_eq!((p.size, p.lines), (16.0, 2), "{p:?}");
+}
+
+#[test]
+fn a_size_by_hand_stays_out_of_the_page_size() {
+    // three values that shrink to 8 pt bring the page's fourth down with
+    // them; one set by hand keeps its size and brings none down
+    let mut ins = page();
+    ins.lines = serde_json::from_value(json!([
+        {"id": 1, "x0": 50.0, "y0": 60.0, "x1": 110.0, "y1": 60.0},
+        {"id": 6, "x0": 50.0, "y0": 90.0, "x1": 110.0, "y1": 90.0},
+        {"id": 7, "x0": 50.0, "y0": 120.0, "x1": 110.0, "y1": 120.0},
+        {"id": 8, "x0": 150.0, "y0": 60.0, "x1": 450.0, "y1": 60.0}
+    ]))
+    .unwrap();
+    let long = "Musterstadt-Nord";
+    let fields = |hand: serde_json::Value| {
+        json!({"fields": [
+            {"key": "a", "place": {"page": 1, "candidate": 1}},
+            {"key": "b", "place": {"page": 1, "candidate": 6}},
+            {"key": "c", "place": {"page": 1, "candidate": 7}},
+            {"key": "d", "place": {"page": 1, "candidate": 8}, "size": hand}
+        ]})
+    };
+    let mut r = Request {
+        inspections: vec![ins],
+        template: serde_json::from_value(fields(json!(null))).unwrap(),
+        answers: [("a", long), ("b", long), ("c", long), ("d", "Kurz")].map(|(k, v)| (k.to_string(), json!(v))).into(),
+        color: None,
+        min_size: None,
+        images: vec![],
+        texts: vec![],
+    };
+    let chosen = fill::layout(&r);
+    let small = chosen.placed[0].size;
+    assert!(small < chosen.base && chosen.placed[3].size == small, "{:?}", chosen.placed);
+    r.template = serde_json::from_value(fields(json!(13.0))).unwrap();
+    let l = fill::layout(&r);
+    assert_eq!(l.placed[3].size, 13.0);
+    assert_eq!(l.placed[..3].iter().map(|p| p.size).collect::<Vec<_>>(), [small; 3]);
+}
+
+#[test]
+fn a_comb_and_a_cross_moved_by_hand() {
+    let mut r = place("tax_id", 3, "12 345 678 901");
+    let plain = fill::layout(&r);
+    r.template = serde_json::from_value(json!({"fields": [
+        {"key": "tax_id", "place": {"page": 1, "candidate": 3}, "shift": [1.5, 2.0]},
+        {"key": "agree", "type": "choice", "place": {"page": 1, "candidate": 5}, "shift": [-1.0, 0.5]}
+    ]}))
+    .unwrap();
+    r.answers.insert("agree".to_string(), json!(true));
+    let l = fill::layout(&r);
+    let cells = |l: &fill::Layout| -> Vec<(f32, f32)> {
+        l.marks.iter().filter_map(|m| if let Mark::Text { x, y, .. } = m { Some((*x, *y)) } else { None }).collect()
+    };
+    let (a, b) = (cells(&plain), cells(&l));
+    assert_eq!(a.len(), 11);
+    assert!(a.iter().zip(&b).all(|(p, q)| (q.0 - p.0 - 1.5).abs() < 1e-3 && (q.1 - p.1 - 2.0).abs() < 1e-3), "{a:?} {b:?}");
+    let cross = l.marks.iter().find_map(|m| if let Mark::Cross { b, .. } = m { Some(*b) } else { None }).unwrap();
+    let side = 10.0 * (1.0 - 2.0 * 0.18);
+    assert!((cross[0] - (300.0 + 1.8 - 1.0)).abs() < 1e-3 && (cross[1] - (150.0 + 1.8 + 0.5)).abs() < 1e-3, "{cross:?}");
+    assert!((cross[2] - cross[0] - side).abs() < 1e-3);
+    let p = l.placed.iter().find(|p| p.key == "agree").unwrap();
+    assert_eq!((p.x, p.y), (304.0, 155.5));
+}
+
+#[test]
+fn free_text_where_it_was_put() {
+    let mut r = place("name", 1, "Greenholt");
+    r.texts = serde_json::from_value(json!([
+        {"page": 1, "x": 320.0, "y": 200.0, "size": 12.0, "text": "Straße ş ł"},
+        {"x": 50.0, "y": 300.0, "size": 9.0, "text": "  "}
+    ]))
+    .unwrap();
+    let l = fill::layout(&r);
+    assert_eq!(l.placed.len(), 1, "free text is no answer");
+    let free: Vec<&Mark> = l.marks.iter().filter(|m| matches!(m, Mark::Text { x, .. } if *x == 320.0)).collect();
+    assert_eq!(free, [&Mark::Text { page: 1, x: 320.0, y: 200.0, size: 12.0, angle: 0.0, text: "Straße ş ł".into() }]);
+    assert_eq!(l.marks.len(), 2, "blank text is left out");
 }
