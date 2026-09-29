@@ -3,6 +3,7 @@
 // URLs under the server). Prints the times of init, the scan and release,
 // and, in WebKit, the CPU its web process spends in the 10 s after each load
 // settles: threads a page left behind show up there, and add up by reload.
+// Fails when a release had to terminate a worker: each should close itself.
 import { chromium, webkit } from "playwright";
 import { execFileSync } from "node:child_process";
 const [name = "webkit", mode = "release", loads = "4", files = "/examples/notebook-photo.jpg"] = process.argv.slice(2);
@@ -25,12 +26,14 @@ for (let i = 0; i < +loads; i++) {
   await page.waitForFunction(() => window.done, null, { timeout: 0 });
   const r = await page.evaluate(() => window.done);
   if (r.error) { console.log("ERROR", r.error); process.exit(1); }
+  // a release lets every worker close itself: none is terminated
+  if (Object.values(r.terminated).some((n) => n > 0)) { console.log("TERMINATED", JSON.stringify(r.terminated)); process.exit(1); }
   await page.waitForTimeout(3000);
   const c0 = cpu();
   await page.waitForTimeout(10000);
   const c1 = cpu();
   const busy = Object.keys(c1).filter((k) => mine.includes(k)).map((k) => `${Math.round((c1[k].t - (c0[k]?.t ?? 0)) * 100)} ms/s ${c1[k].rss} MB`).join(" | ");
-  console.log(`${name} ${mode} load ${i + 1}: ${JSON.stringify(r.ms)} ${JSON.stringify(r.hashes)}  cpu ${busy}`);
+  console.log(`${name} ${mode} load ${i + 1}: ${JSON.stringify(r.ms)} ${JSON.stringify(r.hashes)} terminated ${JSON.stringify(r.terminated)}  cpu ${busy}`);
 }
 await browser.close();
 process.exit(0);

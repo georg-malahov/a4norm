@@ -32,8 +32,9 @@ const src = \`self.onmessage = async ({ data: { build, threads, files } }) => { 
     const n = (o) => [o.lines.length, o.rects.length, o.combs.length, o.boxes.length].join('/');
     out.push({ f, words: r.words.length, same: JSON.stringify(r) === JSON.stringify(r1), langs: r.langs, skew: r.skewDeg, print: r.printedSize, text: r.words.slice(0, 10).map((w) => w.text).join(' '), geometry: n(r) + ' (alone ' + n(g) + '), field ' + r.typicalFieldHeight });
   }
-  if (build === 'mt') await time('release', () => m.releaseThreadPool());
-  self.postMessage({ ms, out });
+  // how many workers the release had to terminate: none, when each closed itself
+  const terminated = build === 'mt' ? await time('release', () => m.releaseThreadPool()) : 0;
+  self.postMessage({ ms, out, terminated });
 } catch (e) { self.postMessage({ error: String(e && e.stack || e) }); } };\`;
 const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), { type: 'module' });
 w.onmessage = (e) => { window.done = e.data; };
@@ -71,5 +72,9 @@ if (r.error) {
   console.log("ERROR", r.error);
   process.exit(1);
 }
-console.log(`${name} ${build}: ${JSON.stringify(r.ms)}`);
+console.log(`${name} ${build}: ${JSON.stringify(r.ms)}, terminated at release ${r.terminated}`);
 for (const o of r.out) console.log(`  ${o.f}: ${o.words} words, same twice ${o.same}, langs ${o.langs}, skew ${o.skew.toFixed(2)}°, print ${o.print.toFixed(1)} pt\n    lines/rects/combs/boxes ${o.geometry}\n    ${o.text}`);
+if (r.terminated > 0) {
+  console.log("FAIL: the release terminated workers that should have closed themselves");
+  process.exit(1);
+}

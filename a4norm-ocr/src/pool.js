@@ -31,15 +31,16 @@ if (typeof self !== 'undefined' && self.name === 'a4norm-ocr-pool') waitFor(self
   close();
 });
 
-// The pool now: { n, ready, workers, pkg, running, stopped }. The Worker
-// objects are kept: Firefox collects a worker on a shared memory otherwise.
+// The pool now: { n, ready, workers, left, pkg, running, stopped }; `left`
+// marks the workers that said they closed. The Worker objects are kept:
+// Firefox collects a worker on a shared memory otherwise.
 let pool = null;
 
 export function startPool(module, memory, n) {
   if (!(n > 0)) return Promise.reject(new Error('initThreadPool: threads must be > 0'));
   if (pool && pool.n === n) return pool.ready;
   const before = pool ? stopPool() : Promise.resolve();
-  const p = { n, workers: [], running: false, stopped: false };
+  const p = { n, workers: [], left: [], running: false, stopped: false };
   p.ready = before.then(() => spawn(p, module, memory));
   pool = p;
   return p.ready;
@@ -56,7 +57,7 @@ async function spawn(p, module, memory) {
     await Promise.race([ready, failed]);
     return w;
   }));
-  p.exits = p.workers.map((w) => waitFor(w, 'a4norm_ocr_pool_exit'));
+  p.exits = p.workers.map((w, i) => waitFor(w, 'a4norm_ocr_pool_exit').then(() => { p.left[i] = true; }));
   if (p.stopped) {
     // released while the workers were loading: they close without a thread
     for (const w of p.workers) w.postMessage({ type: 'a4norm_ocr_pool_quit' });
@@ -74,9 +75,14 @@ export function stopPool() {
   p.stopped = true;
   // the threads are told now, not when the promise is awaited
   if (p.running) p.pkg.wbg_pool_drop();
+  // Resolves with how many workers had to be terminated: none, when each
+  // has left and closed itself. Only one that has not answered in 2 s is:
+  // a worker terminated just after it closed can linger in Chromium.
   return p.ready.catch(() => {}).then(async () => {
     const late = new Promise((r) => setTimeout(r, 2000));
     await Promise.race([Promise.all(p.exits || []), late]);
-    for (const w of p.workers) w.terminate();
+    const stuck = p.workers.filter((w, i) => !p.left[i]);
+    for (const w of stuck) w.terminate();
+    return stuck.length;
   });
 }
