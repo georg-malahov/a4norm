@@ -1,12 +1,14 @@
 //! a4norm-ocr MODELS_DIR PAGE [--det-long N] [--lines] [--mark MARKED.png]
 //! a4norm-ocr --geometry PAGE [MARKED.png]
+//! a4norm-ocr --form PAGE
 //! a4norm-ocr --fill REQUEST.json OUT.pdf [IMAGE.png...] SOURCE.pdf|PAGE.jpg...
 //!
 //! MODELS_DIR holds det.onnx, rec.onnx and rec.yml (models.sh fetches them).
 //! PAGE is an image, or a PDF whose page is one JPEG (a scan), of an A4
 //! page. Prints the page's `PageInspection` JSON, or with --lines its text
 //! lines; the timings go to stderr. --mark draws the candidates with their
-//! numbers on the page; --geometry finds only them (no models needed).
+//! numbers on the page; --geometry finds only them (no models needed);
+//! --form says whether the page looks like a blank form (no models).
 
 use a4norm_ocr::geometry::{self, Kind};
 use a4norm_ocr::{pdf_jpeg, Ocr};
@@ -43,6 +45,14 @@ fn main() {
         std::fs::write(&args[3], &out.pdf).expect("out");
         println!("{}", layout.json());
         eprintln!("{} bytes{}", out.pdf.len(), if out.fallback { ", from the pictures" } else { "" });
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("--form") {
+        let img = load(&args[2]);
+        let t = Instant::now();
+        let f = geometry::looks_like_form(&img, px_pt(&img));
+        eprintln!("looks like a form: {} ms", t.elapsed().as_millis());
+        println!("{}", f.json());
         return;
     }
     if args.get(1).map(String::as_str) == Some("--geometry") {

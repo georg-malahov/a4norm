@@ -19,6 +19,11 @@
 //! edge, 6 pt apart at least, then left to right. The same page read from
 //! another picture gives the same numbers as long as the same candidates
 //! are found.
+//!
+//! One implementation for both modules: A4Norm Forms' OCR module
+//! (a4norm-ocr) finds a page's candidates with it, and the scanner's
+//! browser module (a4norm-rs) asks `looks_like_form` of a page it has just
+//! made, to offer filling it in (D24), without the OCR module.
 
 use image::RgbImage;
 
@@ -697,6 +702,95 @@ impl Geometry {
             p(self.typical_field_height)
         )
     }
+}
+
+/// Whether a page looks like a blank form, for offering to fill it (D24):
+/// its empty candidates and all of them, and how many of each kind. A
+/// writing line counts when shorter than 400 pt (longer ones are a table's
+/// rules or a letter's lines). Each is empty when under 4 % of what it
+/// leaves for writing is dark (luma under 128):
+/// - a field: its inside 1.5 pt in from the strokes, the lower 55 % of it
+///   when it is higher than 14 pt (a printed label sits at the top);
+/// - a comb: its inside, 1.5 pt in; a check box: its inside, 1 pt in;
+/// - a line: the band over it, 0.7 of a typical field high (8–18 pt),
+///   without the line itself.
+///
+/// The site offers the form when `empty >= 6` and `empty >= 0.6 * total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormLook {
+    pub empty: usize,
+    pub total: usize,
+    pub lines: usize,
+    pub rects: usize,
+    pub combs: usize,
+    pub boxes: usize,
+}
+
+impl FormLook {
+    /// `{"empty":…,"total":…,"lines":…,"rects":…,"combs":…,"boxes":…}`
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"empty\":{},\"total\":{},\"lines\":{},\"rects\":{},\"combs\":{},\"boxes\":{}}}",
+            self.empty, self.total, self.lines, self.rects, self.combs, self.boxes
+        )
+    }
+}
+
+/// `looks_like_form` over a page's candidates found without words.
+pub fn looks_like_form(page: &RgbImage, px_pt: f32) -> FormLook {
+    let g = find(page, px_pt, &[]);
+    let (w, h) = (page.width() as f32, page.height() as f32);
+    // the share of dark pixels in `[x0, y0, x1, y1]`, in points
+    let dark = |b: [f32; 4]| {
+        let at = |v: f32, max: f32| (v * px_pt).round().clamp(0.0, max) as u32;
+        let (x0, y0, x1, y1) = (at(b[0], w), at(b[1], h), at(b[2], w), at(b[3], h));
+        let (mut n, mut d) = (0u32, 0u32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let [r, g, b] = page.get_pixel(x, y).0.map(f32::from);
+                n += 1;
+                d += (0.3 * r + 0.59 * g + 0.11 * b < 128.0) as u32;
+            }
+        }
+        if n == 0 {
+            0.0
+        } else {
+            d as f32 / n as f32
+        }
+    };
+    let pt = |b: &[f32; 4], inset: f32| [b[0] / px_pt + inset, b[1] / px_pt + inset, b[2] / px_pt - inset, b[3] / px_pt - inset];
+    let band = (0.7 * g.typical_field_height / px_pt).clamp(8.0, 18.0);
+    let mut out = FormLook::default();
+    for c in &g.candidates {
+        let d = match c.kind {
+            Kind::Line(l) => {
+                let (x0, x1) = (l.x0.min(l.x1) / px_pt, l.x0.max(l.x1) / px_pt);
+                if x1 - x0 >= 400.0 {
+                    continue;
+                }
+                out.lines += 1;
+                let y = l.y0.min(l.y1) / px_pt;
+                dark([x0 + 2.0, y - band, x1 - 2.0, y - 1.5])
+            }
+            Kind::Rect(r) => {
+                out.rects += 1;
+                let b = pt(&r, 1.5);
+                let hgt = b[3] - b[1];
+                dark(if hgt > 14.0 { [b[0], b[1] + 0.45 * hgt, b[2], b[3]] } else { b })
+            }
+            Kind::Comb(r, _) => {
+                out.combs += 1;
+                dark(pt(&r, 1.5))
+            }
+            Kind::Box(r) => {
+                out.boxes += 1;
+                dark(pt(&r, 1.0))
+            }
+        };
+        out.total += 1;
+        out.empty += (d < 0.04) as usize;
+    }
+    out
 }
 
 /// The strokes found, as `(x0, y0, x1, y1, horizontal)`, for drawing.

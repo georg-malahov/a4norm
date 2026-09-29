@@ -68,9 +68,14 @@ const layout = fillLayout(JSON.stringify({ inspections, template, answers }));  
 const filled = fillPdf(JSON.stringify({ inspections, template, answers }), pdfBytes, []);
 ```
 
-`inspect` gives the geometry the words it read: a cell or box inside a word is a letter,
-a line along a word is the tops of its letters, and a frame holding three lines of words
-is a note, not a field.
+`inspect` gives the geometry the words it read, with where each character was read: a
+box inside a word is a letter's loop when a letter or digit was read in it ("6" in
+"635"), a line along a word is the tops of its letters, and a frame holding three lines of
+words is a note, not a field. A row of options read as one word over its boxes ("□ männlich
+□ weiblich" as "männlichweiblich", Jobcenter Hauptantrag p. 1) has nothing read in the
+boxes, so they stay boxes; a round one read as a letter with its label ("◯ ja" as "Oja")
+stays a box when a word space (1.5 pt of paper) follows it, where a letter's next is
+closer ("Ocupación").
 
 In turn, the geometry parts the words. A row of check boxes is read as one word
 ("zu:JaNein" over "zu: [] Ja [] Nein"), so the word is split at each box, by where each
@@ -106,7 +111,10 @@ on one thread and gives the same result.
    list is not counted. A language is kept if it has at least 3 words and a quarter of the
    top language's count.
 
-## Where a form is filled in (`src/geometry.rs`)
+## Where a form is filled in (`a4norm-geometry`)
+
+The geometry is a crate of its own, `a4norm-geometry/` (it needs only `image`), used here
+as `a4norm_ocr::geometry` and by the scanner's browser module for `looksLikeForm`.
 
 All of it is built from strokes, measured in points, so the resolution does not matter;
 the rules were set at 200 dpi.
@@ -184,6 +192,33 @@ The positions differ as the pictures do:
 A field drawn as a bracket (a bottom rule with ends only 5 pt high, as for KG 1's
 "Kindergeld-Nr.") is found as its writing line. Without the words, Jobcenter's note in a
 frame passes for a field, and Frankfurt keeps two strokes along a heading.
+
+### Does a page look like a blank form? (`looks_like_form`, D24)
+
+After "Process", the scanner offers to fill a page in when it looks like a blank form.
+`geometry::looks_like_form(page, px_pt)` finds the page's candidates (no words, no
+models) and counts the empty ones. In the browser this is the scanner's
+`looksLikeForm(page)` (a4norm-rs/docs/api.md), so a plain scan never loads this module.
+
+- Counted are the fields, combs, check boxes and the writing lines shorter than 400 pt.
+  Longer lines are a table's rules or a letter's lines, and are not counted.
+- An element is empty when under 4 % of it is dark (luma 0.3 R + 0.59 G + 0.11 B under
+  128), measured in:
+  - a field's inside, 1.5 pt in from its strokes, only the lower 55 % of it when it is
+    higher than 14 pt (the printed label sits at the top: KG 1's "Familienname");
+  - a comb's inside, 1.5 pt in, and a check box's, 1 pt in;
+  - a line's band above it, 0.7 of the typical field high (8 to 18 pt), without the line.
+- The result is `{empty, total, lines, rects, combs, boxes}`. The site offers the form
+  when `empty >= 6` and `empty >= 0.6 × total`.
+
+On the plan's set (section 15: the demo in 3 forms and 14 official forms, 2 pages each,
+31 pages; the filled demo twice; 17 pages that are no forms: notes pages, the examples'
+photos after the scanner, a synthetic letter, contract and invoice), `empty` and `total`
+match the site's measurement within 1 on all 50. 29 of the 31 blank pages are offered;
+the 2 misses are Finanzamt ESt 1 A (small dense cells). None of the 17 others is
+offered, and neither is the filled demo (10 of 21 empty). In the browser's one-thread
+module (Node, 200 dpi, the JPEG decoded too) a page takes 70 ms median, 87 ms at most,
+once warm; the first call takes up to 170 ms.
 
 ## Where the answers go (`src/fill.rs`)
 

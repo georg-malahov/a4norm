@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
+name = "a4norm-geometry"
+version = "0.1.0"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "a4norm-rs"
 version = "0.1.0"
 dependencies = [
+ "a4norm-geometry",
  "image",
  "jpeg-decoder",
  "jpeg-encoder",

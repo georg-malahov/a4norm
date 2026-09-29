@@ -1,0 +1,10 @@
+[package]
+name = "a4norm-geometry"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Where a form is filled in, from the picture of its page: writing lines, fields, combs and check boxes; and whether a page looks like a blank form"
+publish = false
+
+[dependencies]
+image = { version = "0.25", default-features = false }

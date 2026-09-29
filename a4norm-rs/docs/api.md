@@ -157,6 +157,21 @@ On the public examples and the local corpus of 51 photos:
 deskew angle and the fit by the text block are measured after the cleaning.
 So on such a photo `original` can deskew differently, or not at all.
 
+## Does a page look like a blank form? `looksLikeForm`
+
+```js
+const f = looksLikeForm(r.pages[i]);   // { jpg, dpi }: a page process() returned
+// f = { empty, total, lines, rects, combs, boxes }
+if (f.empty >= 6 && f.empty >= 0.6 * f.total) offerToFillIn();
+```
+
+It counts the page's fields, combs, check boxes and writing lines under 400 pt
+(`total`), and the ones nothing is written in (`empty`), from the page's pixels alone. It
+uses the geometry A4Norm Forms uses (`a4norm-geometry`, see a4norm-ocr's README), without
+its OCR module. It adds 88 KB to `a4norm_bg.wasm` (1 514 KB → 1 604 KB, 29 KB gzip) and
+takes about 70 ms a page in the one-thread module (87 ms at most on the plan's 50 pages). Nothing else changes: `process` runs as
+before.
+
 ## The command line: `--json PATH`
 
 `--json PATH` writes the same `photos` and `pages[].geom` as JSON, beside

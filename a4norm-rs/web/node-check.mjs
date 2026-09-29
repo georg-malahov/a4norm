@@ -42,3 +42,14 @@ const [mt, mb] = [mid(0, 2), mid(6, 4)];
 const spread = Float64Array.from([q[0], q[1], ...mt, ...mb, q[6], q[7], ...mt, q[2], q[3], q[4], q[5], ...mb]);
 const two = m.process([{ ...invoice, quad: spread }], args);
 eq(two.pages.length + two.photos[0].kind, "1spread", "16 numbers: one spread page");
+
+// A page that looks like a blank form is offered for filling in (D24): the
+// demo form after the scanner is, the invoice is not.
+const offer = (f) => f.empty >= 6 && f.empty >= 0.6 * f.total;
+const form = m.process([{ name: "demo-blank-scan.jpg", bytes: readFileSync(new URL("forms/demo-blank-scan.jpg", ex)) }], args);
+for (const [what, page, want] of [["the demo form", form.pages[0], true], ["the invoice", pg, false]]) {
+  const t = performance.now();
+  const f = m.looksLikeForm(page);
+  const ms = (performance.now() - t).toFixed(0);
+  eq(offer(f), want, `looksLikeForm, ${what}: ${JSON.stringify(f)}, ${ms} ms`);
+}

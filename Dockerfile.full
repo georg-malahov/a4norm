@@ -19,6 +19,8 @@ RUN case "$TARGETARCH" in arm64) t=aarch64-unknown-linux-musl ;; *) t=x86_64-unk
 WORKDIR /src
 COPY a4norm-rs/Cargo.toml a4norm-rs/Cargo.lock ./
 COPY a4norm-rs/src ./src
+# a dependency of the browser's module only, but Cargo reads its manifest
+COPY a4norm-geometry /a4norm-geometry
 RUN t=$(cat /target) \
     && CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
