@@ -1,8 +1,9 @@
 //! Where each answer goes and how large it is set (A4Norm Forms E3), from
 //! the pages' `PageInspection`s and the form's template.
 //!
-//! A field of the template points at a candidate of its page by number, or
-//! at a box the model drew (`box2d`, 0–1000 of the page, `[ymin, xmin,
+//! A field of the template points at a candidate of its page by number (or
+//! at several: a tax ID in four combs, an address over two lines), or at a
+//! box the model drew (`box2d`, 0–1000 of the page, `[ymin, xmin,
 //! ymax, xmax]`), which is snapped to the nearest candidate: a writing line
 //! just under it, a field or a comb it lies in, a check box. A choice's
 //! options are check boxes of their own, or else the boxes of the field's
@@ -75,13 +76,18 @@ pub struct IComb {
     pub cells: usize,
 }
 
-/// Where a field (or an option) is: a candidate's number on a page, or a
-/// box, in 0–1000 of the page (`box2d`) or in points (`box`).
+/// Where a field (or an option) is: a candidate's number on a page, or
+/// several in order, or a box, in 0–1000 of the page (`box2d`) or in
+/// points (`box`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Place {
     #[serde(default = "first")]
     pub page: u32,
     pub candidate: Option<usize>,
+    /// a value that runs on: through the cells of several combs, or from
+    /// one line or field into the next
+    #[serde(default)]
+    pub candidates: Vec<usize>,
     #[serde(alias = "box_2d")]
     pub box2d: Option<[f32; 4]>,
     #[serde(rename = "box")]
@@ -193,6 +199,13 @@ pub fn base_size(pages: &[Inspection]) -> f32 {
     }
 }
 
+impl Request {
+    /// The `sizePt` of page `n` (from 1), if it was inspected.
+    pub fn page_size(&self, n: u32) -> Option<[f32; 2]> {
+        page(&self.inspections, n).map(|p| p.size_pt)
+    }
+}
+
 pub fn layout(req: &Request) -> Layout {
     let base = base_size(&req.inspections);
     let min = req.min_size.unwrap_or(7.0).min(base);
@@ -215,9 +228,16 @@ pub fn layout(req: &Request) -> Layout {
         if text.is_empty() {
             continue;
         }
-        let Some((target, candidate)) = snap(ins, place, false) else { continue };
-        let (placed, marks) = set(&text, target, ins, base, min, place.page);
-        out.placed.push(Placed { key: f.key.clone(), candidate, ..placed });
+        let (placed, marks) = if place.candidates.len() > 1 {
+            let Some((placed, marks)) = run_on(&text, &place.candidates, ins, base, min, place.page) else { continue };
+            (placed, marks)
+        } else {
+            let one = Place { candidate: place.candidate.or(place.candidates.first().copied()), ..place.clone() };
+            let Some((target, candidate)) = snap(ins, &one, false) else { continue };
+            let (placed, marks) = set(&text, target, ins, base, min, place.page);
+            (Placed { candidate, ..placed }, marks)
+        };
+        out.placed.push(Placed { key: f.key.clone(), ..placed });
         out.marks.extend(marks);
     }
     out
@@ -269,6 +289,67 @@ fn check(out: &mut Layout, f: &Field, place: &Place, ins: &Inspection, answer: &
         candidate,
         lost: false,
     });
+}
+
+/// A value over several candidates, in the order of their numbers: through
+/// the cells of combs one after another; or into lines and fields, as many
+/// words into each as fit at the base size, the rest into the next, the
+/// last taking what is left by the usual rules. Placed where it starts.
+fn run_on(text: &str, ids: &[usize], ins: &Inspection, base: f32, min: f32, page: u32) -> Option<(Placed, Vec<Mark>)> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    let targets: Vec<Target> = ids.iter().filter_map(|&id| candidate(ins, id).map(|t| t.0)).collect();
+    if targets.is_empty() {
+        return None;
+    }
+    let mut chunks: Vec<String> = vec![];
+    if targets.iter().all(|t| matches!(t, Target::Comb(..))) {
+        let mut chars = text.chars().filter(|c| !c.is_whitespace());
+        for (i, t) in targets.iter().enumerate() {
+            let Target::Comb(_, n) = t else { unreachable!() };
+            // the last comb takes the rest, and overflows with it
+            let take = if i + 1 == targets.len() { usize::MAX } else { *n };
+            chunks.push(chars.by_ref().take(take).collect());
+        }
+    } else {
+        let mut words: Vec<&str> = text.split(' ').filter(|w| !w.is_empty()).collect();
+        for (i, t) in targets.iter().enumerate() {
+            if i + 1 == targets.len() {
+                chunks.push(words.join(" "));
+                break;
+            }
+            let w = zone_width(t);
+            let mut k = 0;
+            while k < words.len() && helvetica::width(&words[..=k].join(" "), base) <= w {
+                k += 1;
+            }
+            let k = k.max(1).min(words.len());
+            chunks.push(words[..k].join(" "));
+            words.drain(..k);
+        }
+    }
+    let mut first: Option<Placed> = None;
+    let (mut marks, mut lines, mut overflow) = (vec![], 0u8, false);
+    for ((t, chunk), id) in targets.iter().zip(&chunks).zip(&ids) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let (p, m) = set(chunk, *t, ins, base, min, page);
+        (lines, overflow) = (lines + p.lines, overflow | p.overflow);
+        first.get_or_insert(Placed { candidate: Some(*id), ..p });
+        marks.extend(m);
+    }
+    let mut placed = first?;
+    (placed.lines, placed.overflow, placed.lost) = (lines, overflow, helvetica::encode(text).1);
+    Some((placed, marks))
+}
+
+/// The width a target leaves the text.
+fn zone_width(t: &Target) -> f32 {
+    match t {
+        Target::Line(l) => l.x1 - 1.0 - (l.x0 + PAD),
+        Target::Area(b) | Target::Check(b) | Target::Comb(b, _) => b[2] - b[0] - 2.0 * PAD,
+    }
 }
 
 /// The check boxes on the row of the field's place, left to right.
@@ -407,20 +488,23 @@ fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: 
             (placed(x0, y, size, n as u8, overflow, "text"), marks)
         }
         Target::Area(b) | Target::Check(b) => {
-            // a label printed in the field's top takes that part
+            // the text goes below every printed word inside the frame (its
+            // label, "Familienname" at the top of KG 1's fields)
             let label = ins
                 .words
                 .iter()
                 .filter(|w| {
                     let (cx, cy) = ((w.bbox[0] + w.bbox[2]) / 2.0, (w.bbox[1] + w.bbox[3]) / 2.0);
-                    cx > b[0] && cx < b[2] && cy > b[1] && cy < (b[1] + b[3]) / 2.0
+                    cx > b[0] && cx < b[2] && cy > b[1] && cy < b[3]
                 })
                 .map(|w| w.bbox[3])
-                .fold(b[1], f32::max);
+                .fold(b[1], f32::max)
+                .min(b[3] - 1.0);
             let z = [b[0] + PAD, label + 0.5, b[2] - PAD, b[3] - 0.5];
             let (size, rows, overflow) = fit(text, z[2] - z[0], z[3] - z[1], base, min);
+            // the lines' glyphs, cap to descender, centred in the zone
             let n = rows.len() as f32;
-            let first = (z[1] + z[3]) / 2.0 - (n - 1.0) * LEADING * size / 2.0 + CAP * size / 2.0;
+            let first = (z[1] + z[3]) / 2.0 - (n - 1.0) * LEADING * size / 2.0 + (CAP - DESCENT) * size / 2.0;
             let marks = rows
                 .into_iter()
                 .enumerate()
@@ -455,7 +539,8 @@ fn room_above(ins: &Inspection, l: &ILine) -> f32 {
 /// smaller, down to `min`; else on two lines if they fit at `min` or more;
 /// else one line at `min`, overflowing.
 fn fit(text: &str, w: f32, h: f32, base: f32, min: f32) -> (f32, Vec<String>, bool) {
-    let top = base.min(h / LEADING).max(min);
+    // one line needs its glyphs' height, cap to descender, and a little air
+    let top = base.min(h / (CAP + DESCENT + 0.05)).max(min);
     let one = helvetica::width(text, top);
     if one <= w {
         return (top, vec![text.to_string()], false);

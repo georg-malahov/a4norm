@@ -1,5 +1,6 @@
 //! a4norm-ocr MODELS_DIR PAGE [--det-long N] [--lines] [--mark MARKED.png]
 //! a4norm-ocr --geometry PAGE [MARKED.png]
+//! a4norm-ocr --fill REQUEST.json OUT.pdf SOURCE.pdf|PAGE.jpg...
 //!
 //! MODELS_DIR holds det.onnx, rec.onnx and rec.yml (models.sh fetches them).
 //! PAGE is an image, or a PDF whose page is one JPEG (a scan), of an A4
@@ -24,6 +25,23 @@ fn px_pt(img: &RgbImage) -> f32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--fill") {
+        // REQUEST.json: {inspections, template, answers}; a PDF source, or
+        // the JPEG pages of a scan
+        let req: a4norm_ocr::fill::Request = serde_json::from_slice(&std::fs::read(&args[2]).expect("request")).expect("request JSON");
+        let sources: Vec<Vec<u8>> = args[4..].iter().map(|f| std::fs::read(f).expect("source")).collect();
+        let refs: Vec<&[u8]> = sources.iter().map(Vec::as_slice).collect();
+        let (layout, out) = if args[4].ends_with(".pdf") {
+            a4norm_ocr::pdf::fill_pdf(&req, refs[0], &refs[1..])
+        } else {
+            a4norm_ocr::pdf::fill_scan(&req, &refs)
+        }
+        .expect("fill");
+        std::fs::write(&args[3], &out.pdf).expect("out");
+        println!("{}", layout.json());
+        eprintln!("{} bytes{}", out.pdf.len(), if out.fallback { ", from the pictures" } else { "" });
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--geometry") {
         let img = load(&args[2]);
         let t = Instant::now();

@@ -101,3 +101,39 @@ pub fn fill_layout(request: &str) -> Result<JsValue, JsError> {
     let req: crate::fill::Request = serde_json::from_str(request).map_err(err)?;
     parse(&crate::fill::layout(&req).json())
 }
+
+/// The filled form from a PDF: a new PDF of its own pages with the answers
+/// over them (`src/pdf.rs`). `pictures` (JPEG, the pages as they were
+/// inspected) stand in for pages that cannot be read; may be empty.
+/// `{pdf, fallback, baseSize, placed}`.
+#[wasm_bindgen(js_name = fillPdf)]
+pub fn fill_pdf(request: &str, source: &[u8], pictures: js_sys::Array) -> Result<JsValue, JsError> {
+    let req: crate::fill::Request = serde_json::from_str(request).map_err(err)?;
+    let pics = bytes_list(&pictures);
+    let refs: Vec<&[u8]> = pics.iter().map(Vec::as_slice).collect();
+    let (layout, out) = crate::pdf::fill_pdf(&req, source, &refs).map_err(|e| JsError::new(&e))?;
+    filled(&layout, out)
+}
+
+/// The filled form from scanned pages (JPEG): each page its picture, and
+/// the answers over it. `{pdf, fallback: false, baseSize, placed}`.
+#[wasm_bindgen(js_name = fillScan)]
+pub fn fill_scan(request: &str, pages: js_sys::Array) -> Result<JsValue, JsError> {
+    let req: crate::fill::Request = serde_json::from_str(request).map_err(err)?;
+    let pics = bytes_list(&pages);
+    let refs: Vec<&[u8]> = pics.iter().map(Vec::as_slice).collect();
+    let (layout, out) = crate::pdf::fill_scan(&req, &refs).map_err(|e| JsError::new(&e))?;
+    filled(&layout, out)
+}
+
+fn bytes_list(a: &js_sys::Array) -> Vec<Vec<u8>> {
+    a.iter().map(|v| js_sys::Uint8Array::new(&v).to_vec()).collect()
+}
+
+fn filled(layout: &crate::fill::Layout, out: crate::pdf::Output) -> Result<JsValue, JsError> {
+    let r = parse(&layout.json())?;
+    let set = |k: &str, v: &JsValue| js_sys::Reflect::set(&r, &JsValue::from_str(k), v).map(|_| ()).map_err(|_| JsError::new("result"));
+    set("pdf", &js_sys::Uint8Array::from(out.pdf.as_slice()).into())?;
+    set("fallback", &JsValue::from_bool(out.fallback))?;
+    Ok(r)
+}
