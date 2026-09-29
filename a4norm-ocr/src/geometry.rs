@@ -96,7 +96,11 @@ pub fn find(page: &RgbImage, px_pt: f32, text: &[[f32; 4]]) -> Geometry {
     let vs = strokes(&ink, w, h, false, 1, pt(V_RUN), pt(THIN), px_pt);
 
     let mut found: Vec<Kind> = vec![];
-    let boxes = check_boxes(&ink, w, h, px_pt);
+    // a box inside a word, lower than the word, is a letter's loop
+    let boxes: Vec<[f32; 4]> = check_boxes(&ink, w, h, px_pt)
+        .into_iter()
+        .filter(|b| !text.iter().any(|t| overlap(b, t) > 0.8 && b[3] - b[1] < 0.6 * (t[3] - t[1])))
+        .collect();
 
     // what stands on each horizontal stroke
     let foot = FOOT * px_pt;
@@ -195,7 +199,7 @@ pub fn find(page: &RgbImage, px_pt: f32, text: &[[f32; 4]]) -> Geometry {
         }
         found.push(Kind::Rect(*c));
     }
-    for l in join(lines, px_pt) {
+    for l in join(lines, &ink, w, px_pt) {
         // a field's bottom rule drawn twice
         let bottom = |r: &[f32; 4]| (l.y0 - r[3]).abs() <= 3.0 * px_pt && l.x0 >= r[0] - 3.0 * px_pt && l.x1 <= r[2] + 3.0 * px_pt;
         // the tops of a heading's letters: a line through a word's upper
@@ -225,16 +229,22 @@ fn hung(s: &Stroke, vs: &[Stroke], foot: f32) -> bool {
     hangs(s.a0) && hangs(s.a1)
 }
 
-/// Writing lines, a line broken in two (dots lost in print) made whole:
-/// pieces one after the other on the same height, less than 8 pt apart.
-fn join(mut lines: Vec<Stroke>, px_pt: f32) -> Vec<WLine> {
+/// Writing lines, a line broken in two (dots lost in print or in cleaning)
+/// made whole: pieces one after the other on the same height, less than
+/// 16 pt apart with paper between them. Two lines with a label between
+/// ("Telefon ...... Fax: ......") stay two.
+fn join(mut lines: Vec<Stroke>, ink: &[bool], w: usize, px_pt: f32) -> Vec<WLine> {
     lines.sort_by(|a, b| a.a0.total_cmp(&b.a0));
+    let clear = |x0: f32, x1: f32, y: f32| {
+        let (y0, y1) = ((y - 12.0 * px_pt).max(0.0) as usize, (y - 1.6 * px_pt).max(0.0) as usize);
+        (y0..y1).all(|yy| (x0.max(0.0) as usize..(x1 as usize).min(w)).all(|x| !ink[yy * w + x]))
+    };
     let mut out: Vec<WLine> = vec![];
     for s in lines {
         let l = WLine { x0: s.a0, y0: s.at(s.a0), x1: s.a1, y1: s.at(s.a1) };
         let prev = out.iter_mut().find(|p| {
             let gap = l.x0 - p.x1;
-            gap >= -px_pt && gap <= 8.0 * px_pt && (l.y0 - p.y1).abs() <= 1.2 * px_pt
+            gap >= -px_pt && gap <= 16.0 * px_pt && (l.y0 - p.y1).abs() <= 1.2 * px_pt && (gap <= 8.0 * px_pt || clear(p.x1, l.x0, p.y1))
         });
         match prev {
             Some(p) => (p.x1, p.y1) = (l.x1, l.y1),
@@ -488,8 +498,11 @@ fn check_boxes(ink: &[bool], w: usize, h: usize, px_pt: f32) -> Vec<[f32; 4]> {
         if big || bw < lo || bh < lo || x0 == 0 || y0 == 0 || x1 + 1 == w || y1 + 1 == h {
             continue;
         }
-        // square, or round (a circle fills 79 % of its square)
-        if (bw / bh - 1.0).abs() > 0.15 || (n as f32) < 0.72 * bw * bh {
+        // square, or round (a circle fills 79 % of its square); a small
+        // round one is the loop of a letter or digit ("6", "o"), a check box
+        // that small is square ("□")
+        let fill = n as f32 / (bw * bh);
+        if (bw / bh - 1.0).abs() > 0.15 || fill < 0.72 || (fill < 0.88 && bw.min(bh) < 7.5 * px_pt) {
             continue;
         }
         // an empty box: a number or a letter in a frame is a label
@@ -510,12 +523,13 @@ fn blank_middle(ink: &[bool], w: usize, b: &[f32; 4]) -> bool {
 
 /// Whether the area around `(cx, cy)`, `side` across, is closed by a thin
 /// border with paper beyond it, looking out four ways: a box's border is at
-/// most a quarter of its side (0.6 to 1.6 pt), and at most one side has
+/// most a quarter of its side (0.6 to 2.4 pt: a cleaned scan's rules come
+/// out bolder), and at most one side has
 /// something within 0.8 pt beyond it. A letter's counter (a bold "o", an
 /// "o" in a heading) has a thicker stroke, or its neighbours close on both
 /// sides.
 fn thin_border(ink: &[bool], w: usize, h: usize, cx: usize, cy: usize, side: f32, px_pt: f32) -> bool {
-    let t = (0.25 * side).clamp(0.6 * px_pt, 1.6 * px_pt);
+    let t = (0.25 * side).clamp(0.6 * px_pt, 2.4 * px_pt);
     let (max_t, gap) = (t.ceil() as i64, (0.8 * px_pt).ceil() as i64);
     let mut clear = 0;
     for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {

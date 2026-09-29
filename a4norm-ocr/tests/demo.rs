@@ -139,3 +139,19 @@ fn the_whole_inspection() {
         assert!(json.contains(key), "{key}");
     }
 }
+
+#[test]
+fn words_part_at_the_boxes() {
+    let Some(ocr) = ocr() else {
+        return eprintln!("skipped: no models (a4norm-ocr/models.sh)");
+    };
+    // "zu: [] Ja [] Nein" is read as one word; the boxes part it, so each
+    // option's label is a word
+    let bytes = std::fs::read(format!("{FORMS}demo-blank-a4norm-scan.pdf")).unwrap();
+    let img = image::load_from_memory(pdf_jpeg(&bytes).unwrap()).unwrap().to_rgb8();
+    let (p, _) = ocr.inspect(&img, [595.28, 841.89]).unwrap();
+    let words: Vec<&str> = p.lines.iter().flat_map(|l| &l.words).map(|w| w.text.as_str()).collect();
+    for run in [["zu:", "Ja", "Nein"], ["Beihilfe:", "Ja", "Nein"]] {
+        assert!(words.windows(3).any(|w| w == run), "{run:?} in {words:?}");
+    }
+}

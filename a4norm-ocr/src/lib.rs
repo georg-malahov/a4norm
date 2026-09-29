@@ -35,6 +35,8 @@ pub struct Word {
     pub text: String,
     pub score: f32,
     pub bbox: [f32; 4],
+    /// where each character was read, across the page in its pixels
+    pub at: Vec<f32>,
 }
 
 /// A text line as detected: its words left to right, its upright box, and
@@ -162,6 +164,7 @@ impl Ocr {
                 .into_iter()
                 .map(|s| Word {
                     bbox: f.bbox(b.u0 + s.u0, b.v0, b.u0 + s.u1.min(end), b.v1),
+                    at: s.at.iter().map(|&u| f.page(b.u0 + u, (b.v0 + b.v1) / 2.0).0).collect(),
                     text: s.text,
                     score: s.score,
                 })
@@ -240,8 +243,9 @@ impl Ocr {
     /// `size_pt`: A4Norm Forms' whole `PageInspection`. The words tell the
     /// geometry where letters are.
     pub fn inspect(&self, page: &RgbImage, size_pt: [f32; 2]) -> TractResult<(Page, geometry::Geometry)> {
-        let p = self.page(page)?;
+        let mut p = self.page(page)?;
         let g = geometry::find(page, px_pt(page.width(), size_pt), &p.word_boxes());
+        p.split_at_boxes(&g);
         Ok((p, g))
     }
 }
@@ -268,6 +272,79 @@ impl Page {
             .filter(|w| w.score >= 0.6 && w.text.chars().any(char::is_alphanumeric))
             .map(|w| w.bbox)
             .collect()
+    }
+
+    /// Words read across check boxes, split at them: a row of boxes reads
+    /// as one word ("zu:JaNein" over "zu: [] Ja [] Nein"), and each option's
+    /// label is a word of its own. A character read where a box is, or its
+    /// side read as "[" or "|" next to it, is dropped.
+    pub fn split_at_boxes(&mut self, g: &geometry::Geometry) {
+        let boxes: Vec<[f32; 4]> =
+            g.candidates.iter().filter_map(|c| if let geometry::Kind::Box(b) = c.kind { Some(b) } else { None }).collect();
+        // a box's side read as a character ("[", "|") where a word meets it
+        let side = |c: char| "[]|(){}□口".contains(c);
+        for line in &mut self.lines {
+            let mut out = vec![];
+            for w in line.words.drain(..) {
+                let across: Vec<&[f32; 4]> = boxes
+                    .iter()
+                    .filter(|b| {
+                        let over = w.bbox[3].min(b[3]) - w.bbox[1].max(b[1]);
+                        over > 0.5 * (b[3] - b[1]) && b[0] > w.bbox[0] && b[2] < w.bbox[2]
+                    })
+                    .collect();
+                if across.is_empty() || w.at.len() != w.text.chars().count() {
+                    out.push(w);
+                    continue;
+                }
+                // the edges a box leaves between the pieces
+                let mut edges = vec![w.bbox[0]];
+                let mut sorted = across.clone();
+                sorted.sort_by(|a, b| a[0].total_cmp(&b[0]));
+                for b in &sorted {
+                    edges.extend([b[0], b[2]]);
+                }
+                edges.push(w.bbox[2]);
+                for (k, piece) in edges.chunks(2).enumerate() {
+                    let (x0, x1) = (piece[0], piece[1]);
+                    let mut keep: Vec<(char, f32)> = w.text.chars().zip(w.at.iter().copied()).filter(|&(_, x)| x > x0 && x < x1).collect();
+                    if k + 1 < edges.len() / 2 {
+                        while keep.last().is_some_and(|p| side(p.0)) {
+                            keep.pop();
+                        }
+                    }
+                    if k > 0 {
+                        while keep.first().is_some_and(|p| side(p.0)) {
+                            keep.remove(0);
+                        }
+                    }
+                    let text: String = keep.iter().map(|p| p.0).collect();
+                    let at: Vec<f32> = keep.iter().map(|p| p.1).collect();
+                    if !text.is_empty() {
+                        out.push(Word { text, score: w.score, bbox: [x0, w.bbox[1], x1, w.bbox[3]], at });
+                    }
+                }
+            }
+            // a box's side read into the word beside it ("Ja[" before a box)
+            for w in &mut out {
+                let near = |x: f32| {
+                    boxes.iter().any(|b| {
+                        let over = w.bbox[3].min(b[3]) - w.bbox[1].max(b[1]) > 0.5 * (b[3] - b[1]);
+                        let reach = 0.5 * (b[3] - b[1]);
+                        over && ((x - b[0]).abs() < reach || (x - b[2]).abs() < reach)
+                    })
+                };
+                while w.text.chars().count() > 1 && w.text.ends_with(side) && w.at.last().is_some_and(|&x| near(x)) {
+                    w.text.pop();
+                    w.at.pop();
+                }
+                while w.text.chars().count() > 1 && w.text.starts_with(side) && w.at.first().is_some_and(|&x| near(x)) {
+                    w.text.remove(0);
+                    w.at.remove(0);
+                }
+            }
+            line.words = out;
+        }
     }
 
     /// A4Norm Forms' `PageInspection` for this page, without the geometry:
