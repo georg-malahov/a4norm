@@ -16,13 +16,17 @@ fn picture(name: &str) -> RgbImage {
     image::load_from_memory(pdf_jpeg(&bytes).unwrap_or(&bytes)).unwrap().to_rgb8()
 }
 
-/// A PDF's page at 200 dpi, or None without pdftoppm or the file.
+/// A PDF's page at 200 dpi, or None without pdftoppm or the file. Each call
+/// renders to a file of its own: tests running at once may ask for the
+/// same page.
 fn render(pdf: &str, page: u32) -> Option<RgbImage> {
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = format!("{FORMS}{pdf}");
     if !std::path::Path::new(&path).exists() {
         return None;
     }
-    let out = std::env::temp_dir().join(format!("a4norm-geometry-{}-{page}", pdf.replace(['/', '.'], "-")));
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out = std::env::temp_dir().join(format!("a4norm-geometry-{}-{page}-{n}", pdf.replace(['/', '.'], "-")));
     let p = page.to_string();
     let ok = Command::new("pdftoppm")
         .args(["-r", "200", "-png", "-f", &p, "-l", &p, "-singlefile", &path])
