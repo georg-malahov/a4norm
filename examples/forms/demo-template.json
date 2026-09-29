@@ -1,0 +1,171 @@
+{
+ "title": "Patientendaten und Datenschutzerklärung",
+ "lang": "de",
+ "fields": [
+  {
+   "key": "name",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 1
+   }
+  },
+  {
+   "key": "first_name",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 2
+   }
+  },
+  {
+   "key": "birth_date",
+   "type": "date",
+   "place": {
+    "page": 1,
+    "candidate": 3
+   }
+  },
+  {
+   "key": "weight",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 4
+   }
+  },
+  {
+   "key": "street",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 5
+   }
+  },
+  {
+   "key": "zip_city",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 6
+   }
+  },
+  {
+   "key": "phone",
+   "type": "phone",
+   "place": {
+    "page": 1,
+    "candidate": 7
+   }
+  },
+  {
+   "key": "fax",
+   "type": "phone",
+   "place": {
+    "page": 1,
+    "candidate": 8
+   }
+  },
+  {
+   "key": "email",
+   "type": "email",
+   "place": {
+    "page": 1,
+    "candidate": 9
+   }
+  },
+  {
+   "key": "email_consent",
+   "type": "choice",
+   "place": {
+    "page": 1,
+    "candidate": 10
+   },
+   "options": [
+    {
+     "value": "ja",
+     "place": {
+      "page": 1,
+      "candidate": 10
+     }
+    },
+    {
+     "value": "nein",
+     "place": {
+      "page": 1,
+      "candidate": 11
+     }
+    }
+   ]
+  },
+  {
+   "key": "insurance",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 12
+   }
+  },
+  {
+   "key": "beihilfe",
+   "type": "choice",
+   "place": {
+    "page": 1,
+    "candidate": 13
+   },
+   "options": [
+    {
+     "value": "ja"
+    },
+    {
+     "value": "nein"
+    }
+   ]
+  },
+  {
+   "key": "bg",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 15
+   }
+  },
+  {
+   "key": "referrer",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 16
+   }
+  },
+  {
+   "key": "region",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "box2d": [
+     578,
+     512,
+     604,
+     975
+    ]
+   }
+  },
+  {
+   "key": "previous_mri",
+   "type": "text",
+   "place": {
+    "page": 1,
+    "candidate": 18
+   }
+  },
+  {
+   "key": "date",
+   "type": "date",
+   "place": {
+    "page": 1,
+    "candidate": 19
+   }
+  }
+ ]
+}

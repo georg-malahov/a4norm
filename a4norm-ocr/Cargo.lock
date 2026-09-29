@@ -10,6 +10,8 @@ dependencies = [
  "image",
  "js-sys",
  "rayon",
+ "serde",
+ "serde_json",
  "tract-onnx",
  "wasm-bindgen",
 ]
