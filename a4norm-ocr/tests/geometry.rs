@@ -201,3 +201,30 @@ fn the_demo_scans_after_the_scanner() {
         }
     }
 }
+
+#[test]
+fn a_blank_form_looks_like_one() {
+    // D24: a page is offered for filling in when 6 or more of its
+    // candidates are empty, and 60 % of them at least. The blank demo in
+    // its three pictures and KG 1 are; the filled demo (10 of 21 empty) and
+    // a page of KG 1's notes (nothing to fill in) are not.
+    let offer = |f: geometry::FormLook| f.empty >= 6 && f.empty as f32 >= 0.6 * f.total as f32;
+    let look = |img: &RgbImage| geometry::looks_like_form(img, img.width() as f32 / 595.28);
+    for name in ["demo-blank-scan.jpg", "demo-blank-a4norm-scan.pdf"] {
+        let f = look(&picture(name));
+        eprintln!("{name}: {f:?}");
+        assert!(offer(f) && f.empty >= 19, "{name}: {f:?}");
+    }
+    let f = look(&picture("demo-filled-scan.jpg"));
+    eprintln!("demo-filled-scan.jpg: {f:?}");
+    assert!(!offer(f) && (9..=11).contains(&f.empty) && (20..=22).contains(&f.total), "{f:?}");
+    for (pdf, page, form) in [("demo-blank.pdf", 1, true), ("official/ba-kg1-kindergeld.pdf", 2, true), ("official/ba-kg1-kindergeld.pdf", 4, false)] {
+        let Some(img) = render(pdf, page) else {
+            eprintln!("skipped {pdf}: no pdftoppm or no form here");
+            continue;
+        };
+        let f = look(&img);
+        eprintln!("{pdf} p. {page}: {f:?}");
+        assert_eq!(offer(f), form, "{pdf} p. {page}: {f:?}");
+    }
+}

@@ -10,7 +10,8 @@
 
 pub mod det;
 pub mod fill;
-pub mod geometry;
+/// The geometry of a form's page, shared with the scanner (a4norm-geometry)
+pub use a4norm_geometry as geometry;
 pub mod font;
 pub mod lang;
 pub mod pdf;

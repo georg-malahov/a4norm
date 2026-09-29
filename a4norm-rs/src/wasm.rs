@@ -28,6 +28,9 @@
 //! const thumb = thumbnail(bytes, 320, 80);
 //! // camera preview: the document in a video frame drawn to a ~600 px canvas
 //! const { kind, quads } = detect(ctx.getImageData(0, 0, w, h).data, w, h);
+//!
+//! // after process: does a page look like a blank form? (offer "Fill in")
+//! const { empty, total } = looksLikeForm(r.pages[0]);   // { jpg, dpi }
 //! ```
 
 use crate::{encode_page, io, parse_args, run, Source};
@@ -254,4 +257,23 @@ pub fn detect(rgba: &[u8], w: u32, h: u32) -> Result<Object, JsValue> {
 pub fn thumbnail(bytes: &[u8], max_side: u32, quality: Option<u8>) -> Result<Uint8Array, JsValue> {
     let out = work(|_| crate::edit::thumbnail(bytes, max_side as usize, quality.unwrap_or(80)), |_, _| {}).map_err(|e| JsValue::from_str(&e.0))?;
     Ok(Uint8Array::from(out.as_slice()))
+}
+
+/// Whether one of `process`'s pages, `{ jpg, dpi }`, looks like a blank form,
+/// for offering to fill it in (D24): `{ empty, total, lines, rects, combs,
+/// boxes }`, the page's writing lines (under 400 pt), fields, combs and check
+/// boxes, and how many of them nothing is written in (a4norm-geometry). The
+/// site offers it when `empty >= 6 && empty >= 0.6 * total`.
+#[wasm_bindgen(js_name = looksLikeForm)]
+pub fn looks_like_form(page: JsValue) -> Result<Object, JsValue> {
+    let jpg = Uint8Array::new(&get(&page, "jpg")).to_vec();
+    let dpi = get(&page, "dpi").as_f64().unwrap_or(200.0);
+    let src = io::decode(&jpg, "page").map_err(|e| JsValue::from_str(&e.0))?;
+    let img = image::RgbImage::from_raw(src.w as u32, src.h as u32, src.px).ok_or_else(|| JsValue::from_str("a4norm: page"))?;
+    let f = a4norm_geometry::looks_like_form(&img, dpi as f32 / 72.0);
+    let out = Object::new();
+    for (k, v) in [("empty", f.empty), ("total", f.total), ("lines", f.lines), ("rects", f.rects), ("combs", f.combs), ("boxes", f.boxes)] {
+        set(&out, k, &JsValue::from_f64(v as f64));
+    }
+    Ok(out)
 }
