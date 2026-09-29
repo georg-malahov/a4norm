@@ -6,6 +6,7 @@
 use a4norm_ocr::geometry::{self, Candidate, Kind};
 use a4norm_ocr::pdf_jpeg;
 use image::RgbImage;
+use std::path::PathBuf;
 use std::process::Command;
 
 const FORMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/forms/");
@@ -163,5 +164,40 @@ fn official_forms() {
         got.sort_unstable();
         want.sort_unstable();
         assert_eq!(got, want, "{pdf}");
+    }
+}
+
+/// The scanner, if it was built (`cargo build --release` in a4norm-rs/).
+fn scanner() -> Option<PathBuf> {
+    let p = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../a4norm-rs/target/release/a4norm"));
+    p.exists().then_some(p)
+}
+
+#[test]
+fn the_demo_scans_after_the_scanner() {
+    // A4Norm Forms reads a photo of paper after the scanner has made a page
+    // of it (cropped, levelled, cleaned, 200 dpi JPEG): its rules come out
+    // bolder, and a figure's loop must not pass for a box
+    let Some(a4norm) = scanner() else {
+        return eprintln!("skipped: no scanner built (cargo build --release in a4norm-rs/)");
+    };
+    for scan in ["demo-blank-a4norm-scan.pdf", "demo-filled-scan.jpg"] {
+        for look in ["auto", "magic", "color"] {
+            let out = std::env::temp_dir().join(format!("a4norm-geometry-pipe-{}-{look}.jpg", scan.replace('.', "-")));
+            let ok = Command::new(&a4norm)
+                .args(["--format", "jpg", "--dpi", "200", "--look", look, "-o"])
+                .arg(&out)
+                .arg(format!("{FORMS}{scan}"))
+                .output()
+                .is_ok_and(|o| o.status.success());
+            assert!(ok, "{scan} {look}: the scanner failed");
+            let img = image::open(&out).unwrap().to_rgb8();
+            let px_pt = img.width() as f32 / 595.28;
+            let boxes: Vec<[f32; 4]> = find(&img).iter().filter_map(|c| if let Kind::Box(b) = c.kind { Some(b) } else { None }).collect();
+            let sides: Vec<f32> = boxes.iter().map(|b| (b[2] - b[0]) / px_pt).collect();
+            eprintln!("{scan} {look}: boxes {sides:.1?}");
+            assert_eq!(boxes.len(), 4, "{scan} {look}: {sides:?}");
+            assert!(sides.iter().all(|s| (16.0..=21.0).contains(s)), "{scan} {look}: {sides:?}");
+        }
     }
 }

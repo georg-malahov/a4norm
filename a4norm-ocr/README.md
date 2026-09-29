@@ -66,9 +66,13 @@ await releaseThreadPool();                             // soon after the work, s
 const geometry = formGeometry(imageData.data, width, height, 595.28, 841.89);  // no models
 ```
 
-`inspect` gives the geometry the words it read: a cell inside a word is a letter, a line
-along a word is the tops of its letters, and a frame holding three lines of words is a
-note, not a field. `formGeometry` works without them, and a large letter or a note in a
+`inspect` gives the geometry the words it read: a cell or box inside a word is a letter,
+a line along a word is the tops of its letters, and a frame holding three lines of words
+is a note, not a field.
+
+In turn, the geometry parts the words. A row of check boxes is read as one word
+("zu:JaNein" over "zu: [] Ja [] Nein"), so the word is split at each box, by where each
+character was read, and each option's label becomes a word of its own. `formGeometry` works without them, and a large letter or a note in a
 frame can then pass for a field.
 
 The threaded build's pool is the one a4norm-rs has (`src/pool.rs`, `src/pool.js`, kept
@@ -127,16 +131,27 @@ the rules were set at 200 dpi.
      - holds three lines of words, or words over two thirds of it (a note);
      - is small with something in its middle (a section's number);
      - lies inside a word (the inside of a large "U").
-4. **Writing lines** are the other horizontal strokes, at least 32 pt long. A stroke with
-   rules hanging from both ends is the top of a box, not a writing line. A line broken in
-   print (by dots lost) is joined across up to 8 pt. A field's doubled bottom rule is not
-   a line.
+4. **Writing lines** are the other horizontal strokes, at least 32 pt long.
+   - A stroke with rules hanging from both ends is the top of a box, not a writing line.
+   - A line broken in print or cleaning, by dots lost, is joined across up to 8 pt, or up
+     to 16 pt with paper above the gap. Two lines with a label between stay two.
+   - A field's doubled bottom rule is not a line.
 5. **Check boxes** are small enclosed white areas (2.8–26 pt, square or round), empty in
-   the middle. Looking out four ways from the middle, the border must be thin, at most a
-   quarter of the side and at most 1.6 pt, with paper right beyond it on three sides. A
-   letter's counter, as in a bold "o" or an "O" in a heading, fails this.
+   the middle.
+   - Looking out four ways from the middle, the border must be thin, with paper right
+     beyond it on three sides. Thin means at most a quarter of the side, 0.6–2.4 pt: the
+     scanner's cleaning leaves rules bolder. A letter's counter, as in a bold "o" or an
+     "O" in a heading, fails this.
+   - A round one under 7.5 pt is a loop, as of a "6" or an "o"; a box that small is
+     square ("□").
+   - With the words read, a box inside a word and lower than it is a letter.
 6. **Numbers.** Rows are formed by the bottom edge, a new row where it drops by 6 pt from
    the row's first; within a row, left to right.
+
+**After the scanner.** A photo of paper reaches A4Norm Forms as the scanner leaves it:
+cropped, levelled, cleaned, a 200 dpi JPEG. Both demo scans come through it (looks
+auto, magic, color) with their 4 boxes and no other (`tests/geometry.rs`). The cleaning
+can take a faint rule with it: on the phone scan it removes the last rule of the page.
 
 **The demo form, three ways.** The same 20 writing lines and 4 boxes, numbered the same, on
 each of:

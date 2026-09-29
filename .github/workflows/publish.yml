@@ -94,7 +94,8 @@ jobs:
           path: |
             ~/.cargo/registry
             a4norm-ocr/target
-          key: ocr-cargo-${{ hashFiles('a4norm-ocr/Cargo.lock') }}
+            a4norm-rs/target
+          key: ocr-cargo-${{ hashFiles('a4norm-ocr/Cargo.lock', 'a4norm-rs/Cargo.lock') }}
 
       - name: Fetch the models
         run: a4norm-ocr/models.sh
@@ -102,6 +103,10 @@ jobs:
       # the geometry tests render the demo PDF and the official forms
       - name: Install poppler
         run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
+
+      # the geometry tests read the demo scans as the scanner leaves them
+      - name: Build the scanner
+        run: cd a4norm-rs && cargo build --release --locked --bin a4norm
 
       - name: Rust tests
         run: cd a4norm-ocr && cargo test --release --locked

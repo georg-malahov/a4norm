@@ -83,6 +83,8 @@ pub struct Span {
     pub score: f32,
     pub u0: f32,
     pub u1: f32,
+    /// where each character was read, along the line like `u0`
+    pub at: Vec<f32>,
 }
 
 /// Reads a cut line: its words, split at the recognizer's spaces.
@@ -98,22 +100,23 @@ pub fn read(plan: &Plan, c: &Cut, chars: &[String]) -> TractResult<Vec<Span>> {
     let space = chars.len() - 1;
     let mut words: Vec<Span> = vec![];
     let mut cur: Option<(String, f32, usize, usize, usize)> = None; // text, sum, n, first, last frame
+    let mut at: Vec<f32> = vec![];
     let mut prev = 0usize;
     let col = |t: usize| (t * STEP) as f32 * c.scale;
     // A character is emitted about the middle of its glyph: a word starts
     // half a character before its first one, and ends with its last frame.
-    let end = |cur: &mut Option<(String, f32, usize, usize, usize)>, words: &mut Vec<Span>| {
+    let end = |cur: &mut Option<(String, f32, usize, usize, usize)>, at: &mut Vec<f32>, words: &mut Vec<Span>| {
         if let Some((text, sum, n, t0, t1)) = cur.take() {
             let half = if n > 1 { (t1 - t0) as f32 / (n - 1) as f32 / 2.0 } else { 1.0 };
             let u0 = (col(t0) - half * STEP as f32 * c.scale).max(0.0);
-            words.push(Span { text, score: sum / n as f32, u0, u1: col(t1 + 1) });
+            words.push(Span { text, score: sum / n as f32, u0, u1: col(t1 + 1), at: std::mem::take(at) });
         }
     };
     for t in 0..t_len {
         let row = &flat[t * classes..(t + 1) * classes];
         let (k, &p) = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         if k == space {
-            end(&mut cur, &mut words);
+            end(&mut cur, &mut at, &mut words);
         } else if k != 0 && k < chars.len() {
             match &mut cur {
                 Some((text, sum, n, _, t1)) => {
@@ -121,14 +124,18 @@ pub fn read(plan: &Plan, c: &Cut, chars: &[String]) -> TractResult<Vec<Span>> {
                         text.push_str(&chars[k]);
                         *sum += p;
                         *n += 1;
+                        at.push(col(t) + 0.5 * STEP as f32 * c.scale);
                     }
                     *t1 = t;
                 }
-                None => cur = Some((chars[k].clone(), p, 1, t, t)),
+                None => {
+                    cur = Some((chars[k].clone(), p, 1, t, t));
+                    at.push(col(t) + 0.5 * STEP as f32 * c.scale);
+                }
             }
         }
         prev = k;
     }
-    end(&mut cur, &mut words);
+    end(&mut cur, &mut at, &mut words);
     Ok(words)
 }
