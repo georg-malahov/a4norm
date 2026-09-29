@@ -279,3 +279,76 @@ fn moved_larger_and_free_text() {
     let ink = (60..160).flat_map(|x| (800..814).map(move |y| (x, y))).filter(|&(x, y)| shown.get_pixel((x as f32 * s) as u32, (y as f32 * s) as u32)[0] < 128).count();
     assert!(ink > 20, "{ink}");
 }
+
+/// The mean difference of two pictures of one size, in levels.
+fn differ(a: &RgbImage, b: &RgbImage) -> f64 {
+    assert_eq!(a.dimensions(), b.dimensions());
+    let sum: u64 = a.as_raw().iter().zip(b.as_raw()).map(|(x, y)| (*x as i64 - *y as i64).unsigned_abs()).sum();
+    sum as f64 / a.as_raw().len() as f64
+}
+
+/// The demo's request for a picture of any shape, inspected as it is.
+fn request_any(ocr: &Ocr, img: &RgbImage) -> Request {
+    let size = if img.width() < img.height() { [595.28, 841.89] } else { [841.89, 595.28] };
+    let (p, g) = ocr.inspect(img, size).unwrap();
+    let ins: Inspection = serde_json::from_str(&inspection_json(&p, &g, size)).unwrap();
+    let read = |f: &str| std::fs::read_to_string(format!("{FORMS}{f}")).unwrap();
+    Request {
+        inspections: vec![ins],
+        template: serde_json::from_str(&read("demo-template.json")).unwrap(),
+        answers: serde_json::from_str(&read("demo-answers.json")).unwrap(),
+        color: None,
+        min_size: None,
+        images: vec![],
+        texts: vec![],
+    }
+}
+
+#[test]
+fn a_page_on_its_side_filled_the_right_way_up() {
+    let Some(ocr) = ready() else { return };
+    // a scan on its side: read turned, filled, and shown the right way up,
+    // as the scan the right way up is
+    let bytes = std::fs::read(format!("{FORMS}demo-blank-a4norm-scan.pdf")).unwrap();
+    let img = image::load_from_memory(pdf_jpeg(&bytes).unwrap()).unwrap().to_rgb8();
+    let jpeg = |img: &RgbImage| {
+        let mut out = vec![];
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95).encode_image(img).unwrap();
+        out
+    };
+    let side = image::imageops::rotate90(&img);
+    // the answers compared over blank paper of each shape: a picture turned
+    // in the PDF is resampled differently, the answers must not be
+    let white = |i: &RgbImage| RgbImage::from_pixel(i.width(), i.height(), image::Rgb([255, 255, 255]));
+    let (up_jpg, side_jpg) = (jpeg(&white(&img)), jpeg(&white(&side)));
+    let (up_req, side_req) = (request_any(&ocr, &img), request_any(&ocr, &side));
+    assert_eq!(side_req.inspections[0].orientation, 270);
+    let (_, up) = pdf::fill_scan(&up_req, &[&up_jpg], &[]).unwrap();
+    let (layout, turned) = pdf::fill_scan(&side_req, &[&side_jpg], &[]).unwrap();
+    assert_eq!(layout.placed.len(), 14);
+    let t = text(&turned.pdf, "side-scan-out");
+    assert!(t.contains("Greenholt") && t.contains("PRIVAT (Continentale)"), "{t}");
+    let (a, b) = (render(&up.pdf, 1, 72, "up-scan-out").unwrap(), render(&turned.pdf, 1, 72, "side-scan-out").unwrap());
+    let d = differ(&a, &b);
+    eprintln!("scan on its side against the right way up: {d:.2} levels");
+    assert!(d < 0.5, "{d}");
+
+    // a PDF whose page is shown on its side (/Rotate 90): the same
+    let source = std::fs::read(format!("{FORMS}demo-blank.pdf")).unwrap();
+    let mut doc = lopdf::Document::load_mem(&source).unwrap();
+    for id in doc.get_pages().into_values() {
+        doc.get_dictionary_mut(id).unwrap().set("Rotate", 90);
+    }
+    let mut rotated = vec![];
+    doc.save_to(&mut rotated).unwrap();
+    let (up_page, side_page) = (render(&source, 1, 200, "rot-up-src").unwrap(), render(&rotated, 1, 200, "rot-side-src").unwrap());
+    assert!(side_page.width() > side_page.height());
+    let side_req = request_any(&ocr, &side_page);
+    assert_eq!(side_req.inspections[0].orientation, 270);
+    let (_, up) = pdf::fill_pdf(&request_any(&ocr, &up_page), &source, &[], &[]).unwrap();
+    let (_, turned) = pdf::fill_pdf(&side_req, &rotated, &[], &[]).unwrap();
+    let (a, b) = (render(&up.pdf, 1, 72, "rot-up-out").unwrap(), render(&turned.pdf, 1, 72, "rot-side-out").unwrap());
+    let d = differ(&a, &b);
+    eprintln!("/Rotate 90 against the right way up: {d:.2} levels");
+    assert!(d < 0.5, "{d}");
+}

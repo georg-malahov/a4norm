@@ -34,6 +34,10 @@ pub struct Inspection {
     pub page: Option<u32>,
     #[serde(rename = "sizePt")]
     pub size_pt: [f32; 2],
+    /// how far the picture was turned clockwise to read it the right way
+    /// up; everything here is of the page so turned
+    #[serde(default)]
+    pub orientation: u16,
     #[serde(default, rename = "skewDeg")]
     pub skew_deg: f32,
     #[serde(default)]
@@ -266,9 +270,10 @@ pub fn base_size(pages: &[Inspection]) -> f32 {
 }
 
 impl Request {
-    /// The `sizePt` of page `n` (from 1), if it was inspected.
-    pub fn page_size(&self, n: u32) -> Option<[f32; 2]> {
-        page(&self.inspections, n).map(|p| p.size_pt)
+    /// The `sizePt` of page `n` (from 1) and its `orientation`, if it was
+    /// inspected.
+    pub fn page_size(&self, n: u32) -> Option<([f32; 2], u16)> {
+        page(&self.inspections, n).map(|p| (p.size_pt, p.orientation % 360 / 90 * 90))
     }
 }
 

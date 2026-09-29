@@ -115,7 +115,7 @@ fn words_sit_on_the_page() {
     let b = w.bbox.map(|v| v * s);
     assert!((b[0] - 73.1).abs() < 8.0 && (b[2] - 143.4).abs() < 8.0, "{b:?}");
     assert!(b[1] < 97.0 && b[3] > 97.0, "{b:?}");
-    assert!(json.starts_with("{\"sizePt\":[595.28,841.89],\"skewDeg\":0.6"), "{}", &json[..60]);
+    assert!(json.starts_with("{\"sizePt\":[595.28,841.89],\"orientation\":0,\"skewDeg\":0.6"), "{}", &json[..60]);
 }
 
 #[test]
