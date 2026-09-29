@@ -245,7 +245,7 @@ impl Ocr {
     /// geometry where letters are.
     pub fn inspect(&self, page: &RgbImage, size_pt: [f32; 2]) -> TractResult<(Page, geometry::Geometry)> {
         let mut p = self.page(page)?;
-        let g = geometry::find(page, px_pt(page.width(), size_pt), &p.word_boxes());
+        let g = geometry::find(page, px_pt(page.width(), size_pt), &p.texts());
         p.split_at_boxes(&g);
         Ok((p, g))
     }
@@ -264,14 +264,17 @@ pub fn inspection_json(p: &Page, g: &geometry::Geometry, size_pt: [f32; 2]) -> S
 }
 
 impl Page {
-    /// The boxes of the words that are words: a letter or digit at least,
-    /// read with some confidence ("□" read as a character is a box).
-    pub fn word_boxes(&self) -> Vec<[f32; 4]> {
+    /// The words that are words, for the geometry: a letter or digit at
+    /// least, read with some confidence ("□" read as a character is a box).
+    pub fn texts(&self) -> Vec<geometry::Text> {
         self.lines
             .iter()
             .flat_map(|l| &l.words)
             .filter(|w| w.score >= 0.6 && w.text.chars().any(char::is_alphanumeric))
-            .map(|w| w.bbox)
+            .map(|w| geometry::Text {
+                bbox: w.bbox,
+                chars: if w.at.len() == w.text.chars().count() { w.text.chars().zip(w.at.iter().copied()).collect() } else { vec![] },
+            })
             .collect()
     }
 

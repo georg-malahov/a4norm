@@ -59,6 +59,14 @@ impl Candidate {
     }
 }
 
+/// A word read on the page: its box, and each character with where across
+/// the page it was read (empty when that is not known).
+#[derive(Debug, Clone, Default)]
+pub struct Text {
+    pub bbox: [f32; 4],
+    pub chars: Vec<(char, f32)>,
+}
+
 /// A page's candidates, in pixels, and the typical height of its fields.
 #[derive(Debug, Clone)]
 pub struct Geometry {
@@ -83,8 +91,9 @@ const BOX_MAX: f32 = 26.0;
 const ROW: f32 = 6.0; // reading order: rows at least this far apart
 
 /// The candidates on a page whose points are `px_pt` pixels. `text` are
-/// the boxes of words read on it, if any: a cell inside a word is a letter.
-pub fn find(page: &RgbImage, px_pt: f32, text: &[[f32; 4]]) -> Geometry {
+/// the words read on it, if any: a cell inside a word is a letter.
+pub fn find(page: &RgbImage, px_pt: f32, words: &[Text]) -> Geometry {
+    let text: Vec<[f32; 4]> = words.iter().map(|t| t.bbox).collect();
     let (w, h) = (page.width() as usize, page.height() as usize);
     let pt = |v: f32| (v * px_pt).round().max(1.0) as usize;
     let ink = ink(page);
@@ -96,10 +105,12 @@ pub fn find(page: &RgbImage, px_pt: f32, text: &[[f32; 4]]) -> Geometry {
     let vs = strokes(&ink, w, h, false, 1, pt(V_RUN), pt(THIN), px_pt);
 
     let mut found: Vec<Kind> = vec![];
-    // a box inside a word, lower than the word, is a letter's loop
     let boxes: Vec<[f32; 4]> = check_boxes(&ink, w, h, px_pt)
         .into_iter()
-        .filter(|b| !text.iter().any(|t| overlap(b, t) > 0.8 && b[3] - b[1] < 0.6 * (t[3] - t[1])))
+        .filter(|b| {
+            let gap = gap_right(&ink, w, b, px_pt);
+            !words.iter().any(|t| a_loop(b, t, gap, px_pt))
+        })
         .collect();
 
     // what stands on each horizontal stroke
@@ -214,7 +225,7 @@ pub fn find(page: &RgbImage, px_pt: f32, text: &[[f32; 4]]) -> Geometry {
     // box), is not a field; a label inside a field takes less of it
     let all = found.clone();
     found.retain(|k| match k {
-        Kind::Rect(r) => !all.iter().any(|o| o != k && inside(&bounds(o), r)) && !a_note(r, text),
+        Kind::Rect(r) => !all.iter().any(|o| o != k && inside(&bounds(o), r)) && !a_note(r, &text),
         _ => true,
     });
 
@@ -260,6 +271,41 @@ fn narrow(c: &[f32; 4]) -> bool {
 
 fn bounds(k: &Kind) -> [f32; 4] {
     Candidate { id: 0, kind: *k }.bounds()
+}
+
+/// Whether box `b` is a letter's loop in word `t` ("6" in "635"): inside
+/// the word, lower than it, with a letter or digit read in it. A row of
+/// boxes read as one word with their labels ("□ männlich □ weiblich" as
+/// "männlichweiblich") has nothing read in the boxes; a round one read as
+/// a letter ("◯ ja" as "Oja") has its label after it, a word space away
+/// (`gap`, paper beyond its right side), where a letter's next is closer
+/// ("Ocupación").
+fn a_loop(b: &[f32; 4], t: &Text, gap: f32, px_pt: f32) -> bool {
+    if overlap(b, &t.bbox) <= 0.8 || b[3] - b[1] >= 0.6 * (t.bbox[3] - t.bbox[1]) {
+        return false;
+    }
+    if t.chars.is_empty() {
+        return true;
+    }
+    let read = t.chars.iter().any(|&(c, x)| x > b[0] && x < b[2] && c.is_alphanumeric());
+    let label = t.chars.iter().skip_while(|&&(_, x)| x < b[2]).take(2).filter(|&&(c, _)| c.is_alphabetic()).count() == 2;
+    read && !(label && gap >= 1.5 * px_pt)
+}
+
+/// The paper right of box `b` across its middle, beyond its side: up to
+/// the next ink, at most 3 pt.
+fn gap_right(ink: &[bool], w: usize, b: &[f32; 4], px_pt: f32) -> f32 {
+    let (y0, y1) = ((b[1] + 0.2 * (b[3] - b[1])) as usize, (b[1] + 0.8 * (b[3] - b[1])) as usize);
+    let dark = |x: usize| (y0..=y1).any(|y| ink[y * w + x]);
+    let (mut x, end) = (b[2] as usize, w.min((b[2] + 6.0 * px_pt) as usize));
+    while x < end && dark(x) {
+        x += 1;
+    }
+    let from = x;
+    while x < end && !dark(x) && ((x - from) as f32) < 3.0 * px_pt {
+        x += 1;
+    }
+    (x - from) as f32
 }
 
 /// Whether `r` holds text rather than room for it: three lines of words or
