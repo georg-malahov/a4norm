@@ -16,6 +16,12 @@
 //! field is high enough; else it is set at 7 pt and marked as overflowing.
 //! A comb takes a character per cell; a check box takes a cross. All in
 //! points from the page's top left, in Arimo (font.rs).
+//!
+//! By hand, on the site: a field's `size` sets its value at that size
+//! exactly (broken over two lines as usual, and left out of the page's
+//! shared size), and its `shift` moves all it puts on the page, text,
+//! cells and cross alike. The request's `texts` are free text of the
+//! person's own, set where they put it.
 
 use crate::font::{self, CAP, DESCENT};
 use serde::{Deserialize, Serialize};
@@ -106,6 +112,11 @@ pub struct Field {
     pub place: Option<Place>,
     #[serde(default)]
     pub options: Vec<Opt>,
+    /// the value's size in points, exactly, instead of the one chosen
+    pub size: Option<f32>,
+    /// `[dx, dy]` in points, right and down: moves all the field puts on
+    /// its page
+    pub shift: Option<[f32; 2]>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +144,21 @@ pub struct Request {
     /// come apart, in this order
     #[serde(default)]
     pub images: Vec<ImagePlace>,
+    /// free text to set over the pages
+    #[serde(default)]
+    pub texts: Vec<FreeText>,
+}
+
+/// Free text: from its baseline's start `(x, y)`, in points from the
+/// page's top left, at `size`, level.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FreeText {
+    #[serde(default = "first")]
+    pub page: u32,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+    pub text: String,
 }
 
 /// A picture's place: fitted into `box` (points from the page's top left),
@@ -191,11 +217,13 @@ const LEADING: f32 = 1.15;
 
 /// The sizes a value may take: at most `cap`, from the ladder `base`,
 /// `base - 1`, … down to `min`, so that fields made smaller share sizes.
+/// An `exact` size is `base`, whatever room there is.
 #[derive(Debug, Clone, Copy)]
 struct Sizes {
     base: f32,
     cap: f32,
     min: f32,
+    exact: bool,
 }
 
 impl Sizes {
@@ -249,7 +277,7 @@ pub fn layout(req: &Request) -> Layout {
     let min = req.min_size.unwrap_or(7.0).min(base);
     let color = req.color.as_deref().and_then(hex).unwrap_or([0x1a as f32 / 255.0; 3]);
     let mut out = Layout { base, color, placed: vec![], marks: vec![] };
-    let full = Sizes { base, cap: base, min };
+    let full = Sizes { base, cap: base, min, exact: false };
     // the text values, each at the largest size it takes
     let mut texts: Vec<(&Field, String, Placed, Vec<Mark>)> = vec![];
     for f in &req.template.fields {
@@ -269,16 +297,23 @@ pub fn layout(req: &Request) -> Layout {
         if text.is_empty() {
             continue;
         }
-        if let Some((p, m)) = place_text(&text, place, ins, full) {
+        let z = match f.size {
+            Some(s) if s > 0.0 => Sizes { base: s, cap: s, min: s, exact: true },
+            _ => full,
+        };
+        if let Some((p, m)) = place_text(&text, place, ins, z) {
             texts.push((f, text, p, m));
         }
     }
     // One size for most of a page: when more than half its text values had
     // to be made smaller, the others come down to the step most of those
     // took, unless their field is notably higher (half again the usual).
+    // A size set by hand stays as it is, and counts for none of this.
     let pages: std::collections::BTreeSet<u32> = texts.iter().map(|t| t.2.page).collect();
     for pg in pages {
-        let on: Vec<usize> = (0..texts.len()).filter(|&i| texts[i].2.page == pg && texts[i].2.kind == "text").collect();
+        let on: Vec<usize> = (0..texts.len())
+            .filter(|&i| texts[i].2.page == pg && texts[i].2.kind == "text" && texts[i].0.size.is_none())
+            .collect();
         let smaller: Vec<f32> = on.iter().map(|&i| texts[i].2.size).filter(|&s| s < base).collect();
         if on.len() < 2 || smaller.len() * 2 <= on.len() {
             continue;
@@ -305,9 +340,18 @@ pub fn layout(req: &Request) -> Layout {
             }
         }
     }
-    for (f, _, p, m) in texts {
+    for (f, _, mut p, mut m) in texts {
+        if let Some(d) = f.shift {
+            shift(&mut p, &mut m, d);
+        }
         out.placed.push(Placed { key: f.key.clone(), ..p });
         out.marks.extend(m);
+    }
+    for t in &req.texts {
+        let text = t.text.trim_end();
+        if !text.is_empty() && t.size > 0.0 {
+            out.marks.push(Mark::Text { page: t.page, x: t.x, y: t.y, size: t.size, angle: 0.0, text: text.to_string() });
+        }
     }
     // in the template's order
     let order = |k: &str| req.template.fields.iter().position(|f| f.key == k);
@@ -324,6 +368,17 @@ fn place_text(text: &str, place: &Place, ins: &Inspection, z: Sizes) -> Option<(
     let (target, candidate) = snap(ins, &one, false)?;
     let (placed, marks) = set(text, target, ins, z, place.page);
     Some((Placed { candidate, ..placed }, marks))
+}
+
+/// A value and its marks moved by `[dx, dy]`.
+fn shift(p: &mut Placed, marks: &mut [Mark], [dx, dy]: [f32; 2]) {
+    (p.x, p.y) = (p.x + dx, p.y + dy);
+    for m in marks {
+        match m {
+            Mark::Text { x, y, .. } => (*x, *y) = (*x + dx, *y + dy),
+            Mark::Cross { b, .. } => *b = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy],
+        }
+    }
 }
 
 fn page(pages: &[Inspection], n: u32) -> Option<&Inspection> {
@@ -359,8 +414,8 @@ fn check(out: &mut Layout, f: &Field, place: &Place, ins: &Inspection, answer: &
     let side = (b[2] - b[0]).min(b[3] - b[1]);
     let inset = 0.18 * side;
     let cross = [b[0] + inset, b[1] + inset, b[2] - inset, b[3] - inset];
-    out.marks.push(Mark::Cross { page: place.page, b: cross, width: (0.08 * side).clamp(0.6, 1.4) });
-    out.placed.push(Placed {
+    let mut marks = [Mark::Cross { page: place.page, b: cross, width: (0.08 * side).clamp(0.6, 1.4) }];
+    let mut placed = Placed {
         key: f.key.clone(),
         page: place.page,
         x: (b[0] + b[2]) / 2.0,
@@ -372,7 +427,12 @@ fn check(out: &mut Layout, f: &Field, place: &Place, ins: &Inspection, answer: &
         candidate,
         lost: false,
         room: side,
-    });
+    };
+    if let Some(d) = f.shift {
+        shift(&mut placed, &mut marks, d);
+    }
+    out.marks.extend(marks);
+    out.placed.push(placed);
 }
 
 /// A value over several candidates, in the order of their numbers: through
@@ -538,7 +598,7 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
             let chars: Vec<String> = text.chars().filter(|c| !c.is_whitespace()).map(String::from).collect();
             let cw = (b[2] - b[0]) / cells.max(1) as f32;
             let widest = chars.iter().map(|c| font::width(c, 1.0)).fold(0.5, f32::max);
-            let size = z.base.min(0.7 * (b[3] - b[1])).min(0.8 * cw / widest);
+            let size = if z.exact { z.base } else { z.base.min(0.7 * (b[3] - b[1])).min(0.8 * cw / widest) };
             let y = (b[1] + b[3]) / 2.0 + CAP * size / 2.0;
             let marks = chars
                 .iter()
@@ -625,6 +685,8 @@ fn room_above(ins: &Inspection, l: &ILine) -> f32 {
 /// `min` or more; else one line at `min`, overflowing. Sizes below `base`
 /// are steps of its ladder.
 fn fit(text: &str, w: f32, h: f32, z: Sizes) -> (f32, Vec<String>, bool) {
+    // a size set by hand takes the height it needs
+    let h = if z.exact { f32::INFINITY } else { h };
     // one line needs its glyphs' height, cap to descender, and a little air
     let top = z.step(z.cap.min(h / (CAP + DESCENT + 0.05)).max(z.min));
     let one = font::width(text, top);

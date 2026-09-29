@@ -190,13 +190,24 @@ frame passes for a field, and Frankfurt keeps two strokes along a heading.
 `fillLayout(requestJson)` (and `fill::layout` in Rust) places a form's answers on its pages
 without drawing them; no models are needed.
 
-The request is `{inspections, template, answers, color?, minSize?}`:
+The request is `{inspections, template, answers, color?, minSize?, images?, texts?}`:
 - `inspections` are the pages' `PageInspection`s as `inspect` gave them;
 - `template.fields` are `{key, type, place, options?}`. A `place` is `{page, candidate}`
   (a candidate's `id` on that page, as the model's structure names it), or `{page, box2d}`
   (`[ymin, xmin, ymax, xmax]` in 0–1000 of the page, for a field the geometry did not
   find), or `{page, box}` in points. Pages count from 1;
-- `answers` maps a key to a text, a choice's option `value`, or `true` for a single box.
+- `answers` maps a key to a text, a choice's option `value`, or `true` for a single box;
+- `texts: [{page, x, y, size, text}]` are free text of the person's own, set level in the
+  embedded font from its baseline's start `(x, y)`, in points from the top left.
+
+**By hand** (the site's adjusting of a filled form). A field may carry:
+- `size` (pt): its value is set at that size exactly, not made smaller, and left out of the
+  page's shared size. It still breaks over two lines when one is too wide.
+- `shift: [dx, dy]` (pt, right and down): all the field puts on its page moves by that
+  much, after it has been placed: a text, a comb's characters, a choice's cross, and
+  `placed`'s `x`, `y`.
+
+Without them everything is as below.
 
 The result is `{baseSize, placed: [{key, page, x, y, size, lines, overflow, kind,
 candidate?, lost?}]}`:

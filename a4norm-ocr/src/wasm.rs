@@ -93,8 +93,9 @@ fn parse(json: &str) -> Result<JsValue, JsError> {
 }
 
 /// Where each answer goes and its size, without drawing it (no models):
-/// `request` is `{inspections, template, answers, color?, minSize?}` as JSON
-/// (`src/fill.rs`); the result `{baseSize, placed: [{key, page, x, y, size,
+/// `request` is `{inspections, template, answers, color?, minSize?,
+/// images?, texts?}` as JSON (`src/fill.rs`; a field may carry `size` and
+/// `shift`, set by hand); the result `{baseSize, placed: [{key, page, x, y, size,
 /// lines, overflow, kind, candidate?, lost?}]}`, in points.
 #[wasm_bindgen(js_name = fillLayout)]
 pub fn fill_layout(request: &str) -> Result<JsValue, JsError> {

@@ -61,6 +61,7 @@ fn request(ocr: &Ocr, img: &RgbImage, page: u32, template: &str, answers: &str) 
         color: None,
         min_size: None,
         images: vec![],
+        texts: vec![],
     }
 }
 
@@ -243,4 +244,38 @@ fn a_signature_over_the_page() {
     let lost = a.enumerate_pixels().filter(|(x, y, p)| p[0] < 100 && b.get_pixel(*x, *y)[0] > 200).count();
     assert_eq!(lost, 0, "the rule under it is not covered");
     assert!(pdf::fill_pdf(&req, &source, &[], &[]).is_err(), "a place without its picture");
+}
+
+#[test]
+fn moved_larger_and_free_text() {
+    let Some(ocr) = ready() else { return };
+    // a value moved and set larger by hand, and a line of the person's own
+    // over the page: vector text in the embedded font, copied as written
+    let source = std::fs::read(format!("{FORMS}demo-blank.pdf")).unwrap();
+    let page = render(&source, 1, 200, "hand-source").unwrap();
+    let mut req = request(&ocr, &page, 1, "demo-template.json", "demo-answers.json");
+    let hand = |req: &mut Request, shift| {
+        for f in &mut req.template.fields {
+            if f.key == "name" {
+                (f.size, f.shift) = (Some(15.0), shift);
+            }
+        }
+    };
+    hand(&mut req, None);
+    let plain = a4norm_ocr::fill::layout(&req);
+    hand(&mut req, Some([6.0, -2.0]));
+    req.texts = serde_json::from_value(serde_json::json!([{"page": 1, "x": 60.0, "y": 812.0, "size": 10.0, "text": "Nachtrag: Größe ş ł"}])).unwrap();
+    let (layout, out) = pdf::fill_pdf(&req, &source, &[], &[]).unwrap();
+    let (a, b) = (plain.placed.iter().find(|p| p.key == "name").unwrap(), layout.placed.iter().find(|p| p.key == "name").unwrap());
+    assert_eq!((a.size, b.size), (15.0, 15.0));
+    assert!((b.x - a.x - 6.0).abs() < 1e-3 && (b.y - a.y + 2.0).abs() < 1e-3, "{a:?} {b:?}");
+    let t = text(&out.pdf, "hand-out");
+    for s in ["Greenholt", "Nachtrag: Größe ş ł"] {
+        assert!(t.contains(s), "{s} not in the text: {t}");
+    }
+    // the free line shows where it was put: ink under 812 pt at 60 pt on
+    let shown = render(&out.pdf, 1, 100, "hand-out").unwrap();
+    let s = 100.0 / 72.0;
+    let ink = (60..160).flat_map(|x| (800..814).map(move |y| (x, y))).filter(|&(x, y)| shown.get_pixel((x as f32 * s) as u32, (y as f32 * s) as u32)[0] < 128).count();
+    assert!(ink > 20, "{ink}");
 }
