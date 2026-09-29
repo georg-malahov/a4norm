@@ -168,6 +168,59 @@ A field drawn as a bracket (a bottom rule with ends only 5 pt high, as for KG 1'
 "Kindergeld-Nr.") is found as its writing line. Without the words, Jobcenter's note in a
 frame passes for a field, and Frankfurt keeps two strokes along a heading.
 
+## Where the answers go (`src/fill.rs`)
+
+`fillLayout(requestJson)` (and `fill::layout` in Rust) places a form's answers on its pages
+without drawing them; no models are needed.
+
+The request is `{inspections, template, answers, color?, minSize?}`:
+- `inspections` are the pages' `PageInspection`s as `inspect` gave them;
+- `template.fields` are `{key, type, place, options?}`. A `place` is `{page, candidate}`
+  (a candidate's `id` on that page, as the model's structure names it), or `{page, box2d}`
+  (`[ymin, xmin, ymax, xmax]` in 0–1000 of the page, for a field the geometry did not
+  find), or `{page, box}` in points. Pages count from 1;
+- `answers` maps a key to a text, a choice's option `value`, or `true` for a single box.
+
+The result is `{baseSize, placed: [{key, page, x, y, size, lines, overflow, kind,
+candidate?, lost?}]}`:
+- `x`, `y` are the first line's baseline at its start, or a cross's middle, in points from
+  the top left;
+- `kind` is `text`, `comb` or `check`;
+- `lost` says that a character Helvetica cannot set became "?".
+
+**Snapping a drawn box.**
+- A choice snaps to the check box it overlaps.
+- A text snaps to a comb or field that holds half of it.
+- Else it snaps to the writing line under it: overlapping by 14 pt, its foot within 25 pt.
+- Else the box itself is the field.
+
+A choice's options without places of their own are the check boxes of the field's row,
+left to right.
+
+**Sizes (the plan's amendment 3).**
+- One size for the document: `base = clamp(round(printed + 2), 9, 0.72 × field)`, from the
+  medians of the pages' `printedSize` and `typicalFieldHeight`. It is below 9 pt only when
+  the fields are that low.
+- A value that does not fit is made smaller, only as far as it has to, not below 7 pt
+  (`minSize`).
+- Then it is broken over two lines at the space that evens them, if the field is
+  2 × 1.15 × size high.
+- Else it is set at 7 pt with `overflow: true`.
+
+**Where it sits.**
+- On a writing line the descenders clear the line by 0.8 pt, and the text follows the
+  line's tilt.
+- In a field the text is centred in what its printed label leaves.
+- In a comb each character is centred in its cell, whitespace dropped; more characters
+  than cells overflow.
+- A check box gets a cross, 18 % in from its sides.
+- The colour is `#1a1a1a` unless `color` says otherwise.
+
+On the demo form (`examples/forms/demo-template.json`, `demo-answers.json`) every value of
+`demo-truth.json` is set at 13 pt, within 2.9 pt of where the form's own app printed it on
+the PDF, within 3.3 pt on the synthetic scan and within 4.4 pt on the phone scan. The two
+scans are compared once laid on the PDF.
+
 ## Results of the reading
 
 On the demo form (`examples/forms/`, `cargo test --release`). The truth is the text of the

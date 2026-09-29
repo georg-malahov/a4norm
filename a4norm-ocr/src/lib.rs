@@ -9,7 +9,9 @@
 //! geometry.
 
 pub mod det;
+pub mod fill;
 pub mod geometry;
+pub mod helvetica;
 pub mod lang;
 pub mod rec;
 

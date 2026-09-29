@@ -20,6 +20,7 @@ way, as a picture of the page, so all of them must give the same fields.
 | `demo-blank-acroform.pdf` | `demo-blank.pdf` plus a form: a text field on each of the 20 writing lines (`undefined`, `undefined_1` …, `DA /Helv 0 Tf` blue) and a check box on each of the 4 boxes | `make.py` |
 | `demo-blank-encrypted.pdf` | `demo-blank.pdf`, AES-128: an empty user password, and an owner password that forbids changes and copying (like the Familienkasse's forms and Bavaria's Wohngeld) | `make.py` |
 | `demo-truth.json` | The 12 values and their boxes in points (A4 = 595.28 × 841.89) | `demo-filled.pdf`'s text |
+| `demo-template.json`, `demo-answers.json` | A template of the form as the model's structure gives it (fields on the candidates' numbers; one drawn as a box), and the 12 values plus two choices | written by hand from the geometry's numbers |
 | `demo-filled.txt`, `demo-blank.txt` | The text of the two PDFs, a line of the page per line: the truth OCR is checked against (a4norm-ocr's tests) | pypdf's extraction, one kerning split (`MRT -Voruntersuchung`) mended |
 
 The synthetic scans are made from the PDFs, so the truth boxes hold for them after the same

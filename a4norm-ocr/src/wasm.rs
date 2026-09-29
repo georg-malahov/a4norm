@@ -91,3 +91,13 @@ fn decode(bytes: &[u8]) -> Result<RgbImage, JsError> {
 fn parse(json: &str) -> Result<JsValue, JsError> {
     js_sys::JSON::parse(json).map_err(|_| JsError::new("JSON"))
 }
+
+/// Where each answer goes and its size, without drawing it (no models):
+/// `request` is `{inspections, template, answers, color?, minSize?}` as JSON
+/// (`src/fill.rs`); the result `{baseSize, placed: [{key, page, x, y, size,
+/// lines, overflow, kind, candidate?, lost?}]}`, in points.
+#[wasm_bindgen(js_name = fillLayout)]
+pub fn fill_layout(request: &str) -> Result<JsValue, JsError> {
+    let req: crate::fill::Request = serde_json::from_str(request).map_err(err)?;
+    parse(&crate::fill::layout(&req).json())
+}
