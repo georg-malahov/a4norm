@@ -35,9 +35,11 @@ impl WasmOcr {
     }
 
     /// A page of RGBA pixels (a canvas's `ImageData`) that spans
-    /// `width_pt` x `height_pt` points: `{sizePt, skewDeg, words: [{text,
-    /// bbox, score}], printedSize, langs, lines, rects, combs, boxes,
-    /// typicalFieldHeight}`, in points from the top left.
+    /// `width_pt` x `height_pt` points: `{sizePt, orientation, skewDeg,
+    /// words: [{text, bbox, score}], printedSize, langs, lines, rects, combs,
+    /// boxes, typicalFieldHeight}`, in points from the top left of the page
+    /// the right way up: `orientation` (0, 90, 180, 270) is how far it was
+    /// turned clockwise for that.
     pub fn inspect(&self, rgba: &[u8], width: u32, height: u32, width_pt: f32, height_pt: f32) -> Result<JsValue, JsError> {
         self.inspect_page(rgb(rgba, width, height)?, [width_pt, height_pt])
     }

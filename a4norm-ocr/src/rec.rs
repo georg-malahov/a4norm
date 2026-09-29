@@ -29,24 +29,49 @@ pub struct Cut {
 
 /// The line under `b` sampled from the page (bilinear), height 48, in the
 /// recognizer's normalization; the width rounded up to one of WIDTHS.
-pub fn cut(page: &RgbImage, f: &Frame, b: &TextBox) -> Cut {
-    let (bw, bh) = (b.u1 - b.u0, b.v1 - b.v0);
-    let want = ((H as f32 * bw / bh).ceil() as usize).max(8);
-    let width = *WIDTHS.iter().find(|&&w| w >= want).unwrap_or(&WIDTHS[WIDTHS.len() - 1]);
+/// `flip` samples it turned half round, as it reads on a page upside down.
+pub fn cut(page: &RgbImage, f: &Frame, b: &TextBox, flip: bool) -> Cut {
+    sample(page, b.u1 - b.u0, b.v1 - b.v0, |a, c| if flip { f.page(b.u1 - a, b.v1 - c) } else { f.page(b.u0 + a, b.v0 + c) })
+}
+
+/// The line in `b` (`[x0, y0, x1, y1]` in page pixels) as it reads on the
+/// page turned `turn` degrees clockwise: at 90 it runs up the page, its
+/// letters' tops to the left; at 270 down, their tops to the right.
+pub fn cut_turned(page: &RgbImage, b: [f32; 4], turn: u16) -> Cut {
+    let [x0, y0, x1, y1] = b;
+    let (w, h) = (x1 - x0, y1 - y0);
+    match turn {
+        90 => sample(page, h, w, |a, c| (x0 + c, y1 - a)),
+        180 => sample(page, w, h, |a, c| (x1 - a, y1 - c)),
+        270 => sample(page, h, w, |a, c| (x1 - c, y0 + a)),
+        _ => sample(page, w, h, |a, c| (x0 + a, y0 + c)),
+    }
+}
+
+/// The recognizer's width for a line `along` long and `across` high.
+pub fn width(along: f32, across: f32) -> usize {
+    let want = ((H as f32 * along / across).ceil() as usize).max(8);
+    *WIDTHS.iter().find(|&&w| w >= want).unwrap_or(&WIDTHS[WIDTHS.len() - 1])
+}
+
+/// A line `along` x `across` page pixels, `at(a, c)` the page point `a`
+/// along it and `c` across from its start and the top of its letters.
+fn sample(page: &RgbImage, along: f32, across: f32, at: impl Fn(f32, f32) -> (f32, f32)) -> Cut {
+    let want = ((H as f32 * along / across).ceil() as usize).max(8);
+    let width = width(along, across);
     let tw = want.min(width);
-    let (su, sv) = (bw / tw as f32, bh / H as f32);
+    let (su, sv) = (along / tw as f32, across / H as f32);
     let (pw, ph) = page.dimensions();
     let raw = page.as_raw();
     let mut data = vec![0f32; 3 * H * width]; // padding: 0 after normalizing
     for j in 0..H {
-        let v = b.v0 + (j as f32 + 0.5) * sv;
+        let c = (j as f32 + 0.5) * sv;
         for i in 0..tw {
-            let u = b.u0 + (i as f32 + 0.5) * su;
-            let (x, y) = f.page(u, v);
+            let (x, y) = at((i as f32 + 0.5) * su, c);
             let rgb = bilinear(raw, pw, ph, x - 0.5, y - 0.5);
-            for c in 0..3 {
+            for k in 0..3 {
                 // BGR, (x/255 - 0.5) / 0.5
-                data[c * H * width + j * width + i] = rgb[2 - c] / 127.5 - 1.0;
+                data[k * H * width + j * width + i] = rgb[2 - k] / 127.5 - 1.0;
             }
         }
     }

@@ -106,15 +106,23 @@ fn main() {
     } else {
         println!("{}", a4norm_ocr::inspection_json(&page, &g, size));
         if let Some(i) = args.iter().position(|a| a == "--mark") {
-            mark(img.clone(), &g).save(&args[i + 1]).expect("marked page");
+            // on the page the right way up, where the candidates are
+            let upright = match page.orientation {
+                90 => image::imageops::rotate90(&img),
+                180 => image::imageops::rotate180(&img),
+                270 => image::imageops::rotate270(&img),
+                _ => img.clone(),
+            };
+            mark(upright, &g).save(&args[i + 1]).expect("marked page");
         }
     }
     eprintln!(
-        "load {} ms · page {} ms first (plans included), {} ms again · {} lines, {} words, skew {:.2}°, \
+        "load {} ms · page {} ms first (plans included), {} ms again · turned {}° · {} lines, {} words, skew {:.2}°, \
          print {:.1} px, langs {:?}",
         loaded.as_millis(),
         first.as_millis(),
         again.as_millis(),
+        page.orientation,
         page.lines.len(),
         page.lines.iter().map(|l| l.words.len()).sum::<usize>(),
         page.skew.to_degrees(),

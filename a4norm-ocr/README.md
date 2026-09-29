@@ -12,7 +12,8 @@ top left:
 
 | Field | What it is |
 |---|---|
-| `sizePt` | the page's size in points, as the caller gives it |
+| `sizePt` | the page's size in points, the right way up: as the caller gives it, or its sides swapped when the page was read turned a quarter |
+| `orientation` | how far the picture was turned clockwise to read it: 0, 90, 180 or 270. All the rest is of the page so turned |
 | `skewDeg` | the tilt of the text lines, degrees; positive runs down to the right |
 | `words` | `{text, bbox, score}` in reading order; `bbox` upright around the word |
 | `printedSize` | the size of the page's print in points: the median over characters of each line's height |
@@ -88,6 +89,20 @@ on one thread and gives the same result.
 
 ## How it reads a page
 
+0. **Which way up.** A sheet across the frame, a PDF page shown on its side, or a photo
+   upside down is read the right way up, and `orientation` says how far it was turned
+   (clockwise, as the scanner's `rotate()` counts):
+   - When the detected lines run down the page (tall boxes outweigh wide ones twice
+     over), a few of them are read both ways across, and the page is turned the way they
+     read better, then detected again.
+   - Otherwise the longest few lines that read quickly (up to 480 columns) are read
+     first. If their mean confidence is under 0.85 and they read better turned half
+     round, the page is turned half round and detected again.
+   - A page the right way up costs nothing: the lines read to tell are kept. A turned page
+     costs one more detection and a few short lines (0.7 s natively on one thread).
+   - Turned 90, 180 or 270°, the demo's phone scan and KG 1 p. 2 give the very inspection
+     of the page as it is (`tests/orientation.rs`). None of the 108 pages of the demo and
+     the official forms, nor the photos of the examples after the scanner, is turned.
 1. **Detection** on the page scaled to a long side of 960 px (multiples of 32), BGR,
    ImageNet mean/std. DB post-processing with the model's settings (thresh 0.3, box_thresh
    0.6, unclip 1.5).
@@ -309,7 +324,9 @@ const r = fillScan(JSON.stringify({ inspections, template, answers, images }), p
 ```
 
 **From a scan.** Each page is its JPEG over the page's `sizePt`, with the answers over it
-as vector text.
+as vector text. A page read turned (`orientation`) keeps its JPEG as it came and is shown
+turned so (`/Rotate`), the right way up; so is a PDF's page, its `/Rotate` and the
+`orientation` added.
 
 **From a PDF.** The result is a new PDF with the source's pages, untouched, as Form
 XObjects, and the answers over them as vector text:

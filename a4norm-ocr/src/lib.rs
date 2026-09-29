@@ -23,7 +23,7 @@ pub mod pool;
 mod wasm;
 
 use det::Frame;
-use image::RgbImage;
+use image::{imageops, RgbImage};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
@@ -68,11 +68,24 @@ pub struct Page {
     /// the size of the print, median over characters, in page pixels
     pub printed: f32,
     pub langs: Vec<&'static str>,
+    /// how far the picture was turned clockwise to read it the right way
+    /// up: 0, 90, 180 or 270. Everything else is on the page so turned;
+    /// `width` and `height` are its.
+    pub orientation: u16,
 }
 
 /// A line's box across the text is the body of its letters plus the room
 /// the detector leaves around them, in points per point of type size.
 const BOX_PER_PT: f32 = 1.39;
+
+/// The lines read to tell which way up the page is: the longest few that
+/// are short enough to read quickly (up to 480 of the recognizer's
+/// columns, some 25 characters).
+const SAMPLE: usize = 6;
+const SAMPLE_WIDTH: usize = 480;
+/// A sample read this confidently is the right way up; below it, it is
+/// read upside down too, and the better reading wins.
+const UPRIGHT: f32 = 0.85;
 
 pub struct Ocr {
     det: InferenceModel,
@@ -133,11 +146,56 @@ impl Ocr {
     }
 
     /// Every text line of the page and its words, the skew, the print size
-    /// and the languages.
+    /// and the languages, read the right way up (`Page::orientation`).
     pub fn page(&self, page: &RgbImage) -> TractResult<Page> {
+        Ok(self.upright(page)?.0)
+    }
+
+    /// The page read the right way up, and the picture turned so when it
+    /// had to be. When its lines run down the page (a sheet across the
+    /// frame), a few are read both ways across and the page is turned the
+    /// way they read better; a page whose lines run across but read better
+    /// upside down is turned half round. Either costs a few short lines
+    /// read and one more detection; a page the right way up costs nothing,
+    /// the lines read to tell being kept.
+    fn upright(&self, page: &RgbImage) -> TractResult<(Page, Option<RgbImage>)> {
+        let (boxes, skew) = self.detect(page)?;
+        if sideways(&boxes) {
+            let f = Frame::new(skew);
+            let tall: Vec<[f32; 4]> = boxes.iter().filter(|b| b.v1 - b.v0 > 3.0 * (b.u1 - b.u0)).map(|b| f.bbox(b.u0, b.v0, b.u1, b.v1)).collect();
+            let sample = sample_of(&tall.iter().map(|b| (b[3] - b[1], b[2] - b[0])).collect::<Vec<_>>());
+            let read = |turn: u16| -> TractResult<f32> {
+                let got = map(&sample, |&i| {
+                    let c = rec::cut_turned(page, tall[i], turn);
+                    rec::read(&self.rec_plan(c.width)?, &c, &self.chars)
+                });
+                Ok(confidence(&got.into_iter().collect::<TractResult<Vec<_>>>()?))
+            };
+            let turn = if read(270)? > read(90)? { 270 } else { 90 };
+            let t = if turn == 90 { imageops::rotate90(page) } else { imageops::rotate270(page) };
+            let (b, s) = self.detect(&t)?;
+            let p = self.read(&t, b, s, false)?.expect("read without the check");
+            return Ok((Page { orientation: turn, ..p }, Some(t)));
+        }
+        if let Some(p) = self.read(page, boxes, skew, true)? {
+            return Ok((p, None));
+        }
+        let t = imageops::rotate180(page);
+        let (b, s) = self.detect(&t)?;
+        let p = self.read(&t, b, s, false)?.expect("read without the check");
+        Ok((Page { orientation: 180, ..p }, Some(t)))
+    }
+
+    fn detect(&self, page: &RgbImage) -> TractResult<(Vec<det::TextBox>, f32)> {
         let (pw, ph) = page.dimensions();
         let shape = det::shape(pw, ph, self.det_long);
-        let (mut boxes, skew) = det::detect(&self.det_plan(shape)?, page, shape)?;
+        det::detect(&self.det_plan(shape)?, page, shape)
+    }
+
+    /// The lines in `boxes` read. With `check`, the longest are read first,
+    /// and None if they read better upside down.
+    fn read(&self, page: &RgbImage, mut boxes: Vec<det::TextBox>, skew: f32, check: bool) -> TractResult<Option<Page>> {
+        let (pw, ph) = page.dimensions();
         let f = Frame::new(skew);
         boxes.retain(|b| b.u1 - b.u0 >= 4.0 && b.v1 - b.v0 >= 4.0);
         // reading order: by the line's middle across, in bands of a third of
@@ -148,21 +206,44 @@ impl Ocr {
             ka.cmp(&kb).then(a.u0.total_cmp(&b.u0))
         });
 
-        let cuts: Vec<rec::Cut> = map(&boxes, |b| rec::cut(page, &f, b));
+        let cuts: Vec<rec::Cut> = map(&boxes, |b| rec::cut(page, &f, b, false));
         let mut widths: Vec<usize> = cuts.iter().map(|c| c.width).collect();
         widths.sort_unstable();
         widths.dedup();
         let plans: Vec<(usize, Plan)> =
             map(&widths, |&w| self.rec_plan(w).map(|p| (w, p))).into_iter().collect::<TractResult<_>>()?;
-        let read = map(&cuts, |c| {
-            let plan = &plans.iter().find(|(w, _)| *w == c.width).unwrap().1;
-            rec::read(plan, c, &self.chars)
-        });
+        let plan = |w: usize| &plans.iter().find(|(pw, _)| *pw == w).unwrap().1;
+        let mut read: Vec<Option<Vec<rec::Span>>> = (0..cuts.len()).map(|_| None).collect();
+        if check {
+            let longest = sample_of(&boxes.iter().map(|b| (b.u1 - b.u0, b.v1 - b.v0)).collect::<Vec<_>>());
+            let sample = map(&longest, |&i| rec::read(plan(cuts[i].width), &cuts[i], &self.chars)).into_iter().collect::<TractResult<Vec<_>>>()?;
+            let right = confidence(&sample);
+            if right < UPRIGHT {
+                let flipped = map(&longest, |&i| {
+                    let c = rec::cut(page, &f, &boxes[i], true);
+                    rec::read(plan(c.width), &c, &self.chars)
+                })
+                .into_iter()
+                .collect::<TractResult<Vec<_>>>()?;
+                if confidence(&flipped) > right {
+                    return Ok(None);
+                }
+            }
+            for (i, spans) in longest.into_iter().zip(sample) {
+                read[i] = Some(spans);
+            }
+        }
+        let rest: Vec<usize> = (0..cuts.len()).filter(|&i| read[i].is_none()).collect();
+        let got = map(&rest, |&i| rec::read(plan(cuts[i].width), &cuts[i], &self.chars));
+        for (i, spans) in rest.into_iter().zip(got) {
+            read[i] = Some(spans?);
+        }
 
         let mut lines = vec![];
         for ((b, spans), c) in boxes.iter().zip(read).zip(&cuts) {
             let end = c.tw as f32 * c.scale; // a word ends at most where the line does
-            let words: Vec<Word> = spans?
+            let words: Vec<Word> = spans
+                .unwrap_or_default()
                 .into_iter()
                 .map(|s| Word {
                     bbox: f.bbox(b.u0 + s.u0, b.v0, b.u0 + s.u1.min(end), b.v1),
@@ -178,7 +259,49 @@ impl Ocr {
         let printed = printed_size(&lines);
         let words = lines.iter().flat_map(|l| &l.words).filter(|w| w.score >= 0.7);
         let langs = lang::langs(words.map(|w| w.text.as_str()));
-        Ok(Page { width: pw, height: ph, skew, lines, printed, langs })
+        Ok(Some(Page { width: pw, height: ph, skew, lines, printed, langs, orientation: 0 }))
+    }
+}
+
+/// Whether the lines run down the page: tall boxes outweigh wide ones, by
+/// their length, twice over.
+fn sideways(boxes: &[det::TextBox]) -> bool {
+    let (mut tall, mut wide) = (0.0, 0.0);
+    for b in boxes {
+        let (w, h) = (b.u1 - b.u0, b.v1 - b.v0);
+        if h > 3.0 * w {
+            tall += h;
+        } else if w > 3.0 * h {
+            wide += w;
+        }
+    }
+    tall > 2.0 * wide
+}
+
+/// Which of the lines (`along` x `across` each) to read to tell which way
+/// up the page is: the longest that read quickly, or the shortest few.
+fn sample_of(lines: &[(f32, f32)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by(|&a, &b| lines[b].0.total_cmp(&lines[a].0));
+    let quick: Vec<usize> = order.iter().copied().filter(|&i| rec::width(lines[i].0, lines[i].1) <= SAMPLE_WIDTH).take(SAMPLE).collect();
+    if quick.len() >= 3 {
+        return quick;
+    }
+    order.into_iter().rev().take(3).collect()
+}
+
+/// The mean confidence of lines read, over their characters.
+fn confidence(lines: &[Vec<rec::Span>]) -> f32 {
+    let (mut sum, mut n) = (0.0, 0usize);
+    for s in lines.iter().flatten() {
+        let k = s.text.chars().count();
+        sum += s.score * k as f32;
+        n += k;
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum / n as f32
     }
 }
 
@@ -242,11 +365,12 @@ fn printed_size(lines: &[Line]) -> f32 {
 
 impl Ocr {
     /// The page read and its geometry found, for a page whose pixels span
-    /// `size_pt`: A4Norm Forms' whole `PageInspection`. The words tell the
-    /// geometry where letters are.
+    /// `size_pt`: A4Norm Forms' whole `PageInspection`, the right way up
+    /// (`Page::orientation`). The words tell the geometry where letters are.
     pub fn inspect(&self, page: &RgbImage, size_pt: [f32; 2]) -> TractResult<(Page, geometry::Geometry)> {
-        let mut p = self.page(page)?;
-        let g = geometry::find(page, px_pt(page.width(), size_pt), &p.texts());
+        let (mut p, turned) = self.upright(page)?;
+        let page = turned.as_ref().unwrap_or(page);
+        let g = geometry::find(page, px_pt(page.width(), p.size_pt(size_pt)), &p.texts());
         p.split_at_boxes(&g);
         Ok((p, g))
     }
@@ -258,13 +382,23 @@ pub fn px_pt(width: u32, size_pt: [f32; 2]) -> f32 {
 }
 
 /// `PageInspection` JSON: the words and the geometry of a page whose pixels
-/// span `size_pt`.
+/// span `size_pt` (as given, before it was turned the right way up).
 pub fn inspection_json(p: &Page, g: &geometry::Geometry, size_pt: [f32; 2]) -> String {
     let text = p.to_json(size_pt);
-    format!("{},{}}}", &text[..text.len() - 1], g.json_fields(px_pt(p.width, size_pt)))
+    format!("{},{}}}", &text[..text.len() - 1], g.json_fields(px_pt(p.width, p.size_pt(size_pt))))
 }
 
 impl Page {
+    /// The size of the page the right way up, of a picture given as
+    /// `size_pt`.
+    pub fn size_pt(&self, size_pt: [f32; 2]) -> [f32; 2] {
+        if self.orientation % 180 == 90 {
+            [size_pt[1], size_pt[0]]
+        } else {
+            size_pt
+        }
+    }
+
     /// The words that are words, for the geometry: a letter or digit at
     /// least, read with some confidence ("□" read as a character is a box).
     pub fn texts(&self) -> Vec<geometry::Text> {
@@ -353,9 +487,11 @@ impl Page {
     }
 
     /// A4Norm Forms' `PageInspection` for this page, without the geometry:
-    /// `sizePt`, `skewDeg`, `words` (boxes in points from the top left),
-    /// `printedSize` in points, `langs`. The page's pixels span `size_pt`.
+    /// `sizePt`, `orientation`, `skewDeg`, `words` (boxes in points from the
+    /// top left), `printedSize` in points, `langs`, all of the page the
+    /// right way up. The picture as given spans `size_pt`.
     pub fn to_json(&self, size_pt: [f32; 2]) -> String {
+        let size_pt = self.size_pt(size_pt);
         let (sx, sy) = (size_pt[0] / self.width as f32, size_pt[1] / self.height as f32);
         let pt = |b: &[f32; 4]| format!("[{:.2},{:.2},{:.2},{:.2}]", b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy);
         let words: Vec<String> = self
@@ -366,9 +502,10 @@ impl Page {
             .collect();
         let langs: Vec<String> = self.langs.iter().map(|l| format!("\"{l}\"")).collect();
         format!(
-            "{{\"sizePt\":[{:.2},{:.2}],\"skewDeg\":{:.3},\"words\":[{}],\"printedSize\":{:.1},\"langs\":[{}]}}",
+            "{{\"sizePt\":[{:.2},{:.2}],\"orientation\":{},\"skewDeg\":{:.3},\"words\":[{}],\"printedSize\":{:.1},\"langs\":[{}]}}",
             size_pt[0],
             size_pt[1],
+            self.orientation,
             self.skew.to_degrees(),
             words.join(","),
             self.printed * sy,

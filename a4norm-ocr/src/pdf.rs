@@ -189,7 +189,8 @@ fn embed_font(doc: &mut Document, layout: &Layout) -> Result<(ObjectId, GlyphRem
 }
 
 /// A PDF of scanned pages: each a JPEG over its `PageInspection.sizePt`
-/// (A4 when the page was not inspected), with its answers over it.
+/// (A4 when the page was not inspected), with its answers over it. A page
+/// read turned (`orientation`) is shown turned so, the right way up.
 pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) -> Result<Vec<u8>, String> {
     let mut doc = Document::with_version("1.4");
     let pages_id = doc.new_object_id();
@@ -198,7 +199,7 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) ->
     let mut kids = vec![];
     for (i, jpeg) in pages.iter().enumerate() {
         let (w, h, comps) = jpeg_info(jpeg).ok_or(format!("page {}: not a JPEG", i + 1))?;
-        let size = sizes(i as u32 + 1).unwrap_or([595.28, 841.89]);
+        let (size, turn) = sizes(i as u32 + 1).unwrap_or(([595.28, 841.89], 0));
         let image = doc.add_object(Stream::new(
             dictionary! {
                 "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
@@ -207,9 +208,10 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) ->
             },
             jpeg.to_vec(),
         ));
-        let [pw, ph] = size;
+        // the picture as it came, the page the right way up turned from it
+        let [pw, ph] = if turn % 180 == 90 { [size[1], size[0]] } else { size };
         let mut content = format!("q {pw:.2} 0 0 {ph:.2} 0 0 cm /A4nScan Do Q\n").into_bytes();
-        content.extend(overlay(layout, i as u32 + 1, [1.0, 0.0, 0.0, -1.0, 0.0, ph], &glyphs, &pics));
+        content.extend(overlay(layout, i as u32 + 1, shown([0.0, 0.0, pw, ph], turn as i64, 1.0), &glyphs, &pics));
         let mut xobjects = dictionary! { "A4nScan" => image };
         for p in pics.iter().filter(|p| p.page == i as u32 + 1) {
             xobjects.set(p.name.clone(), p.id);
@@ -219,6 +221,7 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) ->
         let contents = doc.add_object(stream);
         kids.push(Object::Reference(doc.add_object(dictionary! {
             "Type" => "Page", "Parent" => pages_id, "MediaBox" => vec![0.into(), 0.into(), pw.into(), ph.into()],
+            "Rotate" => turn as i64,
             "Contents" => contents,
             "Resources" => dictionary! {
                 "XObject" => xobjects,
@@ -345,12 +348,29 @@ fn appearances(doc: &Document, page: ObjectId) -> Vec<(ObjectId, [f32; 6])> {
 /// The request's picture places and the pictures' bytes, in that order.
 pub type Images<'a> = (&'a [crate::fill::ImagePlace], &'a [&'a [u8]]);
 
-/// A page's `sizePt` as it was inspected, by its number from 1.
-pub type Sizes<'a> = dyn Fn(u32) -> Option<[f32; 2]> + 'a;
+/// A page's `sizePt` and `orientation` as it was inspected, by its number
+/// from 1: the page the right way up, and how far the picture was turned
+/// clockwise for that.
+pub type Sizes<'a> = dyn Fn(u32) -> Option<([f32; 2], u16)> + 'a;
+
+/// The matrix from points of the page as shown, from its top left, into
+/// the space of a page whose `crop` box is shown turned by `rotate`, `k`
+/// of its units to a point.
+fn shown(crop: [f32; 4], rotate: i64, k: f32) -> [f32; 6] {
+    let [cx0, cy0, cx1, cy1] = crop;
+    match rotate {
+        90 => [0.0, k, k, 0.0, cx0, cy0],
+        180 => [-k, 0.0, 0.0, k, cx1, cy0],
+        270 => [0.0, -k, -k, 0.0, cx1, cy1],
+        _ => [k, 0.0, 0.0, -k, cx0, cy1],
+    }
+}
 
 /// A new PDF: the source's pages as Form XObjects and the answers over
 /// them. `sizes` are the pages' `sizePt` as they were inspected (the page as
-/// shown: its crop box, turned by its /Rotate), to scale the answers from.
+/// shown: its crop box, turned by its /Rotate), to scale the answers from,
+/// and their `orientation`: a page read turned is shown turned so, the
+/// right way up.
 pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> Result<Vec<u8>, String> {
     let mut doc = Document::load_mem(source).map_err(|e| e.to_string())?;
     if doc.is_encrypted() {
@@ -362,7 +382,9 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> R
     for (i, &page) in pages.iter().enumerate() {
         let media = inherited(&doc, page, b"MediaBox").and_then(|o| rect(&doc, o)).unwrap_or([0.0, 0.0, 595.28, 841.89]);
         let crop = inherited(&doc, page, b"CropBox").and_then(|o| rect(&doc, o)).unwrap_or(media);
-        let rotate = inherited(&doc, page, b"Rotate").and_then(|o| o.as_i64().ok()).unwrap_or(0).rem_euclid(360);
+        let inspected = sizes(i as u32 + 1);
+        let turn = inspected.map_or(0, |s| s.1 as i64);
+        let rotate = (inherited(&doc, page, b"Rotate").and_then(|o| o.as_i64().ok()).unwrap_or(0) + turn).rem_euclid(360);
         let resources = match inherited(&doc, page, b"Resources") {
             Some(Object::Reference(id)) => Object::Reference(*id),
             Some(o) => o.clone(),
@@ -382,14 +404,8 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> R
         // the page as shown, in points from its top left, into its space
         let [cx0, cy0, cx1, cy1] = crop;
         let (w, h) = if rotate % 180 == 0 { (cx1 - cx0, cy1 - cy0) } else { (cy1 - cy0, cx1 - cx0) };
-        let size = sizes(i as u32 + 1).unwrap_or([w, h]);
-        let k = w / size[0].max(1.0);
-        let m = match rotate {
-            90 => [0.0, k, k, 0.0, cx0, cy0],
-            180 => [-k, 0.0, 0.0, k, cx1, cy0],
-            270 => [0.0, -k, -k, 0.0, cx1, cy1],
-            _ => [k, 0.0, 0.0, -k, cx0, cy1],
-        };
+        let size = inspected.map_or([w, h], |s| s.0);
+        let m = shown(crop, rotate, w / size[0].max(1.0));
         let mut body = b"q /A4nPage Do Q\n".to_vec();
         // what the form's own fields show (a comb's cells, a box's border)
         // is kept as drawn, the fields themselves are not
