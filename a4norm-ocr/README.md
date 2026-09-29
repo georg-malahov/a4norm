@@ -149,8 +149,9 @@ the rules were set at 200 dpi.
 5. **Check boxes** are small enclosed white areas (2.8–26 pt, square or round), empty in
    the middle.
    - Looking out four ways from the middle, the border must be thin, with paper right
-     beyond it on three sides. Thin means at most a quarter of the side, 0.6–2.4 pt: the
-     scanner's cleaning leaves rules bolder. A letter's counter, as in a bold "o" or an
+     beyond it on three sides. Thin means at most a quarter of the side, 0.6–3.2 pt: the
+     scanner's cleaning leaves rules bolder, and a bold "❑" of a letter printed on A5
+     has 3 pt of border round 16 pt once the scanner has made an A4 page of it. A letter's counter, as in a bold "o" or an
      "O" in a heading, fails this.
    - A round one under 7.5 pt is a loop, as of a "6" or an "o"; a box that small is
      square ("□").

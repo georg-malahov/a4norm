@@ -574,13 +574,14 @@ fn blank_middle(ink: &[bool], w: usize, b: &[f32; 4]) -> bool {
 
 /// Whether the area around `(cx, cy)`, `side` across, is closed by a thin
 /// border with paper beyond it, looking out four ways: a box's border is at
-/// most a quarter of its side (0.6 to 2.4 pt: a cleaned scan's rules come
-/// out bolder), and at most one side has
+/// most a quarter of its side (0.6 to 3.2 pt: a cleaned scan's rules come
+/// out bolder, and a bold "❑" of a school's letter, enlarged from A5 onto
+/// A4, has 3 pt round 16), and at most one side has
 /// something within 0.8 pt beyond it. A letter's counter (a bold "o", an
 /// "o" in a heading) has a thicker stroke, or its neighbours close on both
 /// sides.
 fn thin_border(ink: &[bool], w: usize, h: usize, cx: usize, cy: usize, side: f32, px_pt: f32) -> bool {
-    let t = (0.25 * side).clamp(0.6 * px_pt, 2.4 * px_pt);
+    let t = (0.25 * side).clamp(0.6 * px_pt, 3.2 * px_pt);
     let (max_t, gap) = (t.ceil() as i64, (0.8 * px_pt).ceil() as i64);
     let mut clear = 0;
     for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {

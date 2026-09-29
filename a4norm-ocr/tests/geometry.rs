@@ -232,3 +232,31 @@ fn a_blank_form_looks_like_one() {
         assert_eq!(offer(f), form, "{pdf} p. {page}: {f:?}");
     }
 }
+
+#[test]
+fn bold_boxes_are_boxes() {
+    // Three bold boxes before their lines, as a letter printed on A5 has
+    // them once the scanner has made an A4 page of it: 16 pt inside, 2.9 pt
+    // of border. A small square with as bold a border (a letter's counter)
+    // is none.
+    let px = 200.0 / 72.0;
+    let mut img = RgbImage::from_pixel((595.28 * px) as u32, (841.89 * px) as u32, image::Rgb([255, 255, 255]));
+    let mut square = |x: f32, y: f32, inside: f32, border: f32| {
+        let (x0, y0, x1, y1) = ((x * px) as u32, (y * px) as u32, ((x + inside + 2.0 * border) * px) as u32, ((y + inside + 2.0 * border) * px) as u32);
+        let b = (border * px).round() as u32;
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                if xx < x0 + b || xx >= x1 - b || yy < y0 + b || yy >= y1 - b {
+                    img.put_pixel(xx, yy, image::Rgb([20, 20, 20]));
+                }
+            }
+        }
+    };
+    for i in 0..3 {
+        square(60.0, 200.0 + 50.0 * i as f32, 16.0, 2.9);
+    }
+    square(300.0, 200.0, 7.0, 2.9);
+    let boxes: Vec<[f32; 4]> = find(&img).iter().filter_map(|c| if let Kind::Box(b) = c.kind { Some(b.map(|v| v / px)) } else { None }).collect();
+    assert_eq!(boxes.len(), 3, "{boxes:?}");
+    assert!(boxes.iter().all(|b| b[0] < 70.0 && (b[2] - b[0] - 16.0).abs() < 1.5), "{boxes:?}");
+}
