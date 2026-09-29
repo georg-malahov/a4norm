@@ -202,3 +202,29 @@ fn a_box_takes_a_cross_and_a_drawn_box_snaps() {
     assert_eq!(l.placed[1].candidate, Some(1));
     assert_eq!(l.color, [0x1a as f32 / 255.0; 3]);
 }
+
+#[test]
+fn a_value_runs_on_over_its_candidates() {
+    // two lines of 100 pt: the words that fit the first at the base size,
+    // the rest on the second, in the order of their numbers
+    let mut ins = page();
+    ins.lines = serde_json::from_value(json!([
+        {"id": 1, "x0": 50.0, "y0": 60.0, "x1": 150.0, "y1": 60.0},
+        {"id": 6, "x0": 50.0, "y0": 80.0, "x1": 150.0, "y1": 80.0}
+    ]))
+    .unwrap();
+    let r = Request {
+        inspections: vec![ins],
+        template: serde_json::from_value(json!({"fields": [{"key": "address", "place": {"page": 1, "candidates": [6, 1]}}]})).unwrap(),
+        answers: [("address".to_string(), json!("Musterweg 12, Hinterhaus, 12345 Musterstadt"))].into(),
+        color: None,
+        min_size: None,
+    };
+    let l = fill::layout(&r);
+    let rows: Vec<(f32, String)> = l.marks.iter().map(|m| if let Mark::Text { y, text, .. } = m { (*y, text.clone()) } else { panic!() }).collect();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].0 < 60.0 && rows[1].0 < 80.0 && rows[1].0 > 60.0, "{rows:?}");
+    assert_eq!(format!("{} {}", rows[0].1, rows[1].1), "Musterweg 12, Hinterhaus, 12345 Musterstadt");
+    assert!(helvetica::width(&rows[0].1, l.base) <= 100.0 - 3.0);
+    assert_eq!((l.placed[0].candidate, l.placed[0].lines), (Some(1), 2));
+}

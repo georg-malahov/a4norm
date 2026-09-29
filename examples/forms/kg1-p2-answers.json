@@ -1,0 +1,16 @@
+{
+ "tax_id": "12 345 678 901",
+ "family_name": "Musterfrau",
+ "first_name": "Erika",
+ "birth_date": "12.08.1983",
+ "birth_place": "Musterstadt",
+ "sex": "weiblich",
+ "nationality": "deutsch",
+ "address": "Musterweg 12, Hinterhaus, 12345 Musterstadt, Deutschland",
+ "marital_status": "verheiratet",
+ "married_since": "01.06.2012",
+ "iban": "DE02 1203 0000 0000 2020 51",
+ "bic": "BYLADEM1001",
+ "bank": "Musterbank Berlin",
+ "account_holder_applicant": true
+}

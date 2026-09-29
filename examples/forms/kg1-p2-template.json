@@ -1,0 +1,190 @@
+{
+ "title": "KG 1 – Antrag auf Kindergeld, Seite 2",
+ "lang": "de",
+ "fields": [
+  {
+   "key": "tax_id",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidates": [
+     4,
+     5,
+     6,
+     7
+    ]
+   }
+  },
+  {
+   "key": "family_name",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 8
+   }
+  },
+  {
+   "key": "title",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 9
+   }
+  },
+  {
+   "key": "first_name",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 10
+   }
+  },
+  {
+   "key": "birth_name",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 11
+   }
+  },
+  {
+   "key": "birth_date",
+   "type": "date",
+   "place": {
+    "page": 2,
+    "candidate": 12
+   }
+  },
+  {
+   "key": "birth_place",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 13
+   }
+  },
+  {
+   "key": "sex",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 14
+   }
+  },
+  {
+   "key": "nationality",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 15
+   }
+  },
+  {
+   "key": "address",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 16
+   }
+  },
+  {
+   "key": "marital_status",
+   "type": "choice",
+   "place": {
+    "page": 2,
+    "candidate": 17
+   },
+   "options": [
+    {
+     "value": "verheiratet",
+     "place": {
+      "page": 2,
+      "candidate": 17
+     }
+    },
+    {
+     "value": "eingetragene_lp",
+     "place": {
+      "page": 2,
+      "candidate": 18
+     }
+    },
+    {
+     "value": "ledig",
+     "place": {
+      "page": 2,
+      "candidate": 19
+     }
+    },
+    {
+     "value": "geschieden",
+     "place": {
+      "page": 2,
+      "candidate": 21
+     }
+    },
+    {
+     "value": "aufgehobene_lp",
+     "place": {
+      "page": 2,
+      "candidate": 22
+     }
+    },
+    {
+     "value": "verwitwet",
+     "place": {
+      "page": 2,
+      "candidate": 23
+     }
+    },
+    {
+     "value": "getrennt",
+     "place": {
+      "page": 2,
+      "candidate": 24
+     }
+    }
+   ]
+  },
+  {
+   "key": "married_since",
+   "type": "date",
+   "place": {
+    "page": 2,
+    "candidate": 20
+   }
+  },
+  {
+   "key": "iban",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 37
+   }
+  },
+  {
+   "key": "bic",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 39
+   }
+  },
+  {
+   "key": "bank",
+   "type": "text",
+   "place": {
+    "page": 2,
+    "candidate": 40
+   }
+  },
+  {
+   "key": "account_holder_applicant",
+   "type": "choice",
+   "place": {
+    "page": 2,
+    "candidate": 41
+   }
+  }
+ ]
+}

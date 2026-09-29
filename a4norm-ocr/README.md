@@ -64,6 +64,8 @@ const page = ocr.inspect(imageData.data, width, height, 595.28, 841.89);  // a c
 const scan = ocr.inspectImage(jpegOrPngOrScanPdfBytes, 595.28, 841.89);
 await releaseThreadPool();                             // soon after the work, see a4norm-rs/docs/threads.md
 const geometry = formGeometry(imageData.data, width, height, 595.28, 841.89);  // no models
+const layout = fillLayout(JSON.stringify({ inspections, template, answers }));  // where the answers go
+const filled = fillPdf(JSON.stringify({ inspections, template, answers }), pdfBytes, []);
 ```
 
 `inspect` gives the geometry the words it read: a cell or box inside a word is a letter,
@@ -231,10 +233,65 @@ left to right.
 - A check box gets a cross, 18 % in from its sides.
 - The colour is `#1a1a1a` unless `color` says otherwise.
 
+A field can take several candidates in order (`{page, candidates: [4, 5, 6, 7]}`):
+- a value runs through the cells of several combs one after another (a tax ID printed in
+  groups, 2 + 3 + 3 + 3);
+- or it runs over lines and fields: as many words into each as fit at the base size, the
+  rest into the next.
+
+In a field, the text goes below every printed word inside its frame, such as the label
+"Familienname" at the top of KG 1's fields. One line needs only its glyphs' height (cap to
+descender, 0.925 em, and a little air); two lines need 2 × 1.15 × the size.
+
 On the demo form (`examples/forms/demo-template.json`, `demo-answers.json`) every value of
 `demo-truth.json` is set at 13 pt, within 2.9 pt of where the form's own app printed it on
 the PDF, within 3.3 pt on the synthetic scan and within 4.4 pt on the phone scan. The two
 scans are compared once laid on the PDF.
+
+## The filled form as a PDF (`src/pdf.rs`)
+
+```js
+const r = fillPdf(JSON.stringify({ inspections, template, answers }), pdfBytes, pagePictures);
+const r = fillScan(JSON.stringify({ inspections, template, answers }), pageJpegs);
+// r: {pdf: Uint8Array, fallback, baseSize, placed}
+```
+
+**From a scan.** Each page is its JPEG over the page's `sizePt`, with the answers over it
+as vector text.
+
+**From a PDF.** The result is a new PDF with the source's pages, untouched, as Form
+XObjects, and the answers over them as vector text:
+- The coordinates are those of the page as inspected: its crop box, turned by its
+  `/Rotate`.
+- An encrypted source that opens without a password (AES, an empty user password and
+  owner bans, as with the Familienkasse's forms and Bavaria's Wohngeld) is decrypted, and
+  the copy is written without encryption. The original file is not changed.
+- The form's own fields are not kept: no AcroForm, XFA or widgets, so nothing of theirs
+  (a blue font, a value) shows over the answers. What they draw on the page is kept as
+  drawn: KG 1's comb cells and box borders are its fields' appearances, stamped into the
+  page.
+- When the source cannot be read at all, `pagePictures` (JPEG, the pages as inspected)
+  stand in, as for a scan, with `fallback: true`. Without them it is an error.
+
+**Text.** Helvetica with WinAnsi (umlauts, ß, €, typographic quotes and dashes), not
+embedded, since every viewer has it. The colour is `#1a1a1a`; a check box gets a cross.
+
+On the demo form, filled with its 12 values and two choices:
+
+| Source | Bytes in → out |
+|---|---|
+| `demo-blank.pdf` | 4 800 → 5 472 |
+| `demo-blank-encrypted.pdf` | 5 220 → 5 369 |
+| `demo-blank-acroform.pdf` | 11 793 → 6 165 |
+| `demo-blank-a4norm-scan.pdf` (the JPEG) | 530 985 → 532 255 |
+| KG 1, 5 pages, AES, static XFA | 1 508 259 → 924 068 (XFA and fields dropped) |
+
+- The form's text stays selectable.
+- The three demo PDFs give the same page, pixel for pixel in poppler and in pdf.js.
+- Nothing blue.
+- pdf.js in Chromium and WebKit and PDFKit (Preview and Safari's engine) show the same
+  page (`docs/fill-*.jpg`, the three side by side).
+- On KG 1, p. 2, every dark pixel of the form as shown is still dark once filled.
 
 ## Results of the reading
 
@@ -282,12 +339,14 @@ matrix kernels (`tract-linalg`) at 3, then `wasm-opt -Oz`:
 
 | | wasm | gzip -9 |
 |---|---|---|
-| `st/a4norm_ocr_bg.wasm` | 8.2 MB | 2.4 MB |
-| `mt/a4norm_ocr_bg.wasm` | 8.2 MB | 2.4 MB |
+| `st/a4norm_ocr_bg.wasm` | 9.0 MB | 2.8 MB |
+| `mt/a4norm_ocr_bg.wasm` | 9.0 MB | 2.8 MB |
 | models (fetched apart) | 12.9 MB | |
 
-At opt-level 3 throughout the module is 13.3 MB and slower in the browser (8.1 s against
-7.4 s). At "s" throughout it is 7.9 MB but takes 12–13 s.
+The OCR alone came to 8.2 MB (2.4 MB gzip). The geometry adds ~60 KB, and filling and
+writing the PDF (serde, lopdf) ~720 KB. At opt-level 3 throughout, the OCR module was
+13.3 MB and slower in the browser (8.1 s against 7.4 s); at "s" throughout it was 7.9 MB
+but took 12–13 s.
 
 ```sh
 node a4norm-ocr/web/node-check.mjs [DIST/st]                    # Node, one thread

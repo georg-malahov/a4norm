@@ -21,6 +21,7 @@ way, as a picture of the page, so all of them must give the same fields.
 | `demo-blank-encrypted.pdf` | `demo-blank.pdf`, AES-128: an empty user password, and an owner password that forbids changes and copying (like the Familienkasse's forms and Bavaria's Wohngeld) | `make.py` |
 | `demo-truth.json` | The 12 values and their boxes in points (A4 = 595.28 × 841.89) | `demo-filled.pdf`'s text |
 | `demo-template.json`, `demo-answers.json` | A template of the form as the model's structure gives it (fields on the candidates' numbers; one drawn as a box), and the 12 values plus two choices | written by hand from the geometry's numbers |
+| `kg1-p2-template.json`, `kg1-p2-answers.json` | KG 1's page 2 (`official/`) as a template on its candidates, and made-up answers: the tax ID over its four combs, a test IBAN (DE02120300000000202051), boxes | written by hand |
 | `demo-filled.txt`, `demo-blank.txt` | The text of the two PDFs, a line of the page per line: the truth OCR is checked against (a4norm-ocr's tests) | pypdf's extraction, one kerning split (`MRT -Voruntersuchung`) mended |
 
 The synthetic scans are made from the PDFs, so the truth boxes hold for them after the same

@@ -13,6 +13,7 @@ pub mod fill;
 pub mod geometry;
 pub mod helvetica;
 pub mod lang;
+pub mod pdf;
 pub mod rec;
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
