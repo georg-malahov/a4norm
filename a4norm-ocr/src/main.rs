@@ -1,6 +1,6 @@
 //! a4norm-ocr MODELS_DIR PAGE [--det-long N] [--lines] [--mark MARKED.png]
 //! a4norm-ocr --geometry PAGE [MARKED.png]
-//! a4norm-ocr --fill REQUEST.json OUT.pdf SOURCE.pdf|PAGE.jpg...
+//! a4norm-ocr --fill REQUEST.json OUT.pdf [IMAGE.png...] SOURCE.pdf|PAGE.jpg...
 //!
 //! MODELS_DIR holds det.onnx, rec.onnx and rec.yml (models.sh fetches them).
 //! PAGE is an image, or a PDF whose page is one JPEG (a scan), of an A4
@@ -31,10 +31,13 @@ fn main() {
         let req: a4norm_ocr::fill::Request = serde_json::from_slice(&std::fs::read(&args[2]).expect("request")).expect("request JSON");
         let sources: Vec<Vec<u8>> = args[4..].iter().map(|f| std::fs::read(f).expect("source")).collect();
         let refs: Vec<&[u8]> = sources.iter().map(Vec::as_slice).collect();
-        let (layout, out) = if args[4].ends_with(".pdf") {
-            a4norm_ocr::pdf::fill_pdf(&req, refs[0], &refs[1..])
+        // the request's pictures (a signature), then the source
+        let n = req.images.len();
+        let (imgs, refs) = refs.split_at(n);
+        let (layout, out) = if refs[0].starts_with(b"%PDF") {
+            a4norm_ocr::pdf::fill_pdf(&req, refs[0], &refs[1..], imgs)
         } else {
-            a4norm_ocr::pdf::fill_scan(&req, &refs)
+            a4norm_ocr::pdf::fill_scan(&req, refs, imgs)
         }
         .expect("fill");
         std::fs::write(&args[3], &out.pdf).expect("out");

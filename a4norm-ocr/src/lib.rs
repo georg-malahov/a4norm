@@ -11,7 +11,7 @@
 pub mod det;
 pub mod fill;
 pub mod geometry;
-pub mod helvetica;
+pub mod font;
 pub mod lang;
 pub mod pdf;
 pub mod rec;

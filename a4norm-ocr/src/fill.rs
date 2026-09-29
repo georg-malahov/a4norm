@@ -15,9 +15,9 @@
 //! as it has to and not below 7 pt; then it is broken over two lines if the
 //! field is high enough; else it is set at 7 pt and marked as overflowing.
 //! A comb takes a character per cell; a check box takes a cross. All in
-//! points from the page's top left, in Helvetica.
+//! points from the page's top left, in Arimo (font.rs).
 
-use crate::helvetica::{self, CAP, DESCENT};
+use crate::font::{self, CAP, DESCENT};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -129,6 +129,21 @@ pub struct Request {
     pub color: Option<String>,
     #[serde(rename = "minSize")]
     pub min_size: Option<f32>,
+    /// pictures to set over the pages (a signature, a stamp): their bytes
+    /// come apart, in this order
+    #[serde(default)]
+    pub images: Vec<ImagePlace>,
+}
+
+/// A picture's place: fitted into `box` (points from the page's top left),
+/// its shape kept, in the middle.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImagePlace {
+    #[serde(default = "first")]
+    pub page: u32,
+    #[serde(rename = "box")]
+    pub b: [f32; 4],
+    pub key: Option<String>,
 }
 
 /// An answer as placed: its print point (the first line's baseline at its
@@ -146,9 +161,12 @@ pub struct Placed {
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate: Option<usize>,
-    /// characters Helvetica cannot set were set as "?"
+    /// characters the font lacks were set as "?"
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub lost: bool,
+    /// the height the text had, to tell a notably higher field
+    #[serde(skip)]
+    pub room: f32,
 }
 
 /// What is drawn on a page, in points from its top left.
@@ -170,6 +188,26 @@ pub struct Layout {
 }
 
 const LEADING: f32 = 1.15;
+
+/// The sizes a value may take: at most `cap`, from the ladder `base`,
+/// `base - 1`, … down to `min`, so that fields made smaller share sizes.
+#[derive(Debug, Clone, Copy)]
+struct Sizes {
+    base: f32,
+    cap: f32,
+    min: f32,
+}
+
+impl Sizes {
+    /// The ladder's step at or below `s`.
+    fn step(&self, s: f32) -> f32 {
+        if s >= self.base {
+            self.base
+        } else {
+            (self.base - (self.base - s - 1e-3).ceil()).max(self.min)
+        }
+    }
+}
 const PAD: f32 = 2.0; // from a field's side to the text
 
 /// Where a value goes.
@@ -211,6 +249,9 @@ pub fn layout(req: &Request) -> Layout {
     let min = req.min_size.unwrap_or(7.0).min(base);
     let color = req.color.as_deref().and_then(hex).unwrap_or([0x1a as f32 / 255.0; 3]);
     let mut out = Layout { base, color, placed: vec![], marks: vec![] };
+    let full = Sizes { base, cap: base, min };
+    // the text values, each at the largest size it takes
+    let mut texts: Vec<(&Field, String, Placed, Vec<Mark>)> = vec![];
     for f in &req.template.fields {
         let Some(answer) = req.answers.get(&f.key) else { continue };
         let Some(place) = &f.place else { continue };
@@ -228,19 +269,61 @@ pub fn layout(req: &Request) -> Layout {
         if text.is_empty() {
             continue;
         }
-        let (placed, marks) = if place.candidates.len() > 1 {
-            let Some((placed, marks)) = run_on(&text, &place.candidates, ins, base, min, place.page) else { continue };
-            (placed, marks)
-        } else {
-            let one = Place { candidate: place.candidate.or(place.candidates.first().copied()), ..place.clone() };
-            let Some((target, candidate)) = snap(ins, &one, false) else { continue };
-            let (placed, marks) = set(&text, target, ins, base, min, place.page);
-            (Placed { candidate, ..placed }, marks)
-        };
-        out.placed.push(Placed { key: f.key.clone(), ..placed });
-        out.marks.extend(marks);
+        if let Some((p, m)) = place_text(&text, place, ins, full) {
+            texts.push((f, text, p, m));
+        }
     }
+    // One size for most of a page: when more than half its text values had
+    // to be made smaller, the others come down to the step most of those
+    // took, unless their field is notably higher (half again the usual).
+    let pages: std::collections::BTreeSet<u32> = texts.iter().map(|t| t.2.page).collect();
+    for pg in pages {
+        let on: Vec<usize> = (0..texts.len()).filter(|&i| texts[i].2.page == pg && texts[i].2.kind == "text").collect();
+        let smaller: Vec<f32> = on.iter().map(|&i| texts[i].2.size).filter(|&s| s < base).collect();
+        if on.len() < 2 || smaller.len() * 2 <= on.len() {
+            continue;
+        }
+        let mut counts: Vec<(f32, usize)> = vec![];
+        for s in &smaller {
+            match counts.iter_mut().find(|c| (c.0 - s).abs() < 1e-3) {
+                Some(c) => c.1 += 1,
+                None => counts.push((*s, 1)),
+            }
+        }
+        let step = counts.iter().max_by(|a, b| a.1.cmp(&b.1).then(a.0.total_cmp(&b.0))).unwrap().0;
+        let mut rooms: Vec<f32> = on.iter().map(|&i| texts[i].2.room).collect();
+        rooms.sort_by(f32::total_cmp);
+        let usual = rooms[rooms.len() / 2];
+        for &i in &on {
+            let (f, text, p, _) = &texts[i];
+            if p.size > step && p.room < 1.5 * usual {
+                let place = f.place.as_ref().unwrap();
+                let ins = page(&req.inspections, place.page).unwrap();
+                if let Some(again) = place_text(text, place, ins, Sizes { cap: step, ..full }) {
+                    (texts[i].2, texts[i].3) = again;
+                }
+            }
+        }
+    }
+    for (f, _, p, m) in texts {
+        out.placed.push(Placed { key: f.key.clone(), ..p });
+        out.marks.extend(m);
+    }
+    // in the template's order
+    let order = |k: &str| req.template.fields.iter().position(|f| f.key == k);
+    out.placed.sort_by_key(|p| order(&p.key));
     out
+}
+
+/// A text value at its place: one candidate, or several it runs on over.
+fn place_text(text: &str, place: &Place, ins: &Inspection, z: Sizes) -> Option<(Placed, Vec<Mark>)> {
+    if place.candidates.len() > 1 {
+        return run_on(text, &place.candidates, ins, z, place.page);
+    }
+    let one = Place { candidate: place.candidate.or(place.candidates.first().copied()), ..place.clone() };
+    let (target, candidate) = snap(ins, &one, false)?;
+    let (placed, marks) = set(text, target, ins, z, place.page);
+    Some((Placed { candidate, ..placed }, marks))
 }
 
 fn page(pages: &[Inspection], n: u32) -> Option<&Inspection> {
@@ -288,6 +371,7 @@ fn check(out: &mut Layout, f: &Field, place: &Place, ins: &Inspection, answer: &
         kind: "check",
         candidate,
         lost: false,
+        room: side,
     });
 }
 
@@ -295,7 +379,7 @@ fn check(out: &mut Layout, f: &Field, place: &Place, ins: &Inspection, answer: &
 /// the cells of combs one after another; or into lines and fields, as many
 /// words into each as fit at the base size, the rest into the next, the
 /// last taking what is left by the usual rules. Placed where it starts.
-fn run_on(text: &str, ids: &[usize], ins: &Inspection, base: f32, min: f32, page: u32) -> Option<(Placed, Vec<Mark>)> {
+fn run_on(text: &str, ids: &[usize], ins: &Inspection, z: Sizes, page: u32) -> Option<(Placed, Vec<Mark>)> {
     let mut ids = ids.to_vec();
     ids.sort_unstable();
     let targets: Vec<Target> = ids.iter().filter_map(|&id| candidate(ins, id).map(|t| t.0)).collect();
@@ -320,7 +404,7 @@ fn run_on(text: &str, ids: &[usize], ins: &Inspection, base: f32, min: f32, page
             }
             let w = zone_width(t);
             let mut k = 0;
-            while k < words.len() && helvetica::width(&words[..=k].join(" "), base) <= w {
+            while k < words.len() && font::width(&words[..=k].join(" "), z.cap) <= w {
                 k += 1;
             }
             let k = k.max(1).min(words.len());
@@ -334,13 +418,13 @@ fn run_on(text: &str, ids: &[usize], ins: &Inspection, base: f32, min: f32, page
         if chunk.is_empty() {
             continue;
         }
-        let (p, m) = set(chunk, *t, ins, base, min, page);
+        let (p, m) = set(chunk, *t, ins, z, page);
         (lines, overflow) = (lines + p.lines, overflow | p.overflow);
         first.get_or_insert(Placed { candidate: Some(*id), ..p });
         marks.extend(m);
     }
     let mut placed = first?;
-    (placed.lines, placed.overflow, placed.lost) = (lines, overflow, helvetica::encode(text).1);
+    (placed.lines, placed.overflow, placed.lost) = (lines, overflow, font::lost(text));
     Some((placed, marks))
 }
 
@@ -433,8 +517,8 @@ fn snap(ins: &Inspection, place: &Place, want_check: bool) -> Option<(Target, Op
 }
 
 /// A text or a comb value set in its target.
-fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: u32) -> (Placed, Vec<Mark>) {
-    let lost = helvetica::encode(text).1;
+fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Placed, Vec<Mark>) {
+    let lost = font::lost(text);
     let placed = |x, y, size, lines, overflow, kind| Placed {
         key: String::new(),
         page,
@@ -446,14 +530,15 @@ fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: 
         kind,
         candidate: None,
         lost,
+        room: 0.0,
     };
     let skew = ins.skew_deg.to_radians();
     match target {
         Target::Comb(b, cells) => {
             let chars: Vec<String> = text.chars().filter(|c| !c.is_whitespace()).map(String::from).collect();
             let cw = (b[2] - b[0]) / cells.max(1) as f32;
-            let widest = chars.iter().map(|c| helvetica::width(c, 1.0)).fold(0.5, f32::max);
-            let size = base.min(0.7 * (b[3] - b[1])).min(0.8 * cw / widest);
+            let widest = chars.iter().map(|c| font::width(c, 1.0)).fold(0.5, f32::max);
+            let size = z.base.min(0.7 * (b[3] - b[1])).min(0.8 * cw / widest);
             let y = (b[1] + b[3]) / 2.0 + CAP * size / 2.0;
             let marks = chars
                 .iter()
@@ -461,7 +546,7 @@ fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: 
                 .enumerate()
                 .map(|(i, c)| Mark::Text {
                     page,
-                    x: b[0] + (i as f32 + 0.5) * cw - helvetica::width(c, size) / 2.0,
+                    x: b[0] + (i as f32 + 0.5) * cw - font::width(c, size) / 2.0,
                     y,
                     size,
                     angle: skew,
@@ -474,7 +559,7 @@ fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: 
             let (x0, x1) = (l.x0 + PAD, l.x1 - 1.0);
             let at = |x: f32| l.y0 + (l.y1 - l.y0) * (x - l.x0) / (l.x1 - l.x0).max(1.0);
             let room = room_above(ins, &l);
-            let (size, rows, overflow) = fit(text, x1 - x0, room, base, min);
+            let (size, rows, overflow) = fit(text, x1 - x0, room, z);
             // descenders clear the line
             let foot = at(x0) - DESCENT * size - 0.8;
             let angle = ((l.y1 - l.y0) / (l.x1 - l.x0).max(1.0)).atan();
@@ -485,7 +570,7 @@ fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: 
                 .map(|(i, t)| Mark::Text { page, x: x0, y: foot - (n - 1 - i) as f32 * LEADING * size, size, angle, text: t })
                 .collect::<Vec<_>>();
             let y = foot - (n - 1) as f32 * LEADING * size;
-            (placed(x0, y, size, n as u8, overflow, "text"), marks)
+            (Placed { room, ..placed(x0, y, size, n as u8, overflow, "text") }, marks)
         }
         Target::Area(b) | Target::Check(b) => {
             // the text goes below every printed word inside the frame (its
@@ -500,17 +585,17 @@ fn set(text: &str, target: Target, ins: &Inspection, base: f32, min: f32, page: 
                 .map(|w| w.bbox[3])
                 .fold(b[1], f32::max)
                 .min(b[3] - 1.0);
-            let z = [b[0] + PAD, label + 0.5, b[2] - PAD, b[3] - 0.5];
-            let (size, rows, overflow) = fit(text, z[2] - z[0], z[3] - z[1], base, min);
+            let zone = [b[0] + PAD, label + 0.5, b[2] - PAD, b[3] - 0.5];
+            let (size, rows, overflow) = fit(text, zone[2] - zone[0], zone[3] - zone[1], z);
             // the lines' glyphs, cap to descender, centred in the zone
             let n = rows.len() as f32;
-            let first = (z[1] + z[3]) / 2.0 - (n - 1.0) * LEADING * size / 2.0 + (CAP - DESCENT) * size / 2.0;
+            let first = (zone[1] + zone[3]) / 2.0 - (n - 1.0) * LEADING * size / 2.0 + (CAP - DESCENT) * size / 2.0;
             let marks = rows
                 .into_iter()
                 .enumerate()
-                .map(|(i, t)| Mark::Text { page, x: z[0], y: first + i as f32 * LEADING * size, size, angle: skew, text: t })
+                .map(|(i, t)| Mark::Text { page, x: zone[0], y: first + i as f32 * LEADING * size, size, angle: skew, text: t })
                 .collect();
-            (placed(z[0], first, size, n as u8, overflow, "text"), marks)
+            (Placed { room: zone[3] - zone[1], ..placed(zone[0], first, size, n as u8, overflow, "text") }, marks)
         }
     }
 }
@@ -535,36 +620,37 @@ fn room_above(ins: &Inspection, l: &ILine) -> f32 {
     }
 }
 
-/// The size and lines of `text` in `w` x `h`: at `base` if it fits; else
-/// smaller, down to `min`; else on two lines if they fit at `min` or more;
-/// else one line at `min`, overflowing.
-fn fit(text: &str, w: f32, h: f32, base: f32, min: f32) -> (f32, Vec<String>, bool) {
+/// The size and lines of `text` in `w` x `h`: as large as it may be, if it
+/// fits; else smaller, down to `min`; else on two lines if they fit at
+/// `min` or more; else one line at `min`, overflowing. Sizes below `base`
+/// are steps of its ladder.
+fn fit(text: &str, w: f32, h: f32, z: Sizes) -> (f32, Vec<String>, bool) {
     // one line needs its glyphs' height, cap to descender, and a little air
-    let top = base.min(h / (CAP + DESCENT + 0.05)).max(min);
-    let one = helvetica::width(text, top);
+    let top = z.step(z.cap.min(h / (CAP + DESCENT + 0.05)).max(z.min));
+    let one = font::width(text, top);
     if one <= w {
         return (top, vec![text.to_string()], false);
     }
-    let s = (top * w / one * 10.0).floor() / 10.0;
-    if s >= min {
-        return (s, vec![text.to_string()], false);
+    let s = top * w / one;
+    if s >= z.min {
+        return (z.step(s), vec![text.to_string()], false);
     }
     // two lines, broken at the space that evens them
     let words: Vec<&str> = text.split(' ').collect();
     let best = (1..words.len())
         .map(|k| (words[..k].join(" "), words[k..].join(" ")))
         .min_by(|a, b| {
-            let m = |p: &(String, String)| helvetica::width(&p.0, 1.0).max(helvetica::width(&p.1, 1.0));
+            let m = |p: &(String, String)| font::width(&p.0, 1.0).max(font::width(&p.1, 1.0));
             m(a).total_cmp(&m(b))
         });
     if let Some((a, b)) = best {
-        let widest = helvetica::width(&a, 1.0).max(helvetica::width(&b, 1.0));
-        let s2 = ((w / widest).min(top).min(h / (2.0 * LEADING)) * 10.0).floor() / 10.0;
-        if s2 >= min {
-            return (s2, vec![a, b], false);
+        let widest = font::width(&a, 1.0).max(font::width(&b, 1.0));
+        let s2 = (w / widest).min(top).min(h / (2.0 * LEADING));
+        if s2 >= z.min {
+            return (z.step(s2), vec![a, b], false);
         }
     }
-    (min, vec![text.to_string()], true)
+    (z.min, vec![text.to_string()], true)
 }
 
 impl Layout {

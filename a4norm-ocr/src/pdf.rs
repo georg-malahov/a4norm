@@ -1,5 +1,7 @@
 //! The filled form as a PDF (A4Norm Forms E4): the answers as vector text in
-//! Helvetica, near black, over the form's own pages.
+//! Arimo, near black, over the form's own pages. The font is embedded as the
+//! glyphs the answers use (a CID font with a ToUnicode map, so the text
+//! copies as written), a few kilobytes.
 //!
 //! - A scan: each page its JPEG, full page, and the text over it.
 //! - A PDF: a new PDF whose pages are the source's pages as Form XObjects,
@@ -12,8 +14,10 @@
 //!   for a scan, and the result says so.
 
 use crate::fill::{Layout, Mark};
-use crate::helvetica;
-use lopdf::{dictionary, Document, Object, ObjectId, Stream};
+use crate::font;
+use lopdf::{dictionary, Document, Object, ObjectId, Stream, StringFormat};
+use std::collections::BTreeMap;
+use subsetter::GlyphRemapper;
 
 /// The PDF, and whether its pages are the source's pictures because the
 /// source could not be read.
@@ -25,19 +29,23 @@ pub struct Output {
 /// The overlay's content for a page: the marks of `page`, drawn in points
 /// from the page's top left, with `to_pdf` the matrix from there into the
 /// page's space (it flips the y axis).
-fn overlay(layout: &Layout, page: u32, to_pdf: [f32; 6]) -> Vec<u8> {
+fn overlay(layout: &Layout, page: u32, to_pdf: [f32; 6], glyphs: &GlyphRemapper, pictures: &[Picture]) -> Vec<u8> {
     let [r, g, b] = layout.color;
     let mut s = format!("q {} cm {r:.3} {g:.3} {b:.3} rg {r:.3} {g:.3} {b:.3} RG 1 J\n", matrix(to_pdf));
+    // pictures first, the answers over them; y runs down, so each is drawn
+    // from its foot
+    for p in pictures.iter().filter(|p| p.page == page) {
+        let [x0, y0, x1, y1] = p.at;
+        s += &format!("q {:.3} 0 0 {:.3} {x0:.3} {y1:.3} cm /{} Do Q\n", x1 - x0, -(y1 - y0), p.name);
+    }
     for m in &layout.marks {
         match m {
             Mark::Text { page: p, x, y, size, angle, text } if *p == page => {
                 let (sin, cos) = angle.sin_cos();
                 // y runs down here: the glyphs' up is -y
-                s += &format!(
-                    "BT /A4nHelv {size:.2} Tf {cos:.5} {sin:.5} {sin:.5} {:.5} {x:.2} {y:.2} Tm ({}) Tj ET\n",
-                    -cos,
-                    literal(&helvetica::encode(text).0)
-                );
+                // two bytes a glyph: its number in the embedded subset
+                let hex: String = text.chars().map(|c| format!("{:04X}", glyphs.get(font::glyph(c).0 .0).unwrap_or(0))).collect();
+                s += &format!("BT /A4nFont {size:.2} Tf {cos:.5} {sin:.5} {sin:.5} {:.5} {x:.2} {y:.2} Tm <{hex}> Tj ET\n", -cos);
             }
             Mark::Cross { page: p, b, width } if *p == page => {
                 s += &format!(
@@ -56,34 +64,137 @@ fn matrix(m: [f32; 6]) -> String {
     m.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" ")
 }
 
-/// A PDF literal string of WinAnsi bytes.
-fn literal(bytes: &[u8]) -> String {
-    let mut s = String::new();
-    for &b in bytes {
-        match b {
-            b'(' | b')' | b'\\' => {
-                s.push('\\');
-                s.push(b as char);
-            }
-            0x20..=0x7E => s.push(b as char),
-            _ => s += &format!("\\{b:03o}"),
-        }
-    }
-    s
+/// A picture set over a page: its XObject's name and object, and where.
+struct Picture {
+    page: u32,
+    name: String,
+    id: ObjectId,
+    at: [f32; 4],
 }
 
-fn helvetica_font(doc: &mut Document) -> ObjectId {
-    doc.add_object(dictionary! {
-        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
-    })
+/// The pictures of `images` (PNG, JPEG) as image XObjects in `doc`, each
+/// fitted into its place, its shape kept: RGB, and its alpha as a soft mask
+/// when it has any, so a signature has no white around it.
+fn pictures(doc: &mut Document, places: &[crate::fill::ImagePlace], images: &[&[u8]]) -> Result<Vec<Picture>, String> {
+    if places.len() != images.len() {
+        return Err(format!("{} image places and {} images", places.len(), images.len()));
+    }
+    let mut out = vec![];
+    for (k, (place, bytes)) in places.iter().zip(images).enumerate() {
+        let img = image::load_from_memory(bytes).map_err(|e| format!("image {}: {e}", k + 1))?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let rgb: Vec<u8> = img.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let mut dict = dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        };
+        if img.pixels().any(|p| p[3] < 255) {
+            let mut mask = Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+                    "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+                },
+                img.pixels().map(|p| p[3]).collect(),
+            );
+            let _ = mask.compress();
+            dict.set("SMask", doc.add_object(mask));
+        }
+        let mut stream = Stream::new(dict, rgb);
+        let _ = stream.compress();
+        let id = doc.add_object(stream);
+        // fitted into the box, in its middle
+        let [x0, y0, x1, y1] = place.b;
+        let s = ((x1 - x0) / w as f32).min((y1 - y0) / h as f32);
+        let (pw, ph) = (w as f32 * s, h as f32 * s);
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let at = [cx - pw / 2.0, cy - ph / 2.0, cx + pw / 2.0, cy + ph / 2.0];
+        out.push(Picture { page: place.page, name: format!("A4nImage{k}"), id, at });
+    }
+    Ok(out)
+}
+
+/// Arimo as the glyphs `layout` sets, embedded in `doc`: a Type0 font over a
+/// CIDFontType2 with the subset as its FontFile2, the glyphs' widths, and a
+/// ToUnicode map so the text copies as written. Also the map from the
+/// font's glyph numbers to the subset's, which the text is written in.
+fn embed_font(doc: &mut Document, layout: &Layout) -> Result<(ObjectId, GlyphRemapper), String> {
+    let f = font::face();
+    let mut glyphs = GlyphRemapper::new();
+    // each glyph of the subset, and the character it stands for
+    let mut unicode: BTreeMap<u16, char> = BTreeMap::new();
+    for m in &layout.marks {
+        if let Mark::Text { text, .. } = m {
+            for c in text.chars() {
+                let (g, lost) = font::glyph(c);
+                let new = glyphs.remap(g.0);
+                unicode.entry(new).or_insert(if lost { '?' } else { c });
+            }
+        }
+    }
+    let subset = subsetter::subset(font::DATA, 0, &glyphs).map_err(|e| format!("font subset: {e:?}"))?;
+    let upm = f.units_per_em() as f32;
+    let k = |v: i16| (v as f32 * 1000.0 / upm).round() as i64;
+    // the subset's tag, six capitals before the name, from what it holds
+    let mut h: u32 = 2166136261;
+    for (g, c) in &unicode {
+        h = (h ^ (*g as u32 ^ *c as u32)).wrapping_mul(16777619);
+    }
+    let tag: String = (0..6).map(|i| (b'A' + ((h >> (i * 5)) % 26) as u8) as char).collect();
+    let name = format!("{tag}+Arimo-Regular").into_bytes();
+    let mut file = Stream::new(dictionary! { "Length1" => subset.len() as i64 }, subset);
+    let _ = file.compress();
+    let file = doc.add_object(file);
+    let bbox = f.global_bounding_box();
+    let descriptor = doc.add_object(dictionary! {
+        "Type" => "FontDescriptor", "FontName" => Object::Name(name.clone()), "Flags" => 32,
+        "FontBBox" => vec![k(bbox.x_min).into(), k(bbox.y_min).into(), k(bbox.x_max).into(), k(bbox.y_max).into()],
+        "ItalicAngle" => 0, "Ascent" => k(f.ascender()), "Descent" => k(f.descender()),
+        "CapHeight" => k(f.capital_height().unwrap_or(f.ascender())), "StemV" => 80, "FontFile2" => file,
+    });
+    // the subset's glyphs' widths, from glyph 0 on
+    let widths: Vec<Object> =
+        glyphs.remapped_gids().map(|o| Object::Integer(font::advance(ttf_parser::GlyphId(o)).round() as i64)).collect();
+    let cid = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => Object::Name(name.clone()),
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::String(b"Adobe".to_vec(), StringFormat::Literal),
+            "Ordering" => Object::String(b"Identity".to_vec(), StringFormat::Literal),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => descriptor, "W" => vec![Object::Integer(0), Object::Array(widths)], "CIDToGIDMap" => "Identity",
+    });
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def /CMapType 2 def\n1 begincodespacerange <0000> <FFFF> endcodespacerange\n",
+    );
+    let pairs: Vec<(&u16, &char)> = unicode.iter().collect();
+    for chunk in pairs.chunks(100) {
+        cmap += &format!("{} beginbfchar\n", chunk.len());
+        for (g, c) in chunk {
+            let utf16: String = c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("{u:04X}")).collect();
+            cmap += &format!("<{g:04X}> <{utf16}>\n");
+        }
+        cmap += "endbfchar\n";
+    }
+    cmap += "endcmap CMapName currentdict /CMap defineresource pop end end\n";
+    let mut to_unicode = Stream::new(dictionary! {}, cmap.into_bytes());
+    let _ = to_unicode.compress();
+    let to_unicode = doc.add_object(to_unicode);
+    let font = doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type0", "BaseFont" => Object::Name(name),
+        "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid)], "ToUnicode" => to_unicode,
+    });
+    Ok((font, glyphs))
 }
 
 /// A PDF of scanned pages: each a JPEG over its `PageInspection.sizePt`
 /// (A4 when the page was not inspected), with its answers over it.
-pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout) -> Result<Vec<u8>, String> {
+pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) -> Result<Vec<u8>, String> {
     let mut doc = Document::with_version("1.4");
     let pages_id = doc.new_object_id();
-    let font = helvetica_font(&mut doc);
+    let (font, glyphs) = embed_font(&mut doc, layout)?;
+    let pics = pictures(&mut doc, images.0, images.1)?;
     let mut kids = vec![];
     for (i, jpeg) in pages.iter().enumerate() {
         let (w, h, comps) = jpeg_info(jpeg).ok_or(format!("page {}: not a JPEG", i + 1))?;
@@ -98,7 +209,11 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout) -> Result<Vec<u8>, 
         ));
         let [pw, ph] = size;
         let mut content = format!("q {pw:.2} 0 0 {ph:.2} 0 0 cm /A4nScan Do Q\n").into_bytes();
-        content.extend(overlay(layout, i as u32 + 1, [1.0, 0.0, 0.0, -1.0, 0.0, ph]));
+        content.extend(overlay(layout, i as u32 + 1, [1.0, 0.0, 0.0, -1.0, 0.0, ph], &glyphs, &pics));
+        let mut xobjects = dictionary! { "A4nScan" => image };
+        for p in pics.iter().filter(|p| p.page == i as u32 + 1) {
+            xobjects.set(p.name.clone(), p.id);
+        }
         let mut stream = Stream::new(dictionary! {}, content);
         let _ = stream.compress();
         let contents = doc.add_object(stream);
@@ -106,8 +221,8 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout) -> Result<Vec<u8>, 
             "Type" => "Page", "Parent" => pages_id, "MediaBox" => vec![0.into(), 0.into(), pw.into(), ph.into()],
             "Contents" => contents,
             "Resources" => dictionary! {
-                "XObject" => dictionary! { "A4nScan" => image },
-                "Font" => dictionary! { "A4nHelv" => font },
+                "XObject" => xobjects,
+                "Font" => dictionary! { "A4nFont" => font },
             },
         })));
     }
@@ -227,18 +342,22 @@ fn appearances(doc: &Document, page: ObjectId) -> Vec<(ObjectId, [f32; 6])> {
     out
 }
 
+/// The request's picture places and the pictures' bytes, in that order.
+pub type Images<'a> = (&'a [crate::fill::ImagePlace], &'a [&'a [u8]]);
+
 /// A page's `sizePt` as it was inspected, by its number from 1.
 pub type Sizes<'a> = dyn Fn(u32) -> Option<[f32; 2]> + 'a;
 
 /// A new PDF: the source's pages as Form XObjects and the answers over
 /// them. `sizes` are the pages' `sizePt` as they were inspected (the page as
 /// shown: its crop box, turned by its /Rotate), to scale the answers from.
-pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout) -> Result<Vec<u8>, String> {
+pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> Result<Vec<u8>, String> {
     let mut doc = Document::load_mem(source).map_err(|e| e.to_string())?;
     if doc.is_encrypted() {
         return Err("encrypted, and it does not open without a password".into());
     }
-    let font = helvetica_font(&mut doc);
+    let (font, glyphs) = embed_font(&mut doc, layout)?;
+    let pics = pictures(&mut doc, images.0, images.1)?;
     let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
     for (i, &page) in pages.iter().enumerate() {
         let media = inherited(&doc, page, b"MediaBox").and_then(|o| rect(&doc, o)).unwrap_or([0.0, 0.0, 595.28, 841.89]);
@@ -280,14 +399,17 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout) -> Result<Vec<u8>, St
             body.extend(format!("q {} cm /{name} Do Q\n", matrix(cm)).into_bytes());
             shown.set(name, ap);
         }
-        body.extend(overlay(layout, i as u32 + 1, m));
+        body.extend(overlay(layout, i as u32 + 1, m, &glyphs, &pics));
+        for p in pics.iter().filter(|p| p.page == i as u32 + 1) {
+            shown.set(p.name.clone(), p.id);
+        }
         let mut stream = Stream::new(dictionary! {}, body);
         let _ = stream.compress();
         let contents = doc.add_object(stream);
         let d = doc.get_dictionary_mut(page).map_err(|e| e.to_string())?;
         d.set("Contents", contents);
         shown.set("A4nPage", form);
-        d.set("Resources", dictionary! { "XObject" => shown, "Font" => dictionary! { "A4nHelv" => font } });
+        d.set("Resources", dictionary! { "XObject" => shown, "Font" => dictionary! { "A4nFont" => font } });
         d.set("MediaBox", media.iter().map(|&v| Object::Real(v)).collect::<Vec<_>>());
         d.set("CropBox", crop.iter().map(|&v| Object::Real(v)).collect::<Vec<_>>());
         d.set("Rotate", rotate);
@@ -307,24 +429,25 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout) -> Result<Vec<u8>, St
 }
 
 /// The filled form from a PDF: over its own pages, or, when it cannot be
-/// read and `pictures` of its pages are given (JPEG, as they were
-/// inspected), over those.
-pub fn fill_pdf(req: &crate::fill::Request, source: &[u8], pictures: &[&[u8]]) -> Result<(Layout, Output), String> {
+/// read and `pages` (JPEG pictures of them, as they were inspected) are
+/// given, over those. `images` are the bytes of the request's pictures.
+pub fn fill_pdf(req: &crate::fill::Request, source: &[u8], pages: &[&[u8]], images: &[&[u8]]) -> Result<(Layout, Output), String> {
     let layout = crate::fill::layout(req);
     let sizes = |n| req.page_size(n);
-    match over(source, &sizes, &layout) {
+    let imgs = (req.images.as_slice(), images);
+    match over(source, &sizes, &layout, &imgs) {
         Ok(pdf) => Ok((layout, Output { pdf, fallback: false })),
-        Err(e) if pictures.is_empty() => Err(e),
+        Err(e) if pages.is_empty() => Err(e),
         Err(_) => {
-            let pdf = scan(pictures, &sizes, &layout)?;
+            let pdf = scan(pages, &sizes, &layout, &imgs)?;
             Ok((layout, Output { pdf, fallback: true }))
         }
     }
 }
 
-/// The filled form from scanned pages (JPEG).
-pub fn fill_scan(req: &crate::fill::Request, pages: &[&[u8]]) -> Result<(Layout, Output), String> {
+/// The filled form from scanned pages (JPEG), with the request's pictures.
+pub fn fill_scan(req: &crate::fill::Request, pages: &[&[u8]], images: &[&[u8]]) -> Result<(Layout, Output), String> {
     let layout = crate::fill::layout(req);
-    let pdf = scan(pages, &|n| req.page_size(n), &layout)?;
+    let pdf = scan(pages, &|n| req.page_size(n), &layout, &(req.images.as_slice(), images))?;
     Ok((layout, Output { pdf, fallback: false }))
 }
