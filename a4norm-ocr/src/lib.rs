@@ -9,12 +9,12 @@
 //! geometry.
 
 pub mod det;
-pub mod fill;
 /// The geometry of a form's page, shared with the scanner (a4norm-geometry)
 pub use a4norm_geometry as geometry;
-pub mod font;
+/// Filling a form in and writing the PDF, shared with the fill module
+/// (a4norm-fill)
+pub use a4norm_fill::{fill, font, pdf};
 pub mod lang;
-pub mod pdf;
 pub mod rec;
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]

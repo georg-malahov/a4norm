@@ -76,6 +76,9 @@ pub struct IBox {
     pub id: usize,
     #[serde(rename = "box")]
     pub b: [f32; 4],
+    /// a field's: where its printed label ends, found from the picture
+    /// (the scanner's `formGeometry`) where no words were read
+    pub label: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -154,7 +157,9 @@ pub struct Request {
 }
 
 /// Free text: from its baseline's start `(x, y)`, in points from the
-/// page's top left, at `size`, level.
+/// page's top left, at `size`, level; or turned `rotate` degrees clockwise
+/// about its middle as set (its width in Arimo, from the capitals' top to
+/// the descenders' foot).
 #[derive(Debug, Clone, Deserialize)]
 pub struct FreeText {
     #[serde(default = "first")]
@@ -163,10 +168,12 @@ pub struct FreeText {
     pub y: f32,
     pub size: f32,
     pub text: String,
+    pub rotate: Option<f32>,
 }
 
 /// A picture's place: fitted into `box` (points from the page's top left),
-/// its shape kept, in the middle.
+/// its shape kept, in the middle; then turned `rotate` degrees clockwise
+/// about the box's middle.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImagePlace {
     #[serde(default = "first")]
@@ -174,6 +181,7 @@ pub struct ImagePlace {
     #[serde(rename = "box")]
     pub b: [f32; 4],
     pub key: Option<String>,
+    pub rotate: Option<f32>,
 }
 
 /// An answer as placed: its print point (the first line's baseline at its
@@ -354,9 +362,19 @@ pub fn layout(req: &Request) -> Layout {
     }
     for t in &req.texts {
         let text = t.text.trim_end();
-        if !text.is_empty() && t.size > 0.0 {
-            out.marks.push(Mark::Text { page: t.page, x: t.x, y: t.y, size: t.size, angle: 0.0, text: text.to_string() });
+        if text.is_empty() || t.size <= 0.0 {
+            continue;
         }
+        let (mut x, mut y, mut angle) = (t.x, t.y, 0.0);
+        if let Some(deg) = t.rotate.filter(|d| d.rem_euclid(360.0) != 0.0) {
+            // the baseline's start turned about the text's middle
+            angle = deg.to_radians();
+            let (sin, cos) = angle.sin_cos();
+            let (cx, cy) = (t.x + font::width(text, t.size) / 2.0, t.y + (DESCENT - CAP) * t.size / 2.0);
+            let (dx, dy) = (t.x - cx, t.y - cy);
+            (x, y) = (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
+        }
+        out.marks.push(Mark::Text { page: t.page, x, y, size: t.size, angle, text: text.to_string() });
     }
     // in the template's order
     let order = |k: &str| req.template.fields.iter().position(|f| f.key == k);
@@ -639,7 +657,8 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
         }
         Target::Area(b) | Target::Check(b) => {
             // the text goes below every printed word inside the frame (its
-            // label, "Familienname" at the top of KG 1's fields)
+            // label, "Familienname" at the top of KG 1's fields), or below
+            // the label's ink the geometry found when no words were read
             let label = ins
                 .words
                 .iter()
@@ -648,6 +667,7 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
                     cx > b[0] && cx < b[2] && cy > b[1] && cy < b[3]
                 })
                 .map(|w| w.bbox[3])
+                .chain(ins.rects.iter().find(|r| r.b == b).and_then(|r| r.label))
                 .fold(b[1], f32::max)
                 .min(b[3] - 1.0);
             let zone = [b[0] + PAD, label + 0.5, b[2] - PAD, b[3] - 0.5];

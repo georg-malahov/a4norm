@@ -1,0 +1,36 @@
+[package]
+name = "a4norm-fill"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A form filled in: where each answer goes and its size, and the filled form as a PDF, in Arimo; no models"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# the browser's API: fillLayout, fillPdf, fillScan (src/wasm.rs), in this
+# crate's own module and in the OCR module
+web = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lopdf = { version = "0.45", default-features = false }
+ttf-parser = { version = "0.25", default-features = false, features = ["std", "opentype-layout"] }
+# a static font: no variable fonts (skrifa, write-fonts), a third of the module
+subsetter = { version = "0.2", default-features = false }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# lopdf draws rand; in the browser its entropy comes from crypto.getRandomValues
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1

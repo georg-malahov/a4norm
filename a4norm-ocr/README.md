@@ -236,7 +236,14 @@ offered, and neither is the filled demo (10 of 21 empty). In the browser's one-t
 module (Node, 200 dpi, the JPEG decoded too) a page takes 70 ms median, 87 ms at most,
 once warm; the first call takes up to 170 ms.
 
-## Where the answers go (`src/fill.rs`)
+## Where the answers go (`a4norm-fill`: `fill.rs`)
+
+Filling a form in and writing its PDF is a crate of its own, `a4norm-fill/` (fill, pdf,
+the font; no tract, no models). This module carries its API (`a4norm_ocr::{fill, pdf,
+font}` and `fillLayout`, `fillPdf`, `fillScan` in the browser), and so does the **fill
+module**, `a4norm_fill.wasm`, built alone (`a4norm-fill/web/build.sh`). With it and the
+scanner's `formGeometry` a form is filled in by hand without this module (see
+a4norm-fill's README).
 
 `fillLayout(requestJson)` (and `fill::layout` in Rust) places a form's answers on its pages
 without drawing them; no models are needed.
@@ -248,8 +255,10 @@ The request is `{inspections, template, answers, color?, minSize?, images?, text
   (`[ymin, xmin, ymax, xmax]` in 0–1000 of the page, for a field the geometry did not
   find), or `{page, box}` in points. Pages count from 1;
 - `answers` maps a key to a text, a choice's option `value`, or `true` for a single box;
-- `texts: [{page, x, y, size, text}]` are free text of the person's own, set level in the
-  embedded font from its baseline's start `(x, y)`, in points from the top left.
+- `texts: [{page, x, y, size, text, rotate?}]` are free text of the person's own, set in
+  the embedded font from its baseline's start `(x, y)`, in points from the top left: level,
+  or turned `rotate` degrees clockwise about its middle as set (its width in Arimo, from
+  the capitals' top to the descenders' foot). Turned, it is still text.
 
 **By hand** (the site's adjusting of a filled form). A field may carry:
 - `size` (pt): its value is set at that size exactly, not made smaller, and left out of the
@@ -315,7 +324,7 @@ On the demo form (`examples/forms/demo-template.json`, `demo-answers.json`) ever
 the PDF, within 3.3 pt on the synthetic scan and within 4.4 pt on the phone scan. The two
 scans are compared once laid on the PDF.
 
-## The filled form as a PDF (`src/pdf.rs`)
+## The filled form as a PDF (`a4norm-fill`: `pdf.rs`)
 
 ```js
 const r = fillPdf(JSON.stringify({ inspections, template, answers, images }), pdfBytes, pagePictures, imageBytes);
@@ -343,15 +352,16 @@ XObjects, and the answers over them as vector text:
   stand in, as for a scan, with `fallback: true`. Without them it is an error.
 
 **Pictures over the page** (a signature from a pad, a stamp):
-- The request's `images: [{page, box, key?}]` place them. `box` is in points from the
-  page's top left; each picture is fitted in its box, its shape kept, in the middle.
+- The request's `images: [{page, box, key?, rotate?}]` place them. `box` is in points from
+  the page's top left; each picture is fitted in its box, its shape kept, in the middle,
+  then turned `rotate` degrees clockwise about the box's middle (a signature standing up).
 - Their bytes (PNG or JPEG) come apart, in the same order: `fillPdf`'s and `fillScan`'s
   last argument, optional.
 - A PNG's alpha becomes a soft mask, so a signature has no white box around it.
 - The page stays vector: each picture is an image XObject of its own. The file grows by
   about the picture's size: 5.3 KB of PNG signature → 5.9 KB.
 
-**Text.** Arimo (`fonts/`, SIL OFL 1.1; Arial's metrics), with Latin Extended, Cyrillic and
+**Text.** Arimo (`a4norm-fill/fonts/`, SIL OFL 1.1; Arial's metrics), with Latin Extended, Cyrillic and
 Greek, so "Yılmaz", "Şahin", "Łukasz", "Đorđević", "Ștefan" and "Müller-Straße" are set as
 written. The module carries the font, and a PDF embeds only the glyphs its answers use: a
 CID font with a ToUnicode map, so the text copies as written. For the demo form that is
@@ -422,13 +432,14 @@ matrix kernels (`tract-linalg`) at 3, then `wasm-opt -Oz`:
 
 | | wasm | gzip -9 |
 |---|---|---|
-| `st/a4norm_ocr_bg.wasm` | 10.2 MB | 3.3 MB |
-| `mt/a4norm_ocr_bg.wasm` | 10.2 MB | 3.3 MB |
+| `st/a4norm_ocr_bg.wasm` | 9.6 MB | 3.1 MB |
+| `mt/a4norm_ocr_bg.wasm` | 9.6 MB | 3.1 MB |
 | models (fetched apart) | 12.9 MB | |
 
-The OCR alone came to 8.2 MB (2.4 MB gzip). The geometry adds ~60 KB; filling and writing
-the PDF (serde, lopdf) ~720 KB; the font and its subsetting (Arimo, ttf-parser, subsetter)
-~1.2 MB. At opt-level 3 throughout, the OCR module was
+The OCR alone came to 8.2 MB (2.4 MB gzip). The geometry adds ~60 KB, and filling and
+writing the PDF (a4norm-fill: serde, lopdf, Arimo, ttf-parser, subsetter) ~1.4 MB. That was
+0.6 MB more until the subsetter was built without variable fonts; the same filling is the
+fill module on its own (a4norm-fill's README). At opt-level 3 throughout, the OCR module was
 13.3 MB and slower in the browser (8.1 s against 7.4 s); at "s" throughout it was 7.9 MB
 but took 12–13 s.
 

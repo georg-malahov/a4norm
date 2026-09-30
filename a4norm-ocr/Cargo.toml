@@ -19,15 +19,15 @@ crate-type = ["rlib", "cdylib"]
 tract-onnx = { version = "0.23", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rayon = { version = "1", optional = true }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-lopdf = { version = "0.45", default-features = false }
-ttf-parser = { version = "0.25", default-features = false, features = ["std", "opentype-layout"] }
-subsetter = "0.2"
 # the page's candidates, one implementation with the scanner's module
 a4norm-geometry = { path = "../a4norm-geometry" }
+# filling a form in and its PDF, one implementation with the fill module
+a4norm-fill = { path = "../a4norm-fill" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# fillLayout, fillPdf, fillScan: the fill module's API, in this module too
+a4norm-fill = { path = "../a4norm-fill", features = ["web"] }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 # tract-onnx-opl draws rand; in the browser its entropy comes from crypto.getRandomValues
@@ -42,3 +42,7 @@ codegen-units = 1
 # kernels, where the time goes, stay at 3.
 [profile.release.package.tract-linalg]
 opt-level = 3
+
+[dev-dependencies]
+# tests turn a PDF's page
+lopdf = { version = "0.45", default-features = false }

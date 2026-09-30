@@ -260,3 +260,38 @@ fn bold_boxes_are_boxes() {
     assert_eq!(boxes.len(), 3, "{boxes:?}");
     assert!(boxes.iter().all(|b| b[0] < 70.0 && (b[2] - b[0] - 16.0).abs() < 1.5), "{boxes:?}");
 }
+
+#[test]
+fn empty_candidates_and_printed_labels() {
+    // each candidate's `empty`, as looks_like_form counts it; and on KG 1's
+    // p. 2 the printed label at the top of its fields ("Familienname"), for
+    // a value set by hand to go below, as the OCR puts it below the words
+    let Some(img) = render("official/ba-kg1-kindergeld.pdf", 2) else {
+        return eprintln!("skipped: no pdftoppm or no form here");
+    };
+    let px = img.width() as f32 / 595.28;
+    let g = geometry::find(&img, px, &[]);
+    let empty = geometry::empty(&img, px, &g);
+    let f = geometry::looks_like_form(&img, px);
+    let counted = g
+        .candidates
+        .iter()
+        .zip(&empty)
+        .filter(|(c, _)| !matches!(c.kind, Kind::Line(l) if (l.x1 - l.x0) / px >= 400.0))
+        .collect::<Vec<_>>();
+    assert_eq!((counted.len(), counted.iter().filter(|(_, e)| **e).count()), (f.total, f.empty));
+    let labels = geometry::label_feet(&img, px, &g);
+    let rects: Vec<([f32; 4], Option<f32>)> =
+        g.candidates.iter().zip(&labels).filter_map(|(c, l)| if let Kind::Rect(r) = c.kind { Some((r, *l)) } else { None }).collect();
+    let found = rects.iter().filter(|r| r.1.is_some()).count();
+    eprintln!("KG 1 p. 2: labels in {found} of {} fields", rects.len());
+    assert!(found >= rects.len() - 2, "{found} of {}", rects.len());
+    for (r, l) in rects {
+        if let Some(y) = l {
+            // in the field's upper part, a label's height (6 pt print) down
+            assert!(y > r[1] && y < r[1] + 0.45 * (r[3] - r[1]) + 2.0 * px, "{r:?} {y}");
+        }
+    }
+    // nothing of the kind outside fields
+    assert!(g.candidates.iter().zip(&labels).all(|(c, l)| l.is_none() || matches!(c.kind, Kind::Rect(_))));
+}

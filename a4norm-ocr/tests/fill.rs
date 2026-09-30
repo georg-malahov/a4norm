@@ -379,3 +379,16 @@ fn free_text_where_it_was_put() {
     assert_eq!(free, [&Mark::Text { page: 1, x: 320.0, y: 200.0, size: 12.0, angle: 0.0, text: "Straße ş ł".into() }]);
     assert_eq!(l.marks.len(), 2, "blank text is left out");
 }
+
+#[test]
+fn a_value_below_the_label_the_picture_shows() {
+    // without words (the free mode), a field's `label` from the geometry:
+    // the value goes below it, as below the words the OCR reads
+    let mut r = place("name", 2, "Musterfrau");
+    r.inspections[0].words.clear();
+    let top = |r: &Request| extents(&fill::layout(r))[0][1];
+    let without = top(&r);
+    r.inspections[0].rects[0].label = Some(112.0);
+    let with = top(&r);
+    assert!(without < 112.0 && with >= 112.0, "top of the letters: {without} without, {with} with the label");
+}

@@ -172,6 +172,27 @@ its OCR module. It adds 88 KB to `a4norm_bg.wasm` (1 514 KB → 1 604 KB, 29 KB 
 takes about 70 ms a page in the one-thread module (87 ms at most on the plan's 50 pages). Nothing else changes: `process` runs as
 before.
 
+## A form's fields for filling it in by hand: `formGeometry`
+
+```js
+const g = formGeometry(r.pages[i]);   // { jpg, dpi, sizePt? }
+// g = { sizePt, lines: [{id, x0, y0, x1, y1, empty}], rects: [{id, box, empty, label?}],
+//       combs: [{id, box, cells, empty}], boxes: [{id, box, empty}], typicalFieldHeight }
+```
+
+This gives the page's writing lines, fields, combs and check boxes, in points from its top
+left, for the free form mode. The fill module (`a4norm-fill`) then lays out the answers and
+writes the PDF, without the OCR module.
+- **The candidates** are the OCR module's `formGeometry`, with the same ids in reading
+  order.
+- **`empty`** says nothing is written in a candidate, measured as `looksLikeForm` does.
+- **`label`** is the foot of a field's printed label ("Familienname" at the top of KG 1's
+  frames). A value set in the field goes below it.
+- **`sizePt`** is A4 when the page is A4-shaped, as the scanner makes it. Otherwise it is
+  the page's pixels at `dpi`, unless it is given.
+
+It adds 8.5 KB to `a4norm_bg.wasm` (3 KB gzip), and takes 60–130 ms a page.
+
 ## The command line: `--json PATH`
 
 `--json PATH` writes the same `photos` and `pages[].geom` as JSON, beside
