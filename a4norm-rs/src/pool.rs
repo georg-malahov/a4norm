@@ -39,8 +39,9 @@ pub fn init_thread_pool(threads: usize) -> js_sys::Promise {
 
 /// Lets the pool go: its threads are told to leave at once, within this
 /// call. Resolves when every worker has left rayon, freed its thread's stack
-/// and closed. Without a pool it does nothing; the calls then run on one
-/// thread until `initThreadPool` is called again.
+/// and closed, with how many workers had to be terminated because they had
+/// not in 2 s (0 normally). Without a pool it does nothing; the calls then
+/// run on one thread until `initThreadPool` is called again.
 #[wasm_bindgen(js_name = releaseThreadPool)]
 pub fn release_thread_pool() -> js_sys::Promise {
     stop_pool()

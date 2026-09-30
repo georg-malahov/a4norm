@@ -24,20 +24,22 @@ self.onmessage = async (e) => { try {
   m = await import(base + 'a4norm.js');
   await m.default({ module_or_path: base + 'a4norm_bg.wasm' });
   const got = await Promise.all(files.map(async (n) => ({ name: n.split('/').pop(), bytes: new Uint8Array(await (await fetch(self.location.origin + n)).arrayBuffer()) })));
-  const ms = {}, hashes = {};
+  const ms = {}, hashes = {}, terminated = {};
   const time = async (k, f) => { const t = performance.now(); const r = await f(); ms[k] = Math.round(performance.now() - t); return r; };
   const scan = async (k) => { hashes[k] = await hash(await time(k, () => m.process(got, args, null))); };
+  // how many workers the release had to terminate: none, when each closed itself
+  const release = async (k) => { terminated[k] = (await time(k, () => m.releaseThreadPool())) ?? 0; };
   if (build === 'mt') await time('init', () => m.initThreadPool(threads));
   await scan('scan');
-  if (mode === 'release' || mode === 'cycle') await time('release', () => m.releaseThreadPool());
+  if (mode === 'release' || mode === 'cycle') await release('release');
   if (mode === 'cycle') {
     await time('reinit', () => m.initThreadPool(threads));
     await scan('scan2');
-    await time('release2', () => m.releaseThreadPool());
-    await time('release3', () => m.releaseThreadPool());
+    await release('release2');
+    await release('release3');
     await scan('scan1t');
   }
-  self.postMessage({ ms, hashes });
+  self.postMessage({ ms, hashes, terminated });
 } catch (x) { self.postMessage({ error: String(x && x.stack || x) }); } };`;
 const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), { type: 'module' });
 w.onmessage = (e) => { window.done = e.data; };

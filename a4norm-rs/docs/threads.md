@@ -36,7 +36,10 @@ await m.initThreadPool(n);    // and again, when a run may come
   - freed its thread's stack and thread-locals in the shared memory;
   - closed itself.
 
-  A worker that has not answered in 2 s is terminated anyway. Without a pool
+  Only a worker that has not answered in 2 s is terminated; one that has
+  closed itself is left alone (terminating it right after it closed could
+  leave it lingering in Chromium). The promise resolves with how many had
+  to be terminated, normally 0. Without a pool
   the call does nothing, so calling it twice is safe. Called while
   `initThreadPool` is still loading the workers, it closes them before they
   enter rayon.
