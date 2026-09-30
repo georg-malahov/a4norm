@@ -421,7 +421,21 @@ work, so they vary by ~10 %:
 | wasm `st` in Node 20 | 7.4–7.9 s | 7.1 s |
 | wasm `st` in Chromium / WebKit (a worker) | 7.4 / 7.6 s | 7.1 / 7.1 s |
 | wasm `mt` in Chromium / WebKit (a worker, 14 threads) | 1.5 / 1.5 s | 1.2 / 1.4 s |
-| first page, `mt` (plans compiled) | 7.0 / 4.4 s | |
+| first page, `mt` (plans compiled) | 3.4 / 3.4 s | |
+
+The first page compiles the recognizer's plans, and in the browser it compiles them one at
+a time. Compiling is nearly all allocation, and in the threaded build the allocator sits
+behind one spin lock. Plans compiled on every thread at once spun on it, so the more
+threads, the slower the first page:
+
+| KG 1 p. 2, `mt` in Node | 4 threads | 8 | 14 |
+|---|---|---|---|
+| before: first page, wall / CPU | 3.9 s / 12.8 s | 5.5 s / 35 s | 9.8 s / 100 s |
+| now: first page, wall / CPU | 4.6 s / 9.4 s | 4.1 s / 9.4 s | 4.3 s / 10.2 s |
+| later pages (unchanged) | 1.9 s | 1.3 s | 1.4 s |
+
+In Chromium with 14 threads the demo's first page went from 7.0 s to 3.4 s. Natively the
+plans still compile side by side.
 
 `mt` needs Web Workers, which Node lacks, so it is measured in the browsers
 (`web/check.mjs`). In a browser the models load in ~20 ms. `initThreadPool` takes

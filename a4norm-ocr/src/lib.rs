@@ -94,6 +94,10 @@ pub struct Ocr {
     chars: Vec<String>,
     det_plans: Mutex<Vec<((usize, usize), Plan)>>,
     rec_plans: Mutex<Vec<(usize, Plan)>>,
+    /// held while a plan is compiled in the browser: one at a time (see
+    /// `rec_plan`)
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    compiling: Mutex<()>,
     /// the long side of the page as detection sees it
     pub det_long: u32,
 }
@@ -123,6 +127,7 @@ impl Ocr {
             chars,
             det_plans: Mutex::new(vec![]),
             rec_plans: Mutex::new(vec![]),
+            compiling: Mutex::new(()),
             det_long: 960,
         })
     }
@@ -136,9 +141,22 @@ impl Ocr {
         Ok(plan)
     }
 
+    /// The recognizer's plan for lines `width` wide, compiled the first time.
+    /// In the browser plans are compiled one at a time: compiling is nearly
+    /// all allocation, and in the threaded build the allocator is behind one
+    /// spin lock, so plans compiled on every thread at once spun on it: the
+    /// cold first page took 3.9 s on 4 threads, 9.8 s on 14 (CPU 12.8 s,
+    /// 100 s), against 2.8 s of compiling on one. Natively they compile side
+    /// by side.
     fn rec_plan(&self, width: usize) -> TractResult<Plan> {
-        if let Some((_, p)) = self.rec_plans.lock().unwrap().iter().find(|(w, _)| *w == width) {
-            return Ok(p.clone());
+        let cached = || self.rec_plans.lock().unwrap().iter().find(|(w, _)| *w == width).map(|(_, p)| p.clone());
+        if let Some(p) = cached() {
+            return Ok(p);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _one = self.compiling.lock().unwrap();
+        if let Some(p) = cached() {
+            return Ok(p);
         }
         let plan = compile(&self.rec, [1, 3, rec::H, width])?;
         self.rec_plans.lock().unwrap().push((width, plan.clone()));
