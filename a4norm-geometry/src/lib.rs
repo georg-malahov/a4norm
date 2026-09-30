@@ -676,22 +676,36 @@ impl Geometry {
     /// The contract's fields, in points (`px_pt` pixels each): `lines`,
     /// `rects`, `combs`, `boxes` (each with its `id`), `typicalFieldHeight`.
     pub fn json_fields(&self, px_pt: f32) -> String {
+        self.json(px_pt, None)
+    }
+
+    /// The same with `"empty"` on each candidate, from `empty`, and a
+    /// field's `"label"`, the foot of its printed label, from `label_feet`.
+    pub fn json_fields_empty(&self, px_pt: f32, empty: &[bool], labels: &[Option<f32>]) -> String {
+        self.json(px_pt, Some((empty, labels)))
+    }
+
+    fn json(&self, px_pt: f32, extra: Option<(&[bool], &[Option<f32>])>) -> String {
         let p = |v: f32| format!("{:.2}", v / px_pt);
         let b = |b: &[f32; 4]| format!("[{},{},{},{}]", p(b[0]), p(b[1]), p(b[2]), p(b[3]));
         let (mut lines, mut rects, mut combs, mut boxes) = (vec![], vec![], vec![], vec![]);
-        for c in &self.candidates {
+        for (i, c) in self.candidates.iter().enumerate() {
+            let e = extra.map_or(String::new(), |(e, l)| {
+                let label = l[i].map_or(String::new(), |y| format!(",\"label\":{}", p(y)));
+                format!(",\"empty\":{}{label}", e[i])
+            });
             match c.kind {
                 Kind::Line(l) => lines.push(format!(
-                    "{{\"id\":{},\"x0\":{},\"y0\":{},\"x1\":{},\"y1\":{}}}",
+                    "{{\"id\":{},\"x0\":{},\"y0\":{},\"x1\":{},\"y1\":{}{e}}}",
                     c.id,
                     p(l.x0),
                     p(l.y0),
                     p(l.x1),
                     p(l.y1)
                 )),
-                Kind::Rect(r) => rects.push(format!("{{\"id\":{},\"box\":{}}}", c.id, b(&r))),
-                Kind::Comb(r, n) => combs.push(format!("{{\"id\":{},\"box\":{},\"cells\":{n}}}", c.id, b(&r))),
-                Kind::Box(r) => boxes.push(format!("{{\"id\":{},\"box\":{}}}", c.id, b(&r))),
+                Kind::Rect(r) => rects.push(format!("{{\"id\":{},\"box\":{}{e}}}", c.id, b(&r))),
+                Kind::Comb(r, n) => combs.push(format!("{{\"id\":{},\"box\":{},\"cells\":{n}{e}}}", c.id, b(&r))),
+                Kind::Box(r) => boxes.push(format!("{{\"id\":{},\"box\":{}{e}}}", c.id, b(&r))),
             }
         }
         format!(
@@ -740,6 +754,51 @@ impl FormLook {
 /// `looks_like_form` over a page's candidates found without words.
 pub fn looks_like_form(page: &RgbImage, px_pt: f32) -> FormLook {
     let g = find(page, px_pt, &[]);
+    let mut out = FormLook::default();
+    for (c, empty) in g.candidates.iter().zip(empty(page, px_pt, &g)) {
+        match c.kind {
+            Kind::Line(l) if (l.x1 - l.x0).abs() / px_pt >= 400.0 => continue,
+            Kind::Line(_) => out.lines += 1,
+            Kind::Rect(_) => out.rects += 1,
+            Kind::Comb(..) => out.combs += 1,
+            Kind::Box(_) => out.boxes += 1,
+        }
+        out.total += 1;
+        out.empty += empty as usize;
+    }
+    out
+}
+
+/// Where the printed label at the top of each of `g`'s fields ends, in
+/// pixels down the page, in their order (None for the rest): the lowest row
+/// with ink (luma under 128) in the upper 45 % of a field over 14 pt high,
+/// 1.5 pt in from its strokes, as KG 1 prints "Familienname" in its frames.
+/// A value set by hand goes below it, as below the words the OCR reads.
+pub fn label_feet(page: &RgbImage, px_pt: f32, g: &Geometry) -> Vec<Option<f32>> {
+    let inset = 1.5 * px_pt;
+    g.candidates
+        .iter()
+        .map(|c| {
+            let Kind::Rect(r) = c.kind else { return None };
+            let (x0, y0, x1, y1) = (r[0] + inset, r[1] + inset, r[2] - inset, r[3] - inset);
+            if y1 - y0 <= 14.0 * px_pt || x1 <= x0 {
+                return None;
+            }
+            let dark = |x: u32, y: u32| {
+                let [r, g, b] = page.get_pixel(x, y).0.map(f32::from);
+                0.3 * r + 0.59 * g + 0.11 * b < 128.0
+            };
+            let (xa, xb) = (x0.round() as u32, (x1.round() as u32).min(page.width()));
+            let (ya, yb) = (y0.round() as u32, ((y0 + 0.45 * (y1 - y0)).round() as u32).min(page.height()));
+            (ya..yb).rev().find(|&y| (xa..xb).any(|x| dark(x, y))).map(|y| y as f32 + 1.0)
+        })
+        .collect()
+}
+
+/// Whether nothing is written in each of `g`'s candidates, in their order:
+/// under 4 % dark where one writes, as `looks_like_form` measures it (a
+/// long line too, which it does not count).
+pub fn empty(page: &RgbImage, px_pt: f32, g: &Geometry) -> Vec<bool> {
     let (w, h) = (page.width() as f32, page.height() as f32);
     // the share of dark pixels in `[x0, y0, x1, y1]`, in points
     let dark = |b: [f32; 4]| {
@@ -761,37 +820,26 @@ pub fn looks_like_form(page: &RgbImage, px_pt: f32) -> FormLook {
     };
     let pt = |b: &[f32; 4], inset: f32| [b[0] / px_pt + inset, b[1] / px_pt + inset, b[2] / px_pt - inset, b[3] / px_pt - inset];
     let band = (0.7 * g.typical_field_height / px_pt).clamp(8.0, 18.0);
-    let mut out = FormLook::default();
-    for c in &g.candidates {
-        let d = match c.kind {
-            Kind::Line(l) => {
-                let (x0, x1) = (l.x0.min(l.x1) / px_pt, l.x0.max(l.x1) / px_pt);
-                if x1 - x0 >= 400.0 {
-                    continue;
+    g.candidates
+        .iter()
+        .map(|c| {
+            let d = match c.kind {
+                Kind::Line(l) => {
+                    let (x0, x1) = (l.x0.min(l.x1) / px_pt, l.x0.max(l.x1) / px_pt);
+                    let y = l.y0.min(l.y1) / px_pt;
+                    dark([x0 + 2.0, y - band, x1 - 2.0, y - 1.5])
                 }
-                out.lines += 1;
-                let y = l.y0.min(l.y1) / px_pt;
-                dark([x0 + 2.0, y - band, x1 - 2.0, y - 1.5])
-            }
-            Kind::Rect(r) => {
-                out.rects += 1;
-                let b = pt(&r, 1.5);
-                let hgt = b[3] - b[1];
-                dark(if hgt > 14.0 { [b[0], b[1] + 0.45 * hgt, b[2], b[3]] } else { b })
-            }
-            Kind::Comb(r, _) => {
-                out.combs += 1;
-                dark(pt(&r, 1.5))
-            }
-            Kind::Box(r) => {
-                out.boxes += 1;
-                dark(pt(&r, 1.0))
-            }
-        };
-        out.total += 1;
-        out.empty += (d < 0.04) as usize;
-    }
-    out
+                Kind::Rect(r) => {
+                    let b = pt(&r, 1.5);
+                    let hgt = b[3] - b[1];
+                    dark(if hgt > 14.0 { [b[0], b[1] + 0.45 * hgt, b[2], b[3]] } else { b })
+                }
+                Kind::Comb(r, _) => dark(pt(&r, 1.5)),
+                Kind::Box(r) => dark(pt(&r, 1.0)),
+            };
+            d < 0.04
+        })
+        .collect()
 }
 
 /// The strokes found, as `(x0, y0, x1, y1, horizontal)`, for drawing.

@@ -352,3 +352,65 @@ fn a_page_on_its_side_filled_the_right_way_up() {
     eprintln!("/Rotate 90 against the right way up: {d:.2} levels");
     assert!(d < 0.5, "{d}");
 }
+
+#[test]
+fn a_signature_and_a_note_turned() {
+    let Some(ocr) = ready() else { return };
+    // a signature standing up (90°) and at a slant (30°), a note at 15°:
+    // turned about their middles, still a picture and text
+    let (w, h) = (600u32, 150u32);
+    let mut sig = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+    for x in 20..580 {
+        let y = 75.0 + 45.0 * (x as f32 / 60.0).sin();
+        for dy in -4i32..=4 {
+            sig.put_pixel(x, (y as i32 + dy) as u32, image::Rgba([20, 20, 60, 255]));
+        }
+    }
+    let mut png = vec![];
+    sig.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let source = std::fs::read(format!("{FORMS}demo-blank.pdf")).unwrap();
+    let page = render(&source, 1, 200, "turn-source").unwrap();
+    let base = request(&ocr, &page, 1, "demo-template.json", "demo-answers.json");
+    let with = |rotate: Option<f32>, text_rotate: Option<f32>| {
+        let mut r = base.clone();
+        r.images = serde_json::from_value(serde_json::json!([{"page": 1, "box": [300.0, 560.0, 500.0, 620.0], "rotate": rotate}])).unwrap();
+        r.texts = serde_json::from_value(serde_json::json!([{"page": 1, "x": 80.0, "y": 640.0, "size": 12.0, "text": "Gesehen am Montag", "rotate": text_rotate}])).unwrap();
+        pdf::fill_pdf(&r, &source, &[], &[&png]).unwrap().1.pdf
+    };
+    // no angle, or none to speak of, is the layout as before
+    let level = with(None, None);
+    assert_eq!(with(Some(0.0), Some(360.0)), level);
+    let s = 100.0 / 72.0;
+    let plain = render(&pdf::fill_pdf(&base, &source, &[], &[]).unwrap().1.pdf, 1, 100, "turn-plain").unwrap();
+    // where the signature's ink is, in points, over the page without it
+    let ink = |pdf: &[u8], name: &str| {
+        let img = render(pdf, 1, 100, name).unwrap();
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (x, y, p) in img.enumerate_pixels() {
+            let (px, py) = (x as f32 / s, y as f32 / s);
+            if (280.0..=520.0).contains(&px) && (470.0..=710.0).contains(&py) && p[2] as i32 > p[0] as i32 + 25 && plain.get_pixel(x, y) != p {
+                (x0, y0, x1, y1) = (x0.min(px), y0.min(py), x1.max(px), y1.max(py));
+            }
+        }
+        [x0, y0, x1, y1]
+    };
+    let flat = ink(&level, "turn-0");
+    let up = ink(&with(Some(90.0), Some(15.0)), "turn-90");
+    let slant = ink(&with(Some(30.0), Some(15.0)), "turn-30");
+    eprintln!("signature ink: level {flat:?}, 90° {up:?}, 30° {slant:?}");
+    let mid = |b: [f32; 4]| ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+    for b in [flat, up, slant] {
+        let (cx, cy) = mid(b);
+        assert!((cx - 400.0).abs() < 4.0 && (cy - 590.0).abs() < 4.0, "about the box's middle: {b:?}");
+    }
+    assert!(flat[2] - flat[0] > 3.0 * (flat[3] - flat[1]), "level: wide {flat:?}");
+    assert!(up[3] - up[1] > 3.0 * (up[2] - up[0]), "90°: tall {up:?}");
+    assert!(slant[3] - slant[1] > 1.5 * (flat[3] - flat[1]) && slant[2] - slant[0] < flat[2] - flat[0], "30°: {slant:?}");
+    // the note turned is still text (in its own order: the layout mode
+    // weaves a slanted line into the printed ones it crosses)
+    let src = tmp("turn-text.pdf");
+    std::fs::write(&src, with(Some(90.0), Some(15.0))).unwrap();
+    let out = Command::new("pdftotext").arg("-raw").arg(&src).arg("-").output().unwrap();
+    let t = String::from_utf8_lossy(&out.stdout);
+    assert!(t.contains("Gesehen am Montag"), "{t}");
+}

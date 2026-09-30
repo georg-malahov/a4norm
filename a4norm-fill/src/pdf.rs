@@ -36,7 +36,14 @@ fn overlay(layout: &Layout, page: u32, to_pdf: [f32; 6], glyphs: &GlyphRemapper,
     // from its foot
     for p in pictures.iter().filter(|p| p.page == page) {
         let [x0, y0, x1, y1] = p.at;
-        s += &format!("q {:.3} 0 0 {:.3} {x0:.3} {y1:.3} cm /{} Do Q\n", x1 - x0, -(y1 - y0), p.name);
+        s += "q ";
+        if p.angle != 0.0 {
+            // turned about its middle, clockwise as y runs down
+            let (sin, cos) = p.angle.sin_cos();
+            let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            s += &format!("1 0 0 1 {cx:.3} {cy:.3} cm {cos:.5} {sin:.5} {:.5} {cos:.5} 0 0 cm 1 0 0 1 {:.3} {:.3} cm ", -sin, -cx, -cy);
+        }
+        s += &format!("{:.3} 0 0 {:.3} {x0:.3} {y1:.3} cm /{} Do Q\n", x1 - x0, -(y1 - y0), p.name);
     }
     for m in &layout.marks {
         match m {
@@ -64,12 +71,14 @@ fn matrix(m: [f32; 6]) -> String {
     m.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" ")
 }
 
-/// A picture set over a page: its XObject's name and object, and where.
+/// A picture set over a page: its XObject's name and object, where, and
+/// turned how far clockwise (radians) about its middle.
 struct Picture {
     page: u32,
     name: String,
     id: ObjectId,
     at: [f32; 4],
+    angle: f32,
 }
 
 /// The pictures of `images` (PNG, JPEG) as image XObjects in `doc`, each
@@ -108,7 +117,8 @@ fn pictures(doc: &mut Document, places: &[crate::fill::ImagePlace], images: &[&[
         let (pw, ph) = (w as f32 * s, h as f32 * s);
         let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
         let at = [cx - pw / 2.0, cy - ph / 2.0, cx + pw / 2.0, cy + ph / 2.0];
-        out.push(Picture { page: place.page, name: format!("A4nImage{k}"), id, at });
+        let angle = place.rotate.filter(|d| d.rem_euclid(360.0) != 0.0).map_or(0.0, f32::to_radians);
+        out.push(Picture { page: place.page, name: format!("A4nImage{k}"), id, at, angle });
     }
     Ok(out)
 }

@@ -11,6 +11,7 @@ tests/out/
 # Rust build output
 a4norm-rs/target*/
 a4norm-geometry/target/
+a4norm-fill/target/
 a4norm-geometry/Cargo.lock
 web/dist/
 a4norm-rs/web/dist/

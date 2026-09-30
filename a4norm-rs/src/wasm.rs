@@ -31,6 +31,8 @@
 //!
 //! // after process: does a page look like a blank form? (offer "Fill in")
 //! const { empty, total } = looksLikeForm(r.pages[0]);   // { jpg, dpi }
+//! // its fields, to fill it in by hand (the fill module writes the PDF)
+//! const { lines, rects, combs, boxes } = formGeometry(r.pages[0]);
 //! ```
 
 use crate::{encode_page, io, parse_args, run, Source};
@@ -276,4 +278,39 @@ pub fn looks_like_form(page: JsValue) -> Result<Object, JsValue> {
         set(&out, k, &JsValue::from_f64(v as f64));
     }
     Ok(out)
+}
+
+/// The candidates of one of `process`'s pages, `{ jpg, dpi, sizePt? }`, for
+/// filling it in by hand (the free form mode, with the fill module):
+/// `{ sizePt, lines, rects, combs, boxes, typicalFieldHeight }`, each
+/// candidate with its `id` in reading order and `empty` (nothing written in
+/// it), a field with `label` where its printed label ends (the fill module
+/// sets a value below it), in points from the page's top left; the same candidates and ids as
+/// the OCR module's `formGeometry` gives (a4norm-geometry). `sizePt` is the
+/// page's: A4 by default when the page is A4-shaped, as the scanner's are,
+/// else its pixels at `dpi`.
+#[wasm_bindgen(js_name = formGeometry)]
+pub fn form_geometry(page: JsValue) -> Result<JsValue, JsValue> {
+    let jpg = Uint8Array::new(&get(&page, "jpg")).to_vec();
+    let dpi = get(&page, "dpi").as_f64().unwrap_or(200.0) as f32;
+    let src = io::decode(&jpg, "page").map_err(|e| JsValue::from_str(&e.0))?;
+    let img = image::RgbImage::from_raw(src.w as u32, src.h as u32, src.px).ok_or_else(|| JsValue::from_str("a4norm: page"))?;
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let given: Vec<f32> = match get(&page, "sizePt") {
+        v if Array::is_array(&v) => Array::from(&v).iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect(),
+        _ => vec![],
+    };
+    let size = match given[..] {
+        [sw, sh] => [sw, sh],
+        _ if ((w.max(h) / w.min(h)) / 2f32.sqrt() - 1.0).abs() < 0.01 => {
+            if w < h { [595.28, 841.89] } else { [841.89, 595.28] }
+        }
+        _ => [w * 72.0 / dpi, h * 72.0 / dpi],
+    };
+    let px_pt = w / size[0];
+    let g = a4norm_geometry::find(&img, px_pt, &[]);
+    let empty = a4norm_geometry::empty(&img, px_pt, &g);
+    let labels = a4norm_geometry::label_feet(&img, px_pt, &g);
+    let json = format!("{{\"sizePt\":[{:.2},{:.2}],{}}}", size[0], size[1], g.json_fields_empty(px_pt, &empty, &labels));
+    js_sys::JSON::parse(&json)
 }

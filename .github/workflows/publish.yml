@@ -111,6 +111,10 @@ jobs:
       - name: Rust tests
         run: cd a4norm-ocr && cargo test --release --locked
 
+      # the fill module's crate on its own (its font test; the rest runs above)
+      - name: Fill crate tests
+        run: cd a4norm-fill && cargo test --release --locked
+
   image:
     needs: test
     runs-on: ubuntu-latest
