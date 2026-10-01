@@ -6,6 +6,8 @@
 //! const r = fillPdf(JSON.stringify(request), pdfBytes, pagePictures, imageBytes);
 //! const r = fillScan(JSON.stringify(request), pageJpegs, imageBytes);
 //! // r: {pdf: Uint8Array, fallback, baseSize, placed}
+//! // several PDFs and scanned pages as one, the PDFs' pages as they are
+//! const pdf = mergePdf([{ pdf: a }, { jpg, dpi: 200 }, { pdf: b, pages: [2, 1] }], { title });
 //! ```
 
 use wasm_bindgen::prelude::*;
@@ -68,4 +70,43 @@ fn filled(layout: &crate::fill::Layout, out: crate::pdf::Output) -> Result<JsVal
     set("pdf", &js_sys::Uint8Array::from(out.pdf.as_slice()).into())?;
     set("fallback", &JsValue::from_bool(out.fallback))?;
     Ok(r)
+}
+
+/// Several PDFs and scanned pages as one PDF, the PDFs' pages as they are
+/// (`src/merge.rs`): `parts` are, in order, `{ pdf, pages? }` (pages from 1,
+/// chosen and ordered; all when absent) and `{ jpg, dpi?, turn?, widthMm?,
+/// heightMm? }` (a page of its own size, or its pixels at `dpi`, or A4;
+/// turned quarters clockwise). `opts.title` goes into the PDF's /Info.
+#[wasm_bindgen(js_name = mergePdf)]
+pub fn merge_pdf(parts: js_sys::Array, opts: Option<JsValue>) -> Result<js_sys::Uint8Array, JsError> {
+    let get = |o: &JsValue, k: &str| js_sys::Reflect::get(o, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED);
+    let num = |v: JsValue| v.as_f64().map(|x| x as f32);
+    let mut bytes: Vec<(Vec<u8>, JsValue)> = vec![];
+    for p in parts.iter() {
+        let pdf = get(&p, "pdf");
+        let src = if pdf.is_undefined() || pdf.is_null() { get(&p, "jpg") } else { pdf };
+        if src.is_undefined() || src.is_null() {
+            return Err(JsError::new(&format!("part {}: neither pdf nor jpg", bytes.len() + 1)));
+        }
+        bytes.push((js_sys::Uint8Array::new(&src).to_vec(), p));
+    }
+    let list: Vec<crate::merge::Part> = bytes
+        .iter()
+        .map(|(b, p)| {
+            if get(p, "pdf").is_undefined() || get(p, "pdf").is_null() {
+                let size = match (num(get(p, "widthMm")), num(get(p, "heightMm"))) {
+                    (Some(w), Some(h)) => Some([w, h]),
+                    _ => None,
+                };
+                crate::merge::Part::Jpeg { jpg: b, dpi: num(get(p, "dpi")), turn: num(get(p, "turn")).unwrap_or(0.0) as u8, size_mm: size }
+            } else {
+                let pages = get(p, "pages");
+                let pages = js_sys::Array::is_array(&pages).then(|| js_sys::Array::from(&pages).iter().filter_map(|v| v.as_f64()).map(|v| v as u32).collect());
+                crate::merge::Part::Pdf { pdf: b, pages }
+            }
+        })
+        .collect();
+    let title = opts.as_ref().and_then(|o| get(o, "title").as_string());
+    let out = crate::merge::merge(&list, title.as_deref()).map_err(|e| JsError::new(&e))?;
+    Ok(js_sys::Uint8Array::from(out.as_slice()))
 }
