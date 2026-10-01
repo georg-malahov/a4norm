@@ -500,8 +500,17 @@ change what this image may be used for.
    to 6% and blurred there anyway: six times cheaper, and within RMSE 0.01 of
    the full-resolution estimate.
 7. **Deskew** above 0.4°, under 5°, after the flat-field (before it, a dim photo
-   binarizes into one blob and a real tilt measures as 0.0°). Skipped after a
-   rectify, which already set the orientation.
+   binarizes into one blob and a real tilt measures as 0.0°). After a rectify
+   the page is **levelled by its lines of text** instead, and only when the lean
+   is the page's own:
+   - the slope is measured by the projection profile, on the upper and the lower
+     half apart;
+   - both halves must be clear and agree within 0.5°, the slope 0.3° to 5°;
+   - a lean left by perspective or a bent sheet differs from part to part, and
+     is left as is: one turn would set one part right and another wrong.
+
+   On the corpus this levels 3 pages of 33, each better, none worse: the landing
+   invoice 1.35° → 0.42°.
 8. **Neutralize the ink** — a photo tints black print warm. Everything goes
    neutral except pixels that are both high-chroma and dark: real coloured ink,
    any hue.

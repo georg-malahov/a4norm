@@ -1131,3 +1131,108 @@ mod tests {
         assert_eq!(py_round(1.6667), 2);
     }
 }
+
+/// The slope of a page's lines of text, in degrees (positive: down to the
+/// right), by the projection profile: the dark pixels summed along lines of
+/// each slope, the slope whose rows come out sharpest (the most energy in
+/// the profile) wins, searched to 5° in 0.25° steps, then to 0.02°.
+/// None without lines enough to tell, or no clear peak.
+pub fn line_skew(g: &Plane) -> Option<f64> {
+    // on a copy some 1000 px wide: lines, not letters
+    let k = (g.w as f64 / 1000.0).max(1.0);
+    let (w, h) = ((g.w as f64 / k) as usize, (g.h as f64 / k) as usize);
+    let small = if k > 1.0 { resize(g, w, h, Filter::Box) } else { g.clone() };
+    let mut s: Vec<f32> = small.d.iter().step_by(5).copied().collect();
+    s.sort_by(f32::total_cmp);
+    let paper = s[(s.len() - 1) * 9 / 10];
+    let thr = 0.55 * paper;
+    // dark pixels, a margin of 3 % left out (edges, shadows)
+    let (mx, my) = (w * 3 / 100, h * 3 / 100);
+    let mut pts: Vec<(f64, f64)> = vec![];
+    for y in my..h - my {
+        for x in mx..w - mx {
+            if small.d[y * w + x] < thr {
+                pts.push((x as f64 - w as f64 / 2.0, y as f64));
+            }
+        }
+    }
+    if pts.len() < w * h / 500 {
+        return None;
+    }
+    let energy = |deg: f64| {
+        let t = deg.to_radians().tan();
+        let off = (w as f64 / 2.0 * t.abs()).ceil() + 1.0;
+        let n = (h as f64 + 2.0 * off) as usize + 2;
+        let mut bins = vec![0f64; n];
+        for &(x, y) in &pts {
+            // a point's row along a line of this slope through the middle
+            let r = y - x * t + off;
+            let i = r.floor();
+            let f = r - i;
+            let i = i as usize;
+            bins[i] += 1.0 - f;
+            bins[i + 1] += f;
+        }
+        bins.iter().map(|b| b * b).sum::<f64>()
+    };
+    let search = |lo: f64, hi: f64, step: f64| {
+        let mut best = (lo, f64::MIN);
+        let mut a = lo;
+        while a <= hi + 1e-9 {
+            let e = energy(a);
+            if e > best.1 {
+                best = (a, e);
+            }
+            a += step;
+        }
+        best
+    };
+    let (coarse, peak) = search(-5.0, 5.0, 0.25);
+    // a clear peak: the profile sharper there than a degree and a half off,
+    // by 8 % (a page of lines; a guilloche or a photo has none)
+    let aside = energy(coarse - 1.5).max(energy(coarse + 1.5));
+    if peak < 1.08 * aside {
+        return None;
+    }
+    let (fine, _) = search(coarse - 0.3, coarse + 0.3, 0.02);
+    Some(fine)
+}
+
+#[cfg(test)]
+mod line_skew_tests {
+    use super::*;
+
+    /// Lines of words on paper, sloping `deg` (down to the right).
+    fn lines(deg: f64) -> Plane {
+        let (w, h) = (1200, 1600);
+        let mut p = Plane { w, h, d: vec![0.95; w * h] };
+        let t = deg.to_radians().tan();
+        for row in 0..30 {
+            let y0 = 100.0 + row as f64 * 45.0;
+            let mut x = 80usize;
+            while x < 1100 {
+                let len = 30 + (x * 7 + row * 13) % 50;
+                for xx in x..(x + len).min(1120) {
+                    let y = y0 + (xx as f64 - 600.0) * t;
+                    for yy in y as usize..y as usize + 12 {
+                        if yy < h {
+                            p.d[yy * w + xx] = 0.1;
+                        }
+                    }
+                }
+                x += len + 14;
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn the_slope_of_lines_of_text() {
+        for deg in [-1.2, -0.4, 0.0, 0.7, 2.5] {
+            let got = line_skew(&lines(deg)).expect("lines");
+            assert!((got - deg).abs() < 0.05, "{deg}: {got}");
+        }
+        // paper alone: nothing to tell
+        assert_eq!(line_skew(&Plane { w: 800, h: 1000, d: vec![0.95; 800_000] }), None);
+    }
+}
