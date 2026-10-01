@@ -13,6 +13,8 @@ pub mod img;
 pub mod io;
 pub mod ops;
 pub mod magic;
+pub mod mrz;
+pub mod size;
 pub mod page;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-threads"))]
 pub mod pool;
@@ -105,6 +107,9 @@ pub struct Opts {
     pub hand: Option<page::Hand>,
     /// --json: what was found on each photo and each page's geometry
     pub json: Option<String>,
+    /// --place / --size: the document at a width in mm, at its real size,
+    /// or over the page (size.rs); per source in the browser
+    pub place: Option<size::Place>,
 }
 
 impl Default for Opts {
@@ -173,6 +178,7 @@ impl Default for Opts {
             look: String::new(),
             hand: None,
             json: None,
+            place: None,
         }
     }
 }
@@ -184,7 +190,7 @@ pub const USAGE: &str = "usage: a4norm [-h] [-o OUTPUT] [--format {pdf,jpg}] [--
               [--rectify {auto,on,off}] [--photo {auto,on,off}] [--fit {auto,edges,content,frame}]
               [--margins MARGINS] [--dry-run] [--preview] [--magic]
               [--look {auto,magic,color,original}] [--quad X,Y,...] [--kind KIND]
-              [--json PATH] [tuning flags...]
+              [--json PATH] [--size {auto,real,fit}] [--place W[,X,Y]] [tuning flags...]
               INPUT [INPUT ...]
 
 Photo of a document -> scanner-like A4 PDF. The tuning flags are the Python
@@ -301,6 +307,21 @@ pub fn parse_args(args: &[String]) -> Result<Opts, Fail> {
             "--quad" => quad = Some(val),
             "--kind" => kind = Some(choice(&val, &["sheet", "receipt", "spread", "cards"])?),
             "--json" => o.json = Some(val),
+            "--size" => {
+                o.place = match choice(&val, &["auto", "real", "fit"])?.as_str() {
+                    "real" => Some(size::Place::Real),
+                    "fit" => Some(size::Place::Fit),
+                    _ => None,
+                }
+            }
+            "--place" => {
+                let v: Vec<f64> = val.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|_| err(format!("argument --place: W[,X,Y] in mm: '{}'", val)))?;
+                o.place = match v[..] {
+                    [w] if w > 0.0 => Some(size::Place::At { w, x: None, y: None }),
+                    [w, x, y] if w > 0.0 => Some(size::Place::At { w, x: Some(x), y: Some(y) }),
+                    _ => return Err(err(format!("argument --place: W[,X,Y] in mm: '{}'", val))),
+                }
+            }
             "--trim-band" => o.trim_band = f(&val)?,
             "--trim-step" => o.trim_step = f(&val)?,
             "--trim-pad" => o.trim_pad = n(&val)?.max(0) as usize,
@@ -359,20 +380,24 @@ pub struct Page {
     pub dpi: usize,
     pub geo: Geo,
     pub sources: Vec<usize>,
+    /// the document's size and where it lies on the page (size.rs)
+    pub layout: size::Layout,
 }
 
 /// A source: its name and its rasters (a photo is one; a PDF may be many).
-/// `look` and `hand` stand in for --look and --quad on this source alone.
+/// `look`, `hand` and `place` stand in for --look, --quad and --place on
+/// this source alone.
 pub struct Source {
     pub name: String,
     pub rasters: Vec<img::Src>,
     pub look: Option<String>,
     pub hand: Option<page::Hand>,
+    pub place: Option<size::Place>,
 }
 
 impl Source {
     pub fn new(name: String, rasters: Vec<img::Src>) -> Source {
-        Source { name, rasters, look: None, hand: None }
+        Source { name, rasters, look: None, hand: None, place: None }
     }
 }
 
@@ -412,8 +437,11 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
             out(&format!("  [{}/{}] {}", si + 1, n_src, basename(&s.name)));
         }
         let own;
-        let so = if s.look.is_some() || s.hand.is_some() {
+        let so = if s.look.is_some() || s.hand.is_some() || s.place.is_some() {
             let mut c = o.clone();
+            if s.place.is_some() {
+                c.place = s.place.clone();
+            }
             if let Some(l) = &s.look {
                 c.look = l.clone();
             }
@@ -460,11 +488,11 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
             photos[kk].1 = pno;
         }
         let first = &items[g[0]];
-        if let Processed::Page(PageOut { img, photo, dpi, geo }) = &first.res {
+        if let Processed::Page(PageOut { img, photo, dpi, geo, layout }) = &first.res {
             for line in &first.report {
                 out(&format!("    - {}", line));
             }
-            pages.push(Page { img: img.clone(), photo: *photo, dpi: *dpi, geo: geo.clone(), sources: g.clone() });
+            pages.push(Page { img: img.clone(), photo: *photo, dpi: *dpi, geo: geo.clone(), sources: g.clone(), layout: layout.clone() });
             continue;
         }
         let mut cards: Vec<&Card> = vec![];
@@ -475,7 +503,7 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
         }
         // the front goes on top; with two fronts or none, input order
         cards.sort_by_key(|c| !c.front);
-        let pg = page::card_page(&cards, o);
+        let (pg, rect) = page::card_page(&cards, o);
         for &kk in g {
             for line in &items[kk].report {
                 out(&format!("    - {}", line));
@@ -495,7 +523,20 @@ pub fn run(sources: Vec<Source>, o: &Opts, out: &mut dyn FnMut(&str), progress: 
         let mut key: Vec<String> = cards.iter().map(|c| c.geo.clone()).collect();
         key.push(format!("cards {} @{}", o.card_size, o.dpi));
         let geo = Geo { key: key.join("; "), look: cards[0].look, flat: "cards", lines: false };
-        pages.push(Page { img: pg, photo: false, dpi: o.dpi, geo, sources: g.clone() });
+        // ID-1 by the card's own shape, laid at real size unless --card-size
+        // fit; the cards' group is the document on the page
+        let px_mm = o.dpi as f64 / page::MM;
+        let mut sz = size::by_shape(detect::CARD_MM.0, detect::CARD_MM.1);
+        sz.candidates.retain(|c| c.kind != "id1");
+        sz.candidates.insert(0, size::Candidate { kind: "id1", mm: [detect::CARD_MM.0, detect::CARD_MM.1], confidence: 0.9 });
+        let sz = size::Size { kind: Some("id1"), mm: Some([detect::CARD_MM.0, detect::CARD_MM.1]), confidence: 0.9, by: "card", applied: o.card_size != "fit", ..sz };
+        let layout = size::Layout {
+            size: sz,
+            placed: rect.map(|v| v as f64 / px_mm),
+            content: (rect[2] as usize, rect[3] as usize),
+            sheet: (pg.w as f64 / px_mm, pg.h as f64 / px_mm),
+        };
+        pages.push(Page { img: pg, photo: false, dpi: o.dpi, geo, sources: g.clone(), layout });
     }
     Ok(Done { pages, photos })
 }
@@ -516,7 +557,7 @@ impl Done {
             .iter()
             .map(|p| {
                 format!(
-                    "{{\"dpi\":{},\"width\":{},\"height\":{},\"geom\":{{\"sources\":[{}],\"key\":\"{}\",\"look\":\"{}\",\"flat\":\"{}\",\"lines\":{}}}}}",
+                    "{{\"dpi\":{},\"width\":{},\"height\":{},\"geom\":{{\"sources\":[{}],\"key\":\"{}\",\"look\":\"{}\",\"flat\":\"{}\",\"lines\":{}}},{}}}",
                     p.dpi,
                     p.img.w,
                     p.img.h,
@@ -524,7 +565,8 @@ impl Done {
                     esc(&p.geo.key),
                     p.geo.look,
                     p.geo.flat,
-                    p.geo.lines
+                    p.geo.lines,
+                    p.layout.json_fields()
                 )
             })
             .collect();
