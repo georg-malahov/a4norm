@@ -157,6 +157,58 @@ On the public examples and the local corpus of 51 photos:
 deskew angle and the fit by the text block are measured after the cleaning.
 So on such a photo `original` can deskew differently, or not at all.
 
+## A document's real size, and where it lies: `size`, `placed`, `place`
+
+```js
+r.pages[i].size    // { kind, mm: [w, h] | null, confidence, by, applied, candidates: [{ kind, mm, confidence }] }
+r.pages[i].placed  // { x, y, w, h }: the document on the page, mm from its top left
+r.pages[i].content // { x, y, w, h, px: [w, h] }: the same, and the document's pixels
+r.pages[i].sheet   // { mm: [210, 297] | [297, 210] }
+// the document where the person puts it: process again with
+process([{ bytes, name, place: { w: 125, x: 42.5, y: 15 } }], args)   // mm
+process([{ bytes, name, place: { size: 'real' } }], args)              // or 'fit'
+```
+
+**A photo holds no physical size.** The focal length and the sensor give an angle per
+pixel, not the distance to the paper. So the size comes from what the document says of
+itself.
+
+- **`by: "mrz"`: its machine-readable zone.**
+  - The zone is found by its geometry, without reading (`src/mrz.rs`): two lines of 44
+    characters on a passport (TD3), two of 36 on a TD2, three of 30 on an ID-1 card.
+  - Its pitch is fixed at 2.54 mm a character. So the zone is a ruler: millimetres per
+    pixel, whatever the format.
+  - One line alone counts too (the other cut off by the frame), at the document's foot.
+  - A page the scanner leaves on its side is searched across as well.
+  - A whole zone is 0.95 sure, one line at the foot 0.9.
+  - `kind`, if within 8 % of a standard: `id3` (125×88), `id3-spread` (125×176), `td2`
+    (105×74), `id1`.
+- **`by: "card"`: an ID-1 card,** found by its rounded shape (the cards page, as before).
+- **`by: "aspect"`: proportions only.** They give `candidates`, never a decision: A4, A5,
+  A6, a passport's page and ID-2 all stand at 1.41–1.42. `candidates` always holds `id1`,
+  `id3`, `a5` and `a6`, best fit first, for the person to choose from.
+- **`by: "none"`:** a photo with no document.
+
+**Laid at real size by itself (`applied: true`)** only by a zone (0.9 sure or more) or a
+card. Then it goes on a portrait A4 (landscape when wider than 200 mm), in the middle
+across, 15 mm from the top. Anything else is laid over the page as before. A passport
+photographed close used to fill the A4; now it is 125 mm wide, as on a flatbed scanner.
+
+**`place`, per file.**
+- `{ size: "real" }` lays the document at the size found, or at the best candidate.
+- `{ size: "fit" }` lays it over the page.
+- `{ w, x?, y? }` lays it `w` mm wide (its height by its proportions), its top left at
+  `(x, y)`. Without `x` and `y` it goes in the middle across, 15 mm from the top.
+
+The page's key changes with it, as with corners set by hand. The command line has the same
+as `--size {auto,real,fit}` and `--place W[,X,Y]`.
+
+Measured on the local corpus, the examples and 20 more passport and card photos:
+- the 10 passports whose zone shows are laid at real size (the internal passport's spread
+  at 124×176 mm, nominal 125×176);
+- no zone is found where there is none;
+- every other page is byte for byte as before.
+
 ## Does a page look like a blank form? `looksLikeForm`
 
 ```js

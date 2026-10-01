@@ -714,8 +714,9 @@ pub fn process_cards(src: &Src, quads: &[Quad], why: &str, o: &Opts, report: &mu
     cards
 }
 
-/// One A4 with a card's front above its back, at their real size.
-pub fn card_page(cards: &[&Card], o: &Opts) -> Img {
+/// One A4 with a card's front above its back, at their real size; and the
+/// cards' group on it (x, y, w, h in pixels).
+pub fn card_page(cards: &[&Card], o: &Opts) -> (Img, [isize; 4]) {
     let dpi = o.dpi as f64;
     let pw = py_round(210.0 / MM * dpi) as usize;
     let ph = py_round(297.0 / MM * dpi) as usize;
@@ -729,6 +730,7 @@ pub fn card_page(cards: &[&Card], o: &Opts) -> Img {
     let total = cards.len() * ch_px + (cards.len() - 1) * gap;
     let mut y = (ph as isize - total as isize).div_euclid(2);
     let x = (pw as isize - cw_px as isize).div_euclid(2);
+    let rect = [x, y, cw_px as isize, total as isize];
     let mut page = Img::solid(pw, ph, [1.0; 3]);
     for c in cards {
         let r = c.img.resize_auto(cw_px, ch_px);
@@ -736,7 +738,7 @@ pub fn card_page(cards: &[&Card], o: &Opts) -> Img {
         y += (ch_px + gap) as isize;
     }
     page.q8();
-    page
+    (page, rect)
 }
 
 // ------------------------------------------------------ the photo passthrough
@@ -746,6 +748,8 @@ pub struct PageOut {
     pub photo: bool,
     pub dpi: usize,
     pub geo: Geo,
+    /// the document's size and where it lies on the page (size.rs)
+    pub layout: crate::size::Layout,
 }
 
 /// The photo path: geometry, and nothing else.
@@ -781,7 +785,14 @@ pub fn fit_photo_page(src: &Src, o: &Opts, report: &mut Vec<String>) -> PageOut 
         pw, ph, page_dpi
     ));
     let key = format!("photo {}x{}; fit {} {:+}{:+}; page {}x{} @{}", src.w, src.h, scale, off.0, off.1, pw, ph, page_dpi);
-    PageOut { img: page, photo: true, dpi: page_dpi, geo: Geo { key, look: "original", flat: "photo", lines: false } }
+    let px_mm = page_dpi as f64 / MM;
+    let layout = crate::size::Layout {
+        size: crate::size::Size { by: "none", ..crate::size::by_shape(iw, ih) },
+        placed: [off.0 as f64 / px_mm, off.1 as f64 / px_mm, scaled.w as f64 / px_mm, scaled.h as f64 / px_mm],
+        content: (src.w, src.h),
+        sheet: (pw as f64 / px_mm, ph as f64 / px_mm),
+    };
+    PageOut { img: page, photo: true, dpi: page_dpi, geo: Geo { key, look: "original", flat: "photo", lines: false }, layout }
 }
 
 const LOWRES_DPI: f64 = 180.0;
@@ -1433,12 +1444,63 @@ struct Fit {
     mode: String,
     dpi: usize,
     lowres: Option<f64>,
+    size: crate::size::Size,
 }
 
 fn choose_fit(job: &Job, rectified: bool, t: &Trim) -> Fit {
     let o = job.o;
     let (iw, ih) = (job.cur.w as f64, job.cur.h as f64);
     let mut page_dpi = o.dpi;
+    // the document's real size, where it says it (size.rs): a machine-
+    // readable zone on it (one line of it only at its foot, where a zone
+    // is); else its proportions, as candidates only
+    let gray = job.cur.gray();
+    let zone = crate::mrz::find(&gray)
+        .map(|m| {
+            let foot = m.bbox[3] as f64 > 0.7 * ih;
+            (m, foot)
+        })
+        // a page on its side (a spread the scanner leaves sideways): its
+        // zone runs down it, at one end, and its pitch is the same ruler
+        .or_else(|| crate::mrz::find(&crate::mrz::transposed(&gray)).map(|m| {
+            let end = m.bbox[3] as f64 > 0.7 * iw || (m.bbox[1] as f64) < 0.3 * iw;
+            (m, end)
+        }))
+        .filter(|(m, foot)| m.lines >= 2 || *foot);
+    let mut size = match zone {
+        Some((m, foot)) => crate::size::by_mrz(&m, iw, ih, foot),
+        None => crate::size::by_shape(iw, ih),
+    };
+    use crate::size::Place;
+    let real: Option<([f64; 2], Option<f64>, Option<f64>)> = match &o.place {
+        Some(Place::Fit) => None,
+        Some(Place::Real) => size.mm.or(size.candidates.first().map(|c| c.mm)).map(|m| (m, None, None)),
+        Some(Place::At { w, x, y }) => Some(([*w, w * ih / iw], *x, *y)),
+        None => (size.by == "mrz" && size.confidence >= 0.9 && o.fit == "auto").then_some(size.mm).flatten().map(|m| (m, None, None)),
+    };
+    if let Some(([mw, mh], x, y)) = real {
+        // on a portrait sheet unless it is too wide for one; across it in
+        // the middle, 15 mm from the top (or where the person put it)
+        let landscape = o.landscape || mw > 200.0;
+        let (mut pw, mut ph) = a4_px(page_dpi as f64);
+        if landscape {
+            std::mem::swap(&mut pw, &mut ph);
+        }
+        let px_mm = page_dpi as f64 / MM;
+        let (sw, sh) = (pw as f64 / px_mm, ph as f64 / px_mm);
+        let x = x.unwrap_or((sw - mw) / 2.0);
+        let y = y.unwrap_or(if mh + crate::size::TOP_MM <= sh { crate::size::TOP_MM } else { ((sh - mh) / 2.0).max(0.0) });
+        let scale = mw * px_mm / iw;
+        let by = match &o.place {
+            Some(Place::At { .. }) => "placed by hand".to_string(),
+            _ => {
+                size.applied = true;
+                format!("real size, {} {:.0}x{:.0} mm by {}", size.kind.or(size.candidates.first().map(|c| c.kind)).unwrap_or("?"), mw, mh, size.by)
+            }
+        };
+        let off = (py_round(x * px_mm), py_round(y * px_mm));
+        return Fit { pw, ph, scale, off, mode: format!("{by} ({:.1} mm wide at {:.1},{:.1} mm)", mw, x, y), dpi: page_dpi, lowres: None, size };
+    }
     let (mut pw, mut ph) = a4_px(page_dpi as f64);
     let turned = iw > ih * (1.0 + o.rotate_tol / 100.0) && !o.landscape;
     if o.landscape || turned {
@@ -1517,15 +1579,16 @@ fn choose_fit(job: &Job, rectified: bool, t: &Trim) -> Fit {
         page_dpi = 200;
         lowres = Some(f);
     }
-    Fit { pw, ph, scale, off, mode: mode.unwrap(), dpi: page_dpi, lowres }
+    Fit { pw, ph, scale, off, mode: mode.unwrap(), dpi: page_dpi, lowres, size }
 }
 
 /// `clean`: the paper is already white and the specks gone (the magic
 /// paper), so the paper screen and the despeckle have nothing to do.
 /// `sharp`: false for a page that gets no finishing (--look original).
-fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: bool, clean: bool, sharp: bool) -> (Img, usize) {
+fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: bool, clean: bool, sharp: bool) -> (Img, usize, crate::size::Layout) {
     let o = job.o;
     let f = choose_fit(job, rectified, t);
+    let content = (job.cur.w, job.cur.h);
     let over = keep.as_ref().and_then(|k| photo_patch(k, f.scale, f.off, o));
     let p: f64 = format!("{:.4}", f.scale * 100.0).parse().unwrap();
     // one channel at a time: scaled, sharpened, laid on the page, dropped
@@ -1557,6 +1620,17 @@ fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: b
         page.over(&patch, Some(&alpha), x, y);
         page.q8();
     }
+    match (f.size.by, &f.size.mm) {
+        ("mrz", Some(m)) => job.say(format!(
+            "size: {} {:.0}x{:.0} mm by its machine-readable zone ({:.0}% sure){}",
+            f.size.kind.unwrap_or("document"),
+            m[0],
+            m[1],
+            f.size.confidence * 100.0,
+            if f.size.applied { ", laid at real size" } else { "" }
+        )),
+        _ => {}
+    }
     job.say(format!("fit: {}; scale {:.4}, offset {:+}{:+}", f.mode, f.scale, f.off.0, f.off.1));
     job.geo(format!("fit {} {:+}{:+}; page {}x{} @{}", p, f.off.0, f.off.1, f.pw, f.ph, f.dpi));
     job.say(format!("page: {}x{}px @ {}dpi", f.pw, f.ph, f.dpi));
@@ -1568,7 +1642,14 @@ fn lay_out(job: &mut Job, rectified: bool, t: &Trim, keep: Option<Keep>, copy: b
             o.dpi
         ));
     }
-    (page, f.dpi)
+    let px_mm = f.dpi as f64 / MM;
+    let layout = crate::size::Layout {
+        size: f.size,
+        placed: [f.off.0 as f64 / px_mm, f.off.1 as f64 / px_mm, nw as f64 / px_mm, nh as f64 / px_mm],
+        content,
+        sheet: (f.pw as f64 / px_mm, f.ph as f64 / px_mm),
+    };
+    (page, f.dpi, layout)
 }
 
 pub enum Processed {
@@ -1830,7 +1911,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         crate::magic::mark("tone");
         step("tone");
     }
-    let (page, dpi) = lay_out(&mut job, rectified, &t, keep, copy, (magic && !copy) || orig, !orig);
+    let (page, dpi, layout) = lay_out(&mut job, rectified, &t, keep, copy, (magic && !copy) || orig, !orig);
     crate::magic::mark("lay out");
     step("page");
     *report = job.report;
@@ -1842,7 +1923,7 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         "color"
     };
     let geo = Geo { key: job.geo.join("; "), look, flat, lines: straight };
-    Ok((Processed::Page(PageOut { img: page, photo: false, dpi, geo }), seen))
+    Ok((Processed::Page(PageOut { img: page, photo: false, dpi, geo, layout }), seen))
 }
 
 #[cfg(test)]

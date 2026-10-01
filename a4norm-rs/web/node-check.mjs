@@ -53,3 +53,11 @@ for (const [what, page, want] of [["the demo form", form.pages[0], true], ["the 
   const ms = (performance.now() - t).toFixed(0);
   eq(offer(f), want, `looksLikeForm, ${what}: ${JSON.stringify(f)}, ${ms} ms`);
 }
+
+// A document's size and where it lies: each page says it, and `place` puts
+// it where the person wants it.
+const sized = m.process([{ name: "landing-invoice.webp", bytes: readFileSync(new URL("landing-invoice.webp", ex)), place: { w: 100, x: 20, y: 30 } }], args);
+const sp = sized.pages[0];
+eq(Math.round(sp.placed.w) + "," + Math.round(sp.placed.x) + "," + Math.round(sp.placed.y), "100,20,30", `place {w: 100, x: 20, y: 30}: placed ${JSON.stringify(sp.placed)}`);
+eq(["id1", "id3", "a5", "a6"].every((k) => pg.size.candidates.some((c) => c.kind === k)) && pg.size.by === "aspect" && !pg.size.applied, true, `size of the invoice: ${pg.size.by}, ${pg.size.candidates.length} candidates`);
+eq(sized.pages[0].geom.key !== pg.geom.key, true, "place moves the key");

@@ -9,6 +9,9 @@
 //! //       report: "photo-0.jpg\n  page 1:\n    - ..." }
 //! // a file may carry its own look and corners set by hand (docs/api.md):
 //! //   { bytes, name, look: 'magic', quad: Float64Array, kind: 'spread' }
+//! // and where its document goes on the page, in mm (docs/api.md, size):
+//! //   { bytes, name, place: { w: 125, x: 42.5, y: 15 } }  or  place: { size: 'real' }
+//! // each page: { jpg, dpi, geom, size, placed, content, sheet }
 //! const pdf = pack(jpgs, dpis, gray);
 //! // pages turned without touching their JPEGs: quarter turns clockwise each
 //! const turnedPdf = pack(jpgs, dpis, gray, new Int32Array([0, 1, 0, 2]));
@@ -85,6 +88,17 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
             let kind = get(&f, "kind").as_string();
             s.hand = Some(crate::page::Hand::new(&v, kind.as_deref()).map_err(|e| JsValue::from_str(&format!("a4norm: {}: quad: {}", s.name, e)))?);
         }
+        // place: { w, x?, y? } in mm, or { size: "real" | "fit" } (size.rs)
+        let place = get(&f, "place");
+        if !place.is_undefined() && !place.is_null() {
+            let mm = |k: &str| get(&place, k).as_f64();
+            s.place = Some(match (get(&place, "size").as_string().as_deref(), mm("w")) {
+                (Some("real"), _) => crate::size::Place::Real,
+                (Some("fit"), _) => crate::size::Place::Fit,
+                (_, Some(w)) if w > 0.0 => crate::size::Place::At { w, x: mm("x"), y: mm("y") },
+                _ => return Err(JsValue::from_str(&format!("a4norm: {}: place: {{ w, x?, y? }} in mm or {{ size: \"real\" | \"fit\" }}", s.name))),
+            });
+        }
         sources.push(s);
     }
     argv.extend(names.iter().cloned());
@@ -121,6 +135,12 @@ pub fn process(files: Array, args: Array, progress: Option<Function>) -> Result<
         set(&geom, "width", &num(p.img.w));
         set(&geom, "height", &num(p.img.h));
         set(&page, "geom", &geom);
+        // size, placed, content, sheet (size.rs): the document's size and
+        // where it lies on the page
+        let fields = js_sys::JSON::parse(&format!("{{{}}}", p.layout.json_fields()))?;
+        for k in ["size", "placed", "content", "sheet"] {
+            set(&page, k, &get(&fields, k));
+        }
         out.push(&page);
     }
     let photos = Array::new();
