@@ -705,6 +705,14 @@ three of the four cost real content:
 
 ## Determinism
 
+**Since the Rust port this holds for Linux/amd64, not for every architecture.**
+The light image built for Linux/arm64 (Docker on an Apple-silicon Mac) fails the
+amd64 goldens on two public examples, notebook-photo (MAE 6.3) and white-on-white
+(MAE 9.2, against a tolerance of 4). The other examples match exactly. CI runs
+amd64, and the browser runs WASM, whose arithmetic does not depend on the CPU,
+though the WASM build has not been compared against amd64 on these two
+examples. Issue #58 tracks it. What follows was measured before the port.
+
 The same input gives the same bytes out on macOS/arm64, Linux/arm64 and
 Linux/amd64 — verified by SHA-256 on a 12 MP HEIC, and the thread count does
 not enter into it either (identical at 1, 2, 4 and 8). **Within one image.**
