@@ -1383,10 +1383,19 @@ fn keep_face_photo(job: &mut Job, spread: bool) -> Option<Keep> {
     keep_of(&job.cur, bx)
 }
 
-fn deskew(job: &mut Job, t: &mut Trim, keep: Option<Keep>) -> Option<Keep> {
+/// A rectified page is levelled too: the quad's corners, found or set by
+/// hand, leave the lines a little off (0.3-1.6° on the corpus), and from
+/// 0.3° it shows.
+const RECTIFIED_DESKEW_MIN: f64 = 0.3;
+
+fn deskew(job: &mut Job, t: &mut Trim, keep: Option<Keep>, rectified: bool) -> Option<Keep> {
     let o = job.o;
+    if rectified {
+        return level_rectified(job, keep);
+    }
     let ang = d::deskew_angle(&job.cur);
-    if !(o.deskew_min <= ang.abs() && ang.abs() <= 5.0) {
+    let min = o.deskew_min;
+    if !(min <= ang.abs() && ang.abs() <= 5.0) {
         job.say(format!("skew {:+.2}° — left as is", ang));
         return keep;
     }
@@ -1431,6 +1440,49 @@ fn deskew(job: &mut Job, t: &mut Trim, keep: Option<Keep>) -> Option<Keep> {
     job.geo(format!("deskew {} -> {}x{} at {:+}{:+}", deg, job.cur.w, job.cur.h, job.page.0, job.page.1));
     if keep.is_some() {
         job.say("face photo left to the page treatment: the page was deskewed after the photo was cut out".into());
+        return None;
+    }
+    keep
+}
+
+/// A rectified page levelled by its lines of text (ops::line_skew), when
+/// the lean is the page's own: its upper and lower halves measured apart
+/// agree within 0.5°. A lean left by perspective or a bent sheet differs
+/// from part to part, and one turn would set one part right and another
+/// wrong. From 0.3° to 5°, turned about the middle on a canvas of the
+/// page's size, white where the turn brings in what was outside.
+fn level_rectified(job: &mut Job, keep: Option<Keep>) -> Option<Keep> {
+    let g = job.cur.gray();
+    let half = g.h / 2;
+    let part = |y0: usize, y1: usize| ops::Plane { w: g.w, h: y1 - y0, d: g.d[y0 * g.w..y1 * g.w].to_vec() };
+    let (top, bottom) = (ops::line_skew(&part(0, half)), ops::line_skew(&part(half, g.h)));
+    let slope = match (top, bottom) {
+        (Some(a), Some(b)) if (a - b).abs() <= 0.5 => (a + b) / 2.0,
+        (Some(a), Some(b)) => {
+            job.say(format!("lines lean {:+.2}° above and {:+.2}° below: not the page's own lean, left as is", a, b));
+            return keep;
+        }
+        _ => {
+            job.say("lines of text not clear enough to level the page by".into());
+            return keep;
+        }
+    };
+    if !(RECTIFIED_DESKEW_MIN..=5.0).contains(&slope.abs()) {
+        job.say(format!("lines at {:+.2}° — left as is", slope));
+        return keep;
+    }
+    let (w, h) = (job.cur.w, job.cur.h);
+    let (r, px, py) = img::rotate_fit(&job.cur, -slope);
+    // the turned page cut back to its size about its middle
+    let (x0, y0) = ((r.w - w) / 2, (r.h - h) / 2);
+    let mut c = r.crop(x0, y0, w, h);
+    c.q8();
+    job.cur = c;
+    let _ = (px, py);
+    job.say(format!("levelled by its lines of text: turned {:+.2}°", -slope));
+    job.geo(format!("level {:.2}", -slope));
+    if keep.is_some() {
+        job.say("face photo left to the page treatment: the page was levelled after the photo was cut out".into());
         return None;
     }
     keep
@@ -1873,8 +1925,8 @@ pub fn process_page(src: Src, o: &Opts, report: &mut Vec<String>, step: Progress
         crate::magic::mark("flat / divide paper");
         step("flat");
     }
-    if !o.no_deskew && !rectified {
-        keep = deskew(&mut job, &mut t, keep);
+    if !o.no_deskew {
+        keep = deskew(&mut job, &mut t, keep, rectified);
     }
     if o.gray {
         let g = job.cur.gray();
