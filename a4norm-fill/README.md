@@ -38,6 +38,29 @@ const { pdf } = fillScan(request, [r.pages[0].jpg], [signaturePng]);   // or fil
   Turned, the picture is still the one image and the text is still text. Without `rotate`
   the PDF is as before, byte for byte.
 
+## Several PDFs as one: `mergePdf`
+
+```js
+const pdf = mergePdf([{ pdf: invoice1 }, { jpg, dpi: 200 }, { pdf: invoice2, pages: [2, 1] }], { title: "Belege 2026" });
+```
+
+- A PDF's pages are copied as they are: vector, their text selectable, nothing
+  rasterized or compressed anew. `pages` (from 1) chooses them and their order.
+- A scanned page is its JPEG, untouched, on a page of `widthMm` × `heightMm`, or its
+  pixels at `dpi`, or A4 the picture's way round. It is turned `turn` quarters clockwise
+  by `/Rotate`.
+- A PDF encrypted without a user password is decrypted (the Familienkasse's forms,
+  Bavaria's Wohngeld); one that needs a password is an error naming its part.
+- What a page inherited from its file's page tree (resources, boxes, rotation) is set on
+  it.
+- A file's form (AcroForm), outline and names are left out: forms from several files would
+  clash by their fields' names. The fields' widgets stay on their pages as they look.
+
+On the demo (plain, encrypted, with a form), its phone scan and KG 1 p. 3 and 2, every page
+of the merged PDF renders pixel for pixel as in its source (`tests/merge.rs`). The file is
+the parts' own objects, pruned: 1.28 MB for those six pages, out of 2.06 MB of sources
+(KG 1 whole).
+
 ## Build
 
 ```sh

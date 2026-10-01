@@ -246,14 +246,14 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) ->
     save(doc)
 }
 
-fn save(mut doc: Document) -> Result<Vec<u8>, String> {
+pub(crate) fn save(mut doc: Document) -> Result<Vec<u8>, String> {
     let mut out = vec![];
     doc.save_to(&mut out).map_err(|e| e.to_string())?;
     Ok(out)
 }
 
 /// Width, height and components of a baseline or progressive JPEG.
-fn jpeg_info(d: &[u8]) -> Option<(u32, u32, u8)> {
+pub(crate) fn jpeg_info(d: &[u8]) -> Option<(u32, u32, u8)> {
     if d.get(..2)? != [0xFF, 0xD8] {
         return None;
     }
@@ -275,7 +275,7 @@ fn jpeg_info(d: &[u8]) -> Option<(u32, u32, u8)> {
 }
 
 /// A page's box: its own or inherited from the page tree.
-fn inherited<'a>(doc: &'a Document, page: ObjectId, key: &[u8]) -> Option<&'a Object> {
+pub(crate) fn inherited<'a>(doc: &'a Document, page: ObjectId, key: &[u8]) -> Option<&'a Object> {
     let mut id = page;
     loop {
         let d = doc.get_dictionary(id).ok()?;
