@@ -23,9 +23,11 @@
 //! - Under the mask the ink keeps its colour, divided channel by channel by
 //!   the light round it (a faded letter in the shadow comes back to its
 //!   contrast, and a second pass does not put the paper's tone on twice),
-//!   a pixel round it half so, and the rest is the paper's own tone: the brightest
-//!   third of what lies round the mask (a cream sheet stays cream, white
-//!   stays white). Outside the mask nothing changes.
+//!   a pixel round it half so, and the rest is the paper's own tone (a
+//!   cream sheet stays cream, white stays white), running on from the paper
+//!   round the mask: a plane fitted to it, shadows round the mask left out,
+//!   so a vignette or a page lit from one side leaves no step at the box's
+//!   edge. Outside the mask nothing changes.
 //!
 //! Where the light round a pixel is coloured, read 3.6 mm wide, or the pixel
 //! itself is brown or orange, it is a desk, not paper, and goes white with
@@ -54,6 +56,12 @@ const PAPER_TINT: f32 = 0.2;
 /// round it, is ink whatever its width.
 const COLOUR: f32 = 0.16;
 const COLOUR_DARK: f32 = 0.75;
+/// The cells the paper's plane is fitted to, mm; how often it is fitted
+/// again with the cells far off it let go (3 robust deviations, at least
+/// PLANE_SHADOW).
+const CELL_MM: f64 = 2.0;
+const PLANE_ROUNDS: usize = 4;
+const PLANE_SHADOW: f32 = 0.03;
 /// A ground no more coloured than this against the paper is paper.
 const GROUND: f32 = 0.12;
 /// The ground's colour is read this many times wider than a stroke's reach.
@@ -190,6 +198,10 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             !ink[i] && (x.saturating_sub(1)..(x + 2).min(rw)).any(|xx| (y.saturating_sub(1)..(y + 2).min(rh)).any(|yy| ink[yy * rw + xx]))
         })
         .collect();
+    // the paper under the mask runs on from the paper round it: a plane
+    // fitted to it (a vignette, a page lit from one side), shadows round
+    // the mask left out; one tone where there is too little round it
+    let plane = paper_plane(img, mask, (x0, y0, x1, y1), (CELL_MM * px_mm).round().max(4.0) as usize);
     let (mut masked, mut kept) = (0usize, 0usize);
     for yy in 0..rh {
         for xx in 0..rw {
@@ -204,7 +216,11 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             // shadow too); on a dark ground (a desk's black edge) kept as it is
             let lit = bg.d[j] >= 0.5;
             for (k, p) in img.c.iter_mut().enumerate() {
-                let (v, t) = (p.d[i], paper[k.min(2)]);
+                let t = match &plane {
+                    Some(f) => f.at(k.min(2), x, y),
+                    None => paper[k.min(2)],
+                };
+                let v = p.d[i];
                 let b = if lit { near_bg[k].d[j].max(0.05) } else { 1.0 };
                 // (on a dark ground, or inside a stroke wider than the
                 // reach, kept as it is: the paper's tone is not put on twice)
@@ -402,6 +418,93 @@ fn drop_specks(ink: &mut [bool], rel: &[f32], grey: &[bool], w: usize, h: usize,
             }
         }
     }
+}
+
+/// The paper's tone across the region as a plane per channel, from cells
+/// `cell` px across round the mask (what is not masked): each cell's tone is
+/// the median of its brightest third, and cells far off the plane, against
+/// how far the others are (a shadow round the mask), are let go. Held
+/// within the tones it was fitted to, so it does not run off past them. (A
+/// quadratic follows a round vignette better in theory, but a thin ring
+/// round the mask swings it.)
+struct Plane3 {
+    c: [[f64; 3]; 3],
+    lo: [f32; 3],
+    hi: [f32; 3],
+}
+
+impl Plane3 {
+    fn at(&self, k: usize, x: usize, y: usize) -> f32 {
+        let c = self.c[k];
+        ((c[0] + c[1] * x as f64 + c[2] * y as f64) as f32).clamp(self.lo[k], self.hi[k])
+    }
+}
+
+fn paper_plane(img: &Img, mask: &[bool], (x0, y0, x1, y1): (usize, usize, usize, usize), cell: usize) -> Option<Plane3> {
+    let w = img.w;
+    let ch = |k: usize| &img.c[k.min(img.c.len() - 1)].d;
+    // (x, y, tone) of each cell round the mask
+    let mut cells: Vec<(f64, f64, [f32; 3])> = vec![];
+    for cy in (y0..y1).step_by(cell) {
+        for cx in (x0..x1).step_by(cell) {
+            let mut px: Vec<(f32, usize)> = (cy..(cy + cell).min(y1)).flat_map(|y| (cx..(cx + cell).min(x1)).map(move |x| y * w + x)).filter(|&i| !mask[i]).map(|i| (ch(0)[i] + ch(1)[i] + ch(2)[i], i)).collect();
+            if px.len() * 3 < cell * cell {
+                continue;
+            }
+            px.sort_by(|a, b| b.0.total_cmp(&a.0));
+            px.truncate(px.len().div_ceil(3));
+            let t = std::array::from_fn(|k| {
+                let mut v: Vec<f32> = px.iter().map(|&(_, i)| ch(k)[i]).collect();
+                v.sort_by(f32::total_cmp);
+                v[v.len() / 2]
+            });
+            let n = px.len() as f64;
+            let (sx, sy) = px.iter().fold((0.0, 0.0), |(a, b), &(_, i)| (a + (i % w) as f64 / n, b + (i / w) as f64 / n));
+            cells.push((sx, sy, t));
+        }
+    }
+    // a plane needs cells spread both ways (round the mask, not a strip
+    // along one side of it)
+    let span = |f: fn(&(f64, f64, [f32; 3])) -> f64| cells.iter().map(f).fold(f64::MAX, f64::min)..cells.iter().map(f).fold(f64::MIN, f64::max);
+    let (sx, sy) = (span(|c| c.0), span(|c| c.1));
+    if cells.len() < 6 || (sx.end - sx.start).min(sy.end - sy.start) < 4.0 * cell as f64 {
+        return None;
+    }
+    let mut wgt = vec![1f64; cells.len()];
+    let mut c = [[0f64; 3]; 3];
+    for _ in 0..PLANE_ROUNDS {
+        for (k, ck) in c.iter_mut().enumerate() {
+            // weighted least squares: tone = a + b x + c y
+            let mut m = vec![vec![0f64; 3]; 3];
+            let mut r = vec![0f64; 3];
+            for (&(x, y, t), &g) in cells.iter().zip(&wgt) {
+                let f = [1.0, x, y];
+                for i in 0..3 {
+                    for j in 0..3 {
+                        m[i][j] += g * f[i] * f[j];
+                    }
+                    r[i] += g * f[i] * t[k] as f64;
+                }
+            }
+            *ck = crate::img::solve(m, r).map(|v| [v[0], v[1], v[2]]).unwrap_or([0.0; 3]);
+        }
+        // a cell far off the plane, against how far the others are, is a
+        // shadow round the mask (or a light patch); a vignette is the plane
+        let off: Vec<f64> = cells.iter().map(|&(x, y, t)| (0..3).map(|k| (c[k][0] + c[k][1] * x + c[k][2] * y - t[k] as f64).abs()).fold(0.0, f64::max)).collect();
+        let mut sorted = off.clone();
+        sorted.sort_by(f64::total_cmp);
+        let lim = (3.0 * 1.4826 * sorted[sorted.len() / 2]).max(PLANE_SHADOW as f64);
+        for (g, &o) in wgt.iter_mut().zip(&off) {
+            *g = if o > lim { 0.02 } else { 1.0 };
+        }
+    }
+    let kept: Vec<&[f32; 3]> = cells.iter().zip(&wgt).filter(|(_, &g)| g >= 0.5).map(|(c, _)| &c.2).collect();
+    if kept.len() < 3 {
+        return None;
+    }
+    let lo = std::array::from_fn(|k| kept.iter().map(|t| t[k]).fold(f32::MAX, f32::min));
+    let hi = std::array::from_fn(|k| kept.iter().map(|t| t[k]).fold(f32::MIN, f32::max));
+    Some(Plane3 { c, lo, hi })
 }
 
 /// Max then min over a (2r+1)-square window: a grey closing, separable.
@@ -835,5 +938,33 @@ mod tests {
             // (the rim round each stroke goes half way to paper: half is kept)
             assert!(after * 2 >= before, "{name}: {after} of {before} pixels of print kept");
         }
+    }
+
+    #[test]
+    fn the_paper_runs_on_under_the_box() {
+        // paper lit from one side, 0.70 at the left to 0.95 at the right, a
+        // line of print, and a box across the middle: the paper under it
+        // meets the paper round it at both ends, no lighter step
+        let (w, h) = (800, 300);
+        let tone = |x: usize| 0.70 + 0.25 * x as f32 / (w - 1) as f32;
+        let mut c: Vec<Vec<f32>> = (0..3).map(|_| (0..w * h).map(|i| tone(i % w)).collect()).collect();
+        for k in 0..30 {
+            for y in 140..160 {
+                for x in 150 + k * 18..153 + k * 18 {
+                    for p in c.iter_mut() {
+                        p[y * w + x] = 0.1;
+                    }
+                }
+            }
+        }
+        let mut img = Img::from_planes(c.into_iter().map(|d| Plane { w, h, d }).collect());
+        let mask: Vec<bool> = (0..w * h).map(|i| (100..700).contains(&(i % w)) && (60..240).contains(&(i / w))).collect();
+        clean_area(&mut img, &mask, 200.0);
+        let g = img.gray();
+        for x in [104, 400, 695] {
+            let (inside, outside) = (g.d[100 * w + x], tone(x));
+            assert!((inside - outside).abs() < 0.03, "at x {x}: {inside} under the box, {outside} round it");
+        }
+        assert!(g.d[150 * w + 151] < 0.3, "print: {}", g.d[150 * w + 151]);
     }
 }

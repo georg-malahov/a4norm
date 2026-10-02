@@ -259,9 +259,12 @@ fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
   Full stops, commas, the dots on i and ä are as dark as the print and stay.
 - **The ink kept is divided by the light round it** where that is paper, so a faded letter
   in the shadow comes back to its contrast. A pixel round each stroke is kept half.
-  Everything else under the mask takes the paper's own tone, the brightest third of what
-  lies round the mask (a cream sheet stays cream, a white one white). Nothing outside the
-  mask changes.
+  Everything else under the mask takes the paper's own tone (a cream sheet stays cream, a
+  white one white). It runs on from the paper round the mask: a plane per channel fitted
+  to it, read in 2 mm cells (the median of each cell's brightest third). Cells far off the
+  plane, such as a shadow round the mask, are left out. So a vignette or a page lit from
+  one side leaves no light step at the box's edge. With too little round the mask (a box
+  along one side of it only), one tone. Nothing outside the mask changes.
 - **What a fold bleached to the shadow's own tone is not in the pixels any more.** It is
   left white. Show the result at once, with undo.
 
@@ -277,6 +280,11 @@ specks along the fold went (13 % and 26 % of what was kept as ink before). Every
 colon, comma, umlaut and full stop stayed, and every dashed rule, including one faded to
 light grey and one photographed 7° askew; lost was one 1 mm piece of a dash 6 mm from the
 rest of its rule. A second pass changes nothing.
+
+A box across a vignette (a made-up page photographed with its edge dark, paper 0.68 there
+and 0.78 in the middle): before, the paper under the box was one tone, 0.83, a light
+rectangle at the dark edge; now it meets the paper round it within 0.01–0.02. White and
+evenly lit pages are within 5 levels of before (a receipt: byte for byte the same).
 
 A signed page (the site's synthetic one: a blue felt-pen stroke 1.3 mm wide, a bold blue
 name, a filled "a", grey small print, a shadow band behind them; white `#fbfbf8` and beige
