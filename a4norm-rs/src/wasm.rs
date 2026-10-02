@@ -36,6 +36,8 @@
 //! const { empty, total } = looksLikeForm(r.pages[0]);   // { jpg, dpi }
 //! // its fields, to fill it in by hand (the fill module writes the PDF)
 //! const { lines, rects, combs, boxes } = formGeometry(r.pages[0]);
+//! // the brush: the shadow under a mask goes white, the print stays
+//! const jpg3 = cleanArea(r.pages[0], maskBytes);   // w*h bytes or RGBA
 //! ```
 
 use crate::{encode_page, io, parse_args, run, Source};
@@ -333,4 +335,29 @@ pub fn form_geometry(page: JsValue) -> Result<JsValue, JsValue> {
     let labels = a4norm_geometry::label_feet(&img, px_pt, &g);
     let json = format!("{{\"sizePt\":[{:.2},{:.2}],{}}}", size[0], size[1], g.json_fields_empty(px_pt, &empty, &labels));
     js_sys::JSON::parse(&json)
+}
+
+/// Paper cleaned by hand under `mask` (src/clean.rs): a grey shadow behind
+/// the print (a receipt's fold, a desk) goes white, the print stays. `page`
+/// is one of `process`'s pages, `{ jpg, dpi }`; `mask` covers its pixels,
+/// one byte each (non-zero: clean) or RGBA (alpha non-zero). Returns the
+/// page's JPEG again, at `quality` (default 88); nothing outside the mask
+/// changes but for the JPEG's own rounding.
+#[wasm_bindgen(js_name = cleanArea)]
+pub fn clean_area(page: JsValue, mask: &[u8], quality: Option<u8>) -> Result<Uint8Array, JsValue> {
+    let jpg = Uint8Array::new(&get(&page, "jpg")).to_vec();
+    let dpi = get(&page, "dpi").as_f64().unwrap_or(200.0);
+    let src = io::decode(&jpg, "page").map_err(|e| JsValue::from_str(&e.0))?;
+    let n = src.w * src.h;
+    let m: Vec<bool> = if mask.len() == n {
+        mask.iter().map(|&v| v != 0).collect()
+    } else if mask.len() == 4 * n {
+        mask.chunks_exact(4).map(|p| p[3] != 0).collect()
+    } else {
+        return Err(JsValue::from_str(&format!("a4norm: cleanArea: the mask is {} bytes; the page is {}x{} (w*h or w*h*4)", mask.len(), src.w, src.h)));
+    };
+    let mut img = crate::img::Img::from_rgb8(&src.px, src.w, src.h);
+    crate::clean::clean_area(&mut img, &m, dpi);
+    img.q8();
+    Ok(Uint8Array::from(io::encode_jpeg(&img, quality.unwrap_or(88), false, dpi as usize).as_slice()))
 }

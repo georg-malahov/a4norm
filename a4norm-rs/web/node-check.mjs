@@ -61,3 +61,20 @@ const sp = sized.pages[0];
 eq(Math.round(sp.placed.w) + "," + Math.round(sp.placed.x) + "," + Math.round(sp.placed.y), "100,20,30", `place {w: 100, x: 20, y: 30}: placed ${JSON.stringify(sp.placed)}`);
 eq(["id1", "id3", "a5", "a6"].every((k) => pg.size.candidates.some((c) => c.kind === k)) && pg.size.by === "aspect" && !pg.size.applied, true, `size of the invoice: ${pg.size.by}, ${pg.size.candidates.length} candidates`);
 eq(sized.pages[0].geom.key !== pg.geom.key, true, "place moves the key");
+
+// The brush: under a mask the shadow goes white and the print stays;
+// nothing outside the mask changes.
+{
+  const page = pg; // the invoice
+  const sizeOf = (jpg) => { let i = 2; while (i < jpg.length) { const m = jpg[i + 1], len = (jpg[i + 2] << 8) | jpg[i + 3]; if (m >= 0xc0 && m <= 0xc3) return [(jpg[i + 7] << 8) | jpg[i + 8], (jpg[i + 5] << 8) | jpg[i + 6]]; i += 2 + len; } };
+  const [w, h] = sizeOf(page.jpg);
+  const mask = new Uint8Array(w * h);
+  for (let y = Math.floor(h * 0.3); y < Math.floor(h * 0.5); y++) mask.fill(1, y * w, (y + 1) * w);
+  const t = performance.now();
+  const out = m.cleanArea(page, mask);
+  const ms = Math.round(performance.now() - t);
+  eq(sizeOf(out).join("x"), `${w}x${h}`, `cleanArea over a fifth of the invoice: a JPEG of the page, ${out.length} bytes, ${ms} ms`);
+  let bad = null;
+  try { m.cleanArea(page, new Uint8Array(10)); } catch (e) { bad = String(e); }
+  eq(/mask is 10 bytes/.test(bad), true, "a mask of the wrong size is refused");
+}

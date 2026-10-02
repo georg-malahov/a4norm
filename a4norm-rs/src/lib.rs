@@ -6,6 +6,7 @@
 // Index loops read as the pixel arithmetic they are.
 #![allow(clippy::needless_range_loop)]
 
+pub mod clean;
 pub mod detect;
 pub mod edit;
 pub mod finish;
