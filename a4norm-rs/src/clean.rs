@@ -11,20 +11,27 @@
 //! - Ink where that is over the region's own noise (a robust spread of the
 //!   black-hat there, times 4, at least 4 % of white).
 //! - A part of that ink thicker than 1 mm across is no stroke: the rim of
-//!   something wide; it goes. Anything near black stays whatever its width
-//!   (a logo, a bar): no shadow on paper is that dark.
+//!   something wide; it goes. When only its faint rest is thick (small
+//!   print joined into one blob by its soft rim, a shadow's grain grown
+//!   onto letters), only that rest goes and the print stays. Anything near
+//!   black stays whatever its width (a logo, a bar): no shadow on paper is
+//!   that dark; and so does coloured ink well darker than the paper (a felt
+//!   pen, bold blue print, a filled loop, a stamp): no shadow is coloured.
 //! - Dust goes: the grey specks a shadow's grain leaves (a thermal
 //!   receipt's fold), lighter than the print, small, grey and in no line
 //!   and no dash (`drop_specks`). A second pass found them again before.
-//! - Under the mask the ink keeps its colour, divided by the light round
-//!   it (a faded letter in the shadow comes back to its contrast), a pixel
-//!   round it half so, and the rest is the paper's own tone: the brightest
+//! - Under the mask the ink keeps its colour, divided channel by channel by
+//!   the light round it (a faded letter in the shadow comes back to its
+//!   contrast, and a second pass does not put the paper's tone on twice),
+//!   a pixel round it half so, and the rest is the paper's own tone: the brightest
 //!   third of what lies round the mask (a cream sheet stays cream, white
 //!   stays white). Outside the mask nothing changes.
 //!
-//! Where the light round a pixel is coloured, or the pixel itself is brown
-//! or orange, it is a desk, not paper, and goes white with the shadow (no
-//! print on paper is brown; a blue pen or a red stamp keeps its colour).
+//! Where the light round a pixel is coloured, read 3.6 mm wide, or the pixel
+//! itself is brown or orange, it is a desk, not paper, and goes white with
+//! the shadow (no print on paper is brown; a blue pen or a red stamp keeps
+//! its colour). Colours are told against the paper's own tone: a beige or
+//! cream sheet, or a warm light on a white one, is paper.
 //!
 //! What a fold has bleached to the shadow's own tone is not in the pixels
 //! any more; it is left white. The site shows the result at once, to undo.
@@ -40,6 +47,17 @@ const STROKE_MM: f64 = 1.0;
 /// black bar): no shadow on paper is near black. A brown desk is not grey.
 const BLACK: f32 = 0.4;
 const GREY: f32 = 0.08;
+/// A paper tone no more coloured than this (beige, cream) is what colours
+/// are told against.
+const PAPER_TINT: f32 = 0.2;
+/// Ink this coloured against the paper, and this much darker than the light
+/// round it, is ink whatever its width.
+const COLOUR: f32 = 0.16;
+const COLOUR_DARK: f32 = 0.75;
+/// A ground no more coloured than this against the paper is paper.
+const GROUND: f32 = 0.12;
+/// The ground's colour is read this many times wider than a stroke's reach.
+const DESK_K: usize = 3;
 /// Dust is no more than this across, mm; a part of a line is no thicker
 /// than `FLAT_MM` or as faint as dust, and the line's parts lie within
 /// `GAP_MM` of each other along `LINE_MM` at least.
@@ -52,6 +70,14 @@ const DASH_MM: f64 = 1.2;
 /// further (0.7 of it and more on a receipt's fold), a faint logo's letter
 /// or a faded dash nearer.
 const FAINT: f32 = 0.6;
+/// A faint part within this of print, mm, and no more than OF_PRINT lighter
+/// than it, belongs to it.
+const NEAR_MM: f64 = 1.0;
+/// A thick part's core is what is at least this share as dark as its
+/// darkest: the dot on an i of small print is about half its stem, dust
+/// grown onto black print a quarter.
+const CORE: f32 = 0.4;
+const OF_PRINT: f32 = 0.4;
 
 /// `img` cleaned under `mask` (true: clean; `img.w` x `img.h`), at `dpi`.
 /// Returns the share of the masked pixels kept as ink.
@@ -88,48 +114,6 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
     dev.sort_by(f32::total_cmp);
     let sigma = 1.4826 * dev[dev.len() / 2];
     let thr = (med + 4.0 * sigma).max(0.04);
-    // the light round each pixel per channel: where it is coloured (a brown
-    // desk, not paper in shadow, which stays grey), nothing is print but
-    // near-black
-    let part = |p: &Plane| Plane { w: rw, h: rh, d: (y0..y1).flat_map(|y| p.d[y * w + x0..y * w + x1].to_vec()).collect() };
-    let bgc: Vec<Plane> = img.c.iter().map(|p| closing(&part(p), r)).collect();
-    let paper_like = |j: usize| {
-        let (lo, hi) = bgc.iter().fold((1f32, 0f32), |(lo, hi), p| (lo.min(p.d[j]), hi.max(p.d[j])));
-        hi - lo < GREY
-    };
-    // a brown or orange pixel is a desk (wood, cork, a table's edge in the
-    // sheet's shadow): nothing printed on paper is that colour (a blue pen
-    // or a red stamp is not)
-    let brown = |j: usize| {
-        let i = (y0 + j / rw) * w + x0 + j % rw;
-        let (r, g, b) = (img.c[0].d[i], img.c[1.min(img.c.len() - 1)].d[i], img.c[2.min(img.c.len() - 1)].d[i]);
-        r >= g && g >= b && r - b > 0.08 && luma.d[j] < 0.75
-    };
-    let mut ink: Vec<bool> = hat.iter().enumerate().map(|(j, &v)| v > thr && paper_like(j) && !brown(j)).collect();
-    // ink thicker than a stroke is the rim of something wide
-    drop_thick(&mut ink, rw, rh, STROKE_MM * px_mm / 2.0);
-    for (j, k) in ink.iter_mut().enumerate() {
-        let i = (y0 + j / rw) * w + x0 + j % rw;
-        let (lo, hi) = img.c.iter().fold((1f32, 0f32), |(lo, hi), p| (lo.min(p.d[i]), hi.max(p.d[i])));
-        *k |= luma.d[j] < BLACK && hi - lo < GREY;
-    }
-    // dust: a grey speck the shadow's grain left, lighter than the print
-    let b = |j: usize| if bg.d[j] >= 0.5 { bg.d[j] } else { 1.0 };
-    let rel: Vec<f32> = (0..rw * rh).map(|j| luma.d[j] / b(j)).collect();
-    let grey: Vec<bool> = (0..rw * rh)
-        .map(|j| {
-            let i = (y0 + j / rw) * w + x0 + j % rw;
-            let (lo, hi) = img.c.iter().fold((1f32, 0f32), |(lo, hi), p| (lo.min(p.d[i]), hi.max(p.d[i])));
-            hi - lo < GREY
-        })
-        .collect();
-    drop_specks(&mut ink, &rel, &grey, rw, rh, px_mm);
-    let near: Vec<bool> = (0..rw * rh)
-        .map(|i| {
-            let (x, y) = (i % rw, i / rw);
-            !ink[i] && (x.saturating_sub(1)..(x + 2).min(rw)).any(|xx| (y.saturating_sub(1)..(y + 2).min(rh)).any(|yy| ink[yy * rw + xx]))
-        })
-        .collect();
     // the paper's own tone (a cream sheet is not white): the brightest third
     // of what lies round the mask, or under it when it covers all
     let tone = |idx: &mut dyn Iterator<Item = usize>| -> Option<[f32; 3]> {
@@ -149,6 +133,63 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
     };
     let region = |want: bool| (y0..y1).flat_map(move |y| (x0..x1).map(move |x| y * w + x)).filter(move |&i| mask[i] == want);
     let paper = tone(&mut region(false)).or_else(|| tone(&mut region(true))).unwrap_or([1.0; 3]);
+    // colours are told against the paper's own: a beige or cream sheet, or
+    // a warm light over a white one, is paper, not a desk. A tone too
+    // coloured or too dark for paper (the mask is all on a desk) is not
+    // balanced against
+    let (tlo, thi) = paper.iter().fold((1f32, 0f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let white = if thi - tlo < PAPER_TINT && tlo > 0.45 { paper } else { [1.0; 3] };
+    let rgb = |k: usize| k.min(img.c.len() - 1);
+    let chroma = |v: [f32; 3]| {
+        let (lo, hi) = v.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+        hi - lo
+    };
+    let at = |j: usize| {
+        let i = (y0 + j / rw) * w + x0 + j % rw;
+        std::array::from_fn::<f32, 3, _>(|k| (img.c[rgb(k)].d[i] / white[k]).min(1.0))
+    };
+    // the light round each pixel per channel, as wide as a desk shows: where
+    // it is coloured (a brown desk, not paper in shadow, which stays grey),
+    // nothing is print but near-black. Within a stroke's reach a pen's own
+    // colour would tint it (a signature's loops, the JPEG's colour bleeding)
+    let part = |p: &Plane| Plane { w: rw, h: rh, d: (y0..y1).flat_map(|y| p.d[y * w + x0..y * w + x1].to_vec()).collect() };
+    let bgc: Vec<Plane> = img.c.iter().map(|p| closing(&part(p), DESK_K * r)).collect();
+    // and within a stroke's reach, what the ink is divided by, channel by
+    // channel: the paper's own colour round it goes out, and the paper's
+    // tone is put back once (a second pass is no warmer than the first)
+    let near_bg: Vec<Plane> = img.c.iter().map(|p| closing(&part(p), r)).collect();
+    // (the white halo a sharpened stroke has is white, not tinted: balanced
+    // values stop at white)
+    // (a shadow on a warm sheet is a little redder than its open paper)
+    let paper_like = |j: usize| chroma(std::array::from_fn(|k| (bgc[rgb(k)].d[j] / white[k]).min(1.0))) < GROUND;
+    // a brown or orange pixel is a desk (wood, cork, a table's edge in the
+    // sheet's shadow): nothing printed on paper is that colour (a blue pen
+    // or a red stamp is not)
+    let brown = |j: usize| {
+        let [r, g, b] = at(j);
+        r >= g && g >= b && r - b > 0.08 && luma.d[j] < 0.75
+    };
+    let grey: Vec<bool> = (0..rw * rh).map(|j| chroma(at(j)) < GREY).collect();
+    let mut ink: Vec<bool> = hat.iter().enumerate().map(|(j, &v)| v > thr && paper_like(j) && !brown(j)).collect();
+    // ink thicker than a stroke is the rim of something wide; coloured ink
+    // is not (a felt pen's loop filled in, a stamp)
+    drop_thick(&mut ink, &hat, &grey, rw, rh, STROKE_MM * px_mm / 2.0);
+    // near-black stays whatever its width (a logo, a bar), and so does
+    // coloured ink well darker than the paper (a felt pen, bold blue print,
+    // a stamp): no shadow is either, and a desk is brown
+    let b = |j: usize| if bg.d[j] >= 0.5 { bg.d[j] } else { 1.0 };
+    let rel: Vec<f32> = (0..rw * rh).map(|j| luma.d[j] / b(j)).collect();
+    for (j, k) in ink.iter_mut().enumerate() {
+        *k |= (luma.d[j] < BLACK && grey[j]) || (chroma(at(j)) >= COLOUR && rel[j] < COLOUR_DARK && !brown(j));
+    }
+    // dust: a grey speck the shadow's grain left, lighter than the print
+    drop_specks(&mut ink, &rel, &grey, rw, rh, px_mm);
+    let near: Vec<bool> = (0..rw * rh)
+        .map(|i| {
+            let (x, y) = (i % rw, i / rw);
+            !ink[i] && (x.saturating_sub(1)..(x + 2).min(rw)).any(|xx| (y.saturating_sub(1)..(y + 2).min(rh)).any(|yy| ink[yy * rw + xx]))
+        })
+        .collect();
     let (mut masked, mut kept) = (0usize, 0usize);
     for yy in 0..rh {
         for xx in 0..rw {
@@ -161,15 +202,18 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             let j = yy * rw + xx;
             // divided by the light round it where that is paper (in the
             // shadow too); on a dark ground (a desk's black edge) kept as it is
-            let b = b(j);
+            let lit = bg.d[j] >= 0.5;
             for (k, p) in img.c.iter_mut().enumerate() {
                 let (v, t) = (p.d[i], paper[k.min(2)]);
-                p.d[i] = t * if ink[j] {
-                    (v / b).min(1.0)
-                } else if near[j] {
-                    ((v / b).min(1.0) + 1.0) / 2.0
-                } else {
-                    1.0
+                let b = if lit { near_bg[k].d[j].max(0.05) } else { 1.0 };
+                // (on a dark ground, or inside a stroke wider than the
+                // reach, kept as it is: the paper's tone is not put on twice)
+                p.d[i] = match (ink[j], near[j], lit) {
+                    (true, _, true) => t * (v / b).min(1.0),
+                    (true, _, false) => v,
+                    (false, true, true) => t * ((v / b).min(1.0) + 1.0) / 2.0,
+                    (false, true, false) => (v + t) / 2.0,
+                    _ => t,
                 };
             }
             kept += ink[j] as usize;
@@ -187,7 +231,7 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
 /// them again. A part of `ink` goes when it is
 /// - lighter than print: its darkest point (`rel`, the luma divided by the
 ///   light round it) past `FAINT` of the way from the print's own (the
-///   median over parts of half a square mm and more) to paper;
+///   median over grey parts of half a square mm and more) to paper;
 /// - grey (a blue pen or a red stamp is not dust) and no more than
 ///   `SPECK_MM` across (a pencil word or a signature is bigger);
 /// - in no line: four parts or more, of one height and side by side
@@ -195,6 +239,9 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
 ///   ones only, so a speck between letters is not saved by the letters: a
 ///   dotted or dashed rule, dark or faded, lives, and so does a whole faded
 ///   line of text;
+/// - no dot of the print next to it: within `NEAR_MM` of grey print that is
+///   not faint, and no more than `OF_PRINT` lighter than it (a colon or an
+///   i's dot of small grey print; dust beside black print is far lighter);
 /// - and no dash: along its own axes (askew too) no thicker than `FLAT_MM`,
 ///   `DASH_MM` long, two and a half times as long as thick and solid (a
 ///   rule a fold has thinned to a few dashes). Dust is round.
@@ -250,13 +297,34 @@ fn drop_specks(ink: &mut [bool], rel: &[f32], grey: &[bool], w: usize, h: usize,
         let grey = greys * 2 > px.len();
         parts.push(Part { px, x0, y0, x1, y1, lo, grey, c: (mx, my), along: (12.0 * (half + root)).sqrt(), across: (12.0 * (half - root)).max(1.0).sqrt(), dir: (t.cos(), t.sin()) });
     }
-    let mut los: Vec<f32> = parts.iter().filter(|p| p.px.len() as f64 >= 0.5 * px_mm * px_mm).map(|p| p.lo).collect();
+    // the print dust is told from is grey print (a blue signature is
+    // darker than small grey print, which is no dust for that)
+    let big = |p: &&Part| p.px.len() as f64 >= 0.5 * px_mm * px_mm;
+    let mut los: Vec<f32> = parts.iter().filter(big).filter(|p| p.grey).map(|p| p.lo).collect();
+    if los.is_empty() {
+        los = parts.iter().filter(big).map(|p| p.lo).collect();
+    }
     if los.is_empty() {
         return;
     }
     los.sort_by(f32::total_cmp);
     let mid = los[los.len() / 2] + FAINT * (1.0 - los[los.len() / 2]);
     let faint: Vec<bool> = parts.iter().map(|p| p.lo > mid).collect();
+    // the print round each pixel: the darkest grey part of print's size
+    // that is not faint within NEAR_MM, as a map of its tone
+    let reach = (NEAR_MM * px_mm).round().max(1.0) as usize;
+    let mut print = vec![f32::INFINITY; w * h];
+    for (k, p) in parts.iter().enumerate() {
+        if !faint[k] && p.grey && big(&p) {
+            for &i in &p.px {
+                print[i] = print[i].min(p.lo);
+            }
+        }
+    }
+    let near_print = |p: &Part| {
+        let (x0, y0, x1, y1) = (p.x0.saturating_sub(reach), p.y0.saturating_sub(reach), (p.x1 + reach).min(w), (p.y1 + reach).min(h));
+        (y0..y1).flat_map(|y| (x0..x1).map(move |x| y * w + x)).map(|i| print[i]).fold(f32::INFINITY, f32::min)
+    };
     let (flat, gap, long) = (FLAT_MM * px_mm, GAP_MM * px_mm, LINE_MM * px_mm);
     let dash = |p: &Part| p.across <= flat && p.along >= 2.5 * p.across && p.px.len() as f64 >= 0.95 * p.along * p.across;
     fn find(r: &mut [usize], k: usize) -> usize {
@@ -324,7 +392,11 @@ fn drop_specks(ink: &mut [bool], rel: &[f32], grey: &[bool], w: usize, h: usize,
     }
     for (k, p) in parts.iter().enumerate() {
         let long_side = (p.x1 - p.x0).max(p.y1 - p.y0) as f64;
-        if faint[k] && p.grey && long_side <= SPECK_MM * px_mm && !in_line[k] && !(dash(p) && p.along >= DASH_MM * px_mm) {
+        // a dot of the print next to it (a colon, the dot on an i of small
+        // grey print) is as light as that print, give or take; dust beside
+        // black print is far lighter
+        let of_print = faint[k] && { let near = near_print(p); near.is_finite() && p.lo - near <= OF_PRINT };
+        if faint[k] && p.grey && long_side <= SPECK_MM * px_mm && !in_line[k] && !(dash(p) && p.along >= DASH_MM * px_mm) && !of_print {
             for &i in &p.px {
                 ink[i] = false;
             }
@@ -381,12 +453,64 @@ fn run(v: &[f32], r: usize, f: fn(f32, f32) -> f32, out: &mut [f32]) {
     }
 }
 
-/// Parts of `ink` whose deepest point lies further than `half` px from
-/// their edge (a chamfer distance) are taken out whole.
-fn drop_thick(ink: &mut [bool], w: usize, h: usize, half: f64) {
+/// Parts of the grey `ink` whose deepest point lies further than `half` px
+/// from their edge (a chamfer distance) are taken out; coloured ink is
+/// left as it is, and does not join grey ink into one part (small grey
+/// print touching a felt pen's stroke is not the stroke). Whole, when
+/// their core, what is at least `CORE` as dark as their darkest (`hat`), is
+/// as thick: the rim of something wide. Else only what is not core goes:
+/// print with something faint round it,
+/// the rim a clean page's low threshold lets in round small print (which
+/// joins a word into one blob) or a shadow's grain grown onto the letters.
+fn drop_thick(ink: &mut [bool], hat: &[f32], grey: &[bool], w: usize, h: usize, half: f64) {
+    let mut part_of = vec![usize::MAX; w * h];
+    let mut parts: Vec<Vec<usize>> = vec![];
+    let ink_g: Vec<bool> = (0..w * h).map(|i| ink[i] && grey[i]).collect();
+    for s in 0..w * h {
+        if !ink_g[s] || part_of[s] != usize::MAX {
+            continue;
+        }
+        let k = parts.len();
+        part_of[s] = k;
+        let (mut stack, mut part) = (vec![s], vec![]);
+        while let Some(i) = stack.pop() {
+            part.push(i);
+            let (x, y) = (i % w, i / w);
+            let mut go = |j: usize| {
+                if ink_g[j] && part_of[j] == usize::MAX {
+                    part_of[j] = k;
+                    stack.push(j);
+                }
+            };
+            if x > 0 { go(i - 1) }
+            if x + 1 < w { go(i + 1) }
+            if y > 0 { go(i - w) }
+            if y + 1 < h { go(i + w) }
+        }
+        parts.push(part);
+    }
+    let top: Vec<f32> = parts.iter().map(|p| p.iter().map(|&i| hat[i]).fold(0.0, f32::max)).collect();
+    let core: Vec<bool> = (0..w * h).map(|i| ink_g[i] && hat[i] >= CORE * top[part_of[i]]).collect();
+    let (whole, cored) = (chamfer(&ink_g, w, h), chamfer(&core, w, h));
+    let lim = (half * 3.0) as u32;
+    for part in parts {
+        let deep = |d: &[u32]| part.iter().map(|&i| d[i]).max().unwrap_or(0);
+        if deep(&whole) <= lim {
+            continue;
+        }
+        let all = deep(&cored) > lim;
+        for i in part {
+            if all || !core[i] {
+                ink[i] = false;
+            }
+        }
+    }
+}
+
+/// A 3-4 chamfer distance from the edge of `m`, two passes.
+fn chamfer(m: &[bool], w: usize, h: usize) -> Vec<u32> {
     let big = u32::MAX / 4;
-    let mut d: Vec<u32> = ink.iter().map(|&k| if k { big } else { 0 }).collect();
-    // 3-4 chamfer, two passes
+    let mut d: Vec<u32> = m.iter().map(|&k| if k { big } else { 0 }).collect();
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
@@ -417,38 +541,7 @@ fn drop_thick(ink: &mut [bool], w: usize, h: usize, half: f64) {
             d[i] = v;
         }
     }
-    let lim = (half * 3.0) as u32;
-    let mut seen = vec![false; w * h];
-    let mut stack = vec![];
-    for s in 0..w * h {
-        if !ink[s] || seen[s] {
-            continue;
-        }
-        seen[s] = true;
-        stack.push(s);
-        let mut part = vec![];
-        let mut deep = 0u32;
-        while let Some(i) = stack.pop() {
-            part.push(i);
-            deep = deep.max(d[i]);
-            let (x, y) = (i % w, i / w);
-            let mut go = |j: usize| {
-                if ink[j] && !seen[j] {
-                    seen[j] = true;
-                    stack.push(j);
-                }
-            };
-            if x > 0 { go(i - 1) }
-            if x + 1 < w { go(i + 1) }
-            if y > 0 { go(i - w) }
-            if y + 1 < h { go(i + w) }
-        }
-        if deep > lim {
-            for i in part {
-                ink[i] = false;
-            }
-        }
-    }
+    d
 }
 
 #[cfg(test)]
@@ -559,7 +652,7 @@ mod tests {
         // the faded strokes are print
         let (mut img, probes) = receipt();
         let (w, h) = (img.w, img.h);
-        let mut put = |img: &mut Img, x: usize, y: usize, n: usize, v: f32| {
+        let put = |img: &mut Img, x: usize, y: usize, n: usize, v: f32| {
             for yy in y..y + n {
                 for xx in x..x + n {
                     for p in img.c.iter_mut() {
@@ -608,5 +701,139 @@ mod tests {
         clean_area(&mut img, &mask, 150.0);
         let diff = img.c.iter().zip(&once.c).flat_map(|(a, b)| a.d.iter().zip(&b.d).map(|(x, y)| (x - y).abs())).fold(0f32, f32::max);
         assert!(diff < 0.05, "second pass moved {diff}");
+    }
+
+    /// A signed page at 200 dpi on `paper`: a line of small grey print on
+    /// the open paper, a shadow band (0.88) with a felt pen's blue stroke
+    /// 1.3 mm wide, a bold blue name (strokes 1.5 mm), a filled "a" and
+    /// small grey print in it that the pen's stroke crosses. Small print
+    /// has a soft rim, as a photo's has.
+    fn signed(paper: [f32; 3]) -> (Img, Vec<(usize, usize, &'static str)>) {
+        let (w, h) = (900, 400);
+        let mut c: Vec<Vec<f32>> = (0..3).map(|k| vec![paper[k]; w * h]).collect();
+        let shade = |y: usize| if (150..300).contains(&y) { 0.88 } else { 1.0 };
+        for y in 0..h {
+            for x in 0..w {
+                for k in 0..3 {
+                    c[k][y * w + x] *= shade(y);
+                }
+            }
+        }
+        let mut put = |x: usize, y: usize, rgb: [f32; 3], a: f32| {
+            for k in 0..3 {
+                let v = &mut c[k][y * w + x];
+                *v = *v * (1.0 - a) + rgb[k] * shade(y) * a;
+            }
+        };
+        let blue = [0.12, 0.23, 0.54];
+        let mut probes = vec![];
+        // small grey print: 2 px strokes 12 tall, 5 apart, a soft rim that
+        // joins a word's letters
+        for (y0, grey) in [(100usize, 0.47f32), (270, 0.53)] {
+            let mut rim = vec![0u8; w * h];
+            for k in 0..60 {
+                let x0 = 40 + k * 5 + (k / 6) * 8;
+                for y in y0 - 2..y0 + 14 {
+                    for x in x0 - 2..x0 + 4 {
+                        let inner = (y0..y0 + 12).contains(&y) && (x0..x0 + 2).contains(&x);
+                        rim[y * w + x] = rim[y * w + x].max(if inner { 2 } else { 1 });
+                    }
+                }
+            }
+            for (i, &r) in rim.iter().enumerate() {
+                if r > 0 {
+                    put(i % w, i / w, [grey; 3], if r == 2 { 1.0 } else { 0.3 });
+                }
+            }
+            probes.push((40, y0 + 6, "print"));
+        }
+        // a felt pen's stroke, 10 px wide
+        for x in 50..400 {
+            let yc = 210.0 + 30.0 * ((x as f32) / 40.0).sin();
+            for y in (yc - 5.0) as usize..(yc + 5.0) as usize {
+                put(x, y, blue, 1.0);
+            }
+        }
+        probes.push((90, (210.0 + 30.0 * (90f32 / 40.0).sin()) as usize, "blue"));
+        // and down through the small print in the shadow, which goes on past it
+        for y in 240..300 {
+            for x in 250..260 {
+                put(x, y, blue, 1.0);
+            }
+        }
+        probes.push((288, 276, "print"));
+        probes.push((268, 276, "print"));
+        // a bold name: strokes 12 px wide, 50 tall
+        for k in 0..4 {
+            for y in 180..230 {
+                for x in 450 + k * 30..462 + k * 30 {
+                    put(x, y, blue, 1.0);
+                }
+            }
+        }
+        probes.push((456, 205, "blue"));
+        // a filled "a"
+        for y in 190..230 {
+            for x in 620..660 {
+                let (dx, dy) = ((x as f32 - 640.0) / 16.0, (y as f32 - 210.0) / 14.0);
+                if dx * dx + dy * dy <= 1.0 {
+                    put(x, y, blue, 1.0);
+                }
+            }
+        }
+        probes.push((640, 210, "blue"));
+        probes.push((800, 170, "paper"));
+        probes.push((300, 290, "paper"));
+        (Img::from_planes(c.into_iter().map(|d| Plane { w, h, d }).collect()), probes)
+    }
+
+    #[test]
+    fn a_signature_on_beige_or_white_stays() {
+        for paper in [[0.984f32, 0.984, 0.973], [0.937, 0.886, 0.784]] {
+            let (mut img, probes) = signed(paper);
+            let (w, h) = (img.w, img.h);
+            let mask: Vec<bool> = (0..w * h).map(|i| i / w >= 20).collect();
+            // twice: a second pass is no warmer than the first, so beige
+            // print does not turn brown and go as a desk
+            clean_area(&mut img, &mask, 200.0);
+            clean_area(&mut img, &mask, 200.0);
+            let g = img.gray();
+            for (x, y, what) in probes {
+                let i = y * w + x;
+                let (r, b, v) = (img.c[0].d[i], img.c[2].d[i], g.d[i]);
+                match what {
+                    "blue" => assert!(v < 0.4 && b > r + 0.2, "{paper:?}: {what} at {x},{y}: {r} {b} {v}"),
+                    "print" => assert!(v < 0.7, "{paper:?}: {what} at {x},{y}: {v}"),
+                    _ => {
+                        for k in 0..3 {
+                            assert!((img.c[k].d[i] - paper[k]).abs() < 0.03, "{paper:?}: {what} at {x},{y}, channel {k}: {}", img.c[k].d[i]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn small_print_a_pen_crosses_stays() {
+        // the site's signed page (made up), as its scanner gives it at 200
+        // dpi, round the box: a felt pen's loop crosses a line of small
+        // grey print, "...ein erfun|denes Beispiel"; the grey print right of
+        // it was taken as the pen's rim and went
+        for (name, jpg) in [("white", &include_bytes!("../testdata/signed-white.jpg")[..]), ("beige", &include_bytes!("../testdata/signed-beige.jpg")[..])] {
+            let mut img = crate::io::decode(jpg, "signed.jpg").unwrap().to_img();
+            let (w, h) = (img.w, img.h);
+            let mask: Vec<bool> = (0..w * h).map(|i| (40..1530).contains(&(i % w)) && (40..422).contains(&(i / w))).collect();
+            // grey print right of the pen: dark and not blue
+            let print = |img: &Img| {
+                let g = img.gray();
+                (347..387).flat_map(|y| (502..662).map(move |x| y * w + x)).filter(|&i| g.d[i] < 0.7 && img.c[2].d[i] < img.c[0].d[i] + 0.1).count()
+            };
+            let before = print(&img);
+            clean_area(&mut img, &mask, 200.0);
+            let after = print(&img);
+            // (the rim round each stroke goes half way to paper: half is kept)
+            assert!(after * 2 >= before, "{name}: {after} of {before} pixels of print kept");
+        }
     }
 }

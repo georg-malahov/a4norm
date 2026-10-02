@@ -226,11 +226,19 @@ fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
   - The threshold is the area's own noise (4 robust deviations, at least 4 % of white),
     not Otsu.
 - **What goes, though it scores:**
-  - parts of "ink" thicker than 1 mm (the rims of wide things);
-  - anything on a coloured ground, or brown or orange itself: a desk, not paper. A blue
-    pen or a red stamp keeps its colour.
+  - parts of grey "ink" thicker than 1 mm (the rims of wide things), judged on their core
+    (what is at least 40 % as dark as their darkest). If only the faint rest is thick, only
+    that goes and the print stays. Examples: small grey print that its soft rim joins into
+    one blob, or a shadow's grain grown onto letters. Coloured ink is not cut, and does
+    not join grey ink into one part: grey print a pen's stroke crosses is not the stroke;
+  - anything on a coloured ground (read 3.6 mm wide, more than 0.12 off the paper's tone),
+    or brown or orange itself: a desk, not paper. A blue pen or a red stamp keeps its colour.
+- **Colours are told against the paper's own tone.** A beige or cream sheet, or a warm
+  light on a white one, is paper, not a desk.
 - **Near-black stays whatever its width** (a logo, a black bar). No shadow on paper is that
-  dark.
+  dark. **So does coloured ink well darker than the paper** (a felt pen, bold blue print, a
+  filled loop, a stamp): no shadow is coloured. A bold grey stroke wider than 1.2 mm is still
+  read by its edges only.
 - **Dust goes.** The grain of a shadow (a thermal receipt's fold) leaves grey specks
   that score like print, and a second pass kept them again. A part of the ink is dust when
   it is all of:
@@ -241,6 +249,9 @@ fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
   - in no line: four parts or more, faint or flat, side by side on one centre line
     within 2.5 mm of each other, 8 mm long (a dotted or dashed rule, dark or faded; a
     whole faded line of text). A speck between letters is not saved by the letters;
+  - no dot of the print next to it: within 1 mm of grey print and no more than 0.4 lighter
+    than it (a colon or an i's dot of small grey print; dust beside black print is far
+    lighter). The print's tone is that of grey print, not of a blue signature;
   - and no dash: along its own axes (askew too) at most 1 mm thick, 1.2 mm long, 2.5
     times as long as thick, and solid. A dashed rule photographed askew links dash to
     dash along their axes.
@@ -266,6 +277,19 @@ specks along the fold went (13 % and 26 % of what was kept as ink before). Every
 colon, comma, umlaut and full stop stayed, and every dashed rule, including one faded to
 light grey and one photographed 7° askew; lost was one 1 mm piece of a dash 6 mm from the
 rest of its rule. A second pass changes nothing.
+
+A signed page (the site's synthetic one: a blue felt-pen stroke 1.3 mm wide, a bold blue
+name, a filled "a", grey small print, a shadow band behind them; white `#fbfbf8` and beige
+`#efe2c8` paper, photographed on a desk and scanned in colour):
+- before, the box erased the signature down to a few blue dots and tore the small print,
+  on white and beige alike;
+- now the shadow goes and all of it stays, including the small print right of where the
+  pen's loop crosses it, its colon and the dots on its i's, and a second or third pass
+  over the same box changes nothing visible. Before, each pass put the paper's tone on the print again:
+  beige print grew browner until it went as a desk.
+
+On a real photo of a beige sheet, a blue signature and a grey hint under it stay whole, and
+so does a felt pen's filled loop on the white «Weißes Papier» page.
 
 The whole page takes about 0.35 s natively; a brushed strip, a fraction of that.
 
