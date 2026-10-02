@@ -20,9 +20,10 @@
 //! - Dust goes: the grey specks a shadow's grain leaves (a thermal
 //!   receipt's fold), lighter than the print, small, grey and in no line
 //!   and no dash (`drop_specks`). A second pass found them again before.
-//! - Under the mask the ink keeps its colour, divided by the light round
-//!   it (a faded letter in the shadow comes back to its contrast), a pixel
-//!   round it half so, and the rest is the paper's own tone: the brightest
+//! - Under the mask the ink keeps its colour, divided channel by channel by
+//!   the light round it (a faded letter in the shadow comes back to its
+//!   contrast, and a second pass does not put the paper's tone on twice),
+//!   a pixel round it half so, and the rest is the paper's own tone: the brightest
 //!   third of what lies round the mask (a cream sheet stays cream, white
 //!   stays white). Outside the mask nothing changes.
 //!
@@ -143,6 +144,10 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
     // colour would tint it (a signature's loops, the JPEG's colour bleeding)
     let part = |p: &Plane| Plane { w: rw, h: rh, d: (y0..y1).flat_map(|y| p.d[y * w + x0..y * w + x1].to_vec()).collect() };
     let bgc: Vec<Plane> = img.c.iter().map(|p| closing(&part(p), DESK_K * r)).collect();
+    // and within a stroke's reach, what the ink is divided by, channel by
+    // channel: the paper's own colour round it goes out, and the paper's
+    // tone is put back once (a second pass is no warmer than the first)
+    let near_bg: Vec<Plane> = img.c.iter().map(|p| closing(&part(p), r)).collect();
     // (the white halo a sharpened stroke has is white, not tinted: balanced
     // values stop at white)
     let paper_like = |j: usize| chroma(std::array::from_fn(|k| (bgc[rgb(k)].d[j] / white[k]).min(1.0))) < GREY;
@@ -186,15 +191,18 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             let j = yy * rw + xx;
             // divided by the light round it where that is paper (in the
             // shadow too); on a dark ground (a desk's black edge) kept as it is
-            let b = b(j);
+            let lit = bg.d[j] >= 0.5;
             for (k, p) in img.c.iter_mut().enumerate() {
                 let (v, t) = (p.d[i], paper[k.min(2)]);
-                p.d[i] = t * if ink[j] {
-                    (v / b).min(1.0)
-                } else if near[j] {
-                    ((v / b).min(1.0) + 1.0) / 2.0
-                } else {
-                    1.0
+                let b = if lit { near_bg[k].d[j].max(0.05) } else { 1.0 };
+                // (on a dark ground, or inside a stroke wider than the
+                // reach, kept as it is: the paper's tone is not put on twice)
+                p.d[i] = match (ink[j], near[j], lit) {
+                    (true, _, true) => t * (v / b).min(1.0),
+                    (true, _, false) => v,
+                    (false, true, true) => t * ((v / b).min(1.0) + 1.0) / 2.0,
+                    (false, true, false) => (v + t) / 2.0,
+                    _ => t,
                 };
             }
             kept += ink[j] as usize;
@@ -727,6 +735,9 @@ mod tests {
             let (mut img, probes) = signed(paper);
             let (w, h) = (img.w, img.h);
             let mask: Vec<bool> = (0..w * h).map(|i| i / w >= 20).collect();
+            // twice: a second pass is no warmer than the first, so beige
+            // print does not turn brown and go as a desk
+            clean_area(&mut img, &mask, 200.0);
             clean_area(&mut img, &mask, 200.0);
             let g = img.gray();
             for (x, y, what) in probes {

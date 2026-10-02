@@ -279,7 +279,9 @@ name, a filled "a", grey small print, a shadow band behind them; white `#fbfbf8`
 `#efe2c8` paper, photographed on a desk and scanned in colour):
 - before, the box erased the signature down to a few blue dots and tore the small print,
   on white and beige alike;
-- now the shadow goes and all of it stays.
+- now the shadow goes and all of it stays, and a second or third pass over the same box
+  changes nothing visible. Before, each pass put the paper's tone on the print again:
+  beige print grew browner until it went as a desk.
 
 On a real photo of a beige sheet, a blue signature and a grey hint under it stay whole, and
 so does a felt pen's filled loop on the white «Weißes Papier» page.
