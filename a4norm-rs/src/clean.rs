@@ -15,8 +15,9 @@
 //!   (a logo, a bar): no shadow on paper is that dark.
 //! - Under the mask the ink keeps its colour, divided by the light round
 //!   it (a faded letter in the shadow comes back to its contrast), a pixel
-//!   round it half so, and the rest is white. Outside the mask nothing
-//!   changes.
+//!   round it half so, and the rest is the paper's own tone: the brightest
+//!   third of what lies round the mask (a cream sheet stays cream, white
+//!   stays white). Outside the mask nothing changes.
 //!
 //! Where the light round a pixel is coloured, or the pixel itself is brown
 //! or orange, it is a desk, not paper, and goes white with the shadow (no
@@ -103,6 +104,25 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             !ink[i] && (x.saturating_sub(1)..(x + 2).min(rw)).any(|xx| (y.saturating_sub(1)..(y + 2).min(rh)).any(|yy| ink[yy * rw + xx]))
         })
         .collect();
+    // the paper's own tone (a cream sheet is not white): the brightest third
+    // of what lies round the mask, or under it when it covers all
+    let tone = |idx: &mut dyn Iterator<Item = usize>| -> Option<[f32; 3]> {
+        let mut px: Vec<(f32, usize)> = idx.map(|i| (img.c.iter().map(|p| p.d[i]).sum::<f32>(), i)).collect();
+        if px.len() < 200 {
+            return None;
+        }
+        px.sort_by(|a, b| b.0.total_cmp(&a.0));
+        px.truncate(px.len() / 3);
+        let mut t = [1f32; 3];
+        for (k, v) in t.iter_mut().enumerate() {
+            let mut c: Vec<f32> = px.iter().map(|&(_, i)| img.c[k.min(img.c.len() - 1)].d[i]).collect();
+            c.sort_by(f32::total_cmp);
+            *v = c[c.len() / 2];
+        }
+        Some(t)
+    };
+    let region = |want: bool| (y0..y1).flat_map(move |y| (x0..x1).map(move |x| y * w + x)).filter(move |&i| mask[i] == want);
+    let paper = tone(&mut region(false)).or_else(|| tone(&mut region(true))).unwrap_or([1.0; 3]);
     let (mut masked, mut kept) = (0usize, 0usize);
     for yy in 0..rh {
         for xx in 0..rw {
@@ -116,9 +136,9 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             // divided by the light round it where that is paper (in the
             // shadow too); on a dark ground (a desk's black edge) kept as it is
             let b = if bg.d[j] >= 0.5 { bg.d[j] } else { 1.0 };
-            for p in img.c.iter_mut() {
-                let v = p.d[i];
-                p.d[i] = if ink[j] {
+            for (k, p) in img.c.iter_mut().enumerate() {
+                let (v, t) = (p.d[i], paper[k.min(2)]);
+                p.d[i] = t * if ink[j] {
                     (v / b).min(1.0)
                 } else if near[j] {
                     ((v / b).min(1.0) + 1.0) / 2.0
@@ -334,5 +354,25 @@ mod tests {
         }
         // nothing outside the mask moved
         assert!((0..30 * w).all(|i| (0..3).all(|k| img.c[k].d[i] == before.c[k].d[i])));
+    }
+
+    #[test]
+    fn cream_paper_stays_cream() {
+        // the same receipt on cream paper: the shadow goes to the paper's
+        // tone round the mask, or under it when the mask covers all
+        for whole in [false, true] {
+            let (mut img, _) = receipt();
+            let cream = [0.97f32, 0.97, 0.94];
+            for (k, p) in img.c.iter_mut().enumerate() {
+                p.d.iter_mut().for_each(|v| *v *= cream[k]);
+            }
+            let (w, h) = (img.w, img.h);
+            let mask: Vec<bool> = (0..w * h).map(|i| whole || i / w >= 30).collect();
+            clean_area(&mut img, &mask, 150.0);
+            let i = 160 * w + 300; // in the shadow
+            for k in 0..3 {
+                assert!((img.c[k].d[i] - cream[k]).abs() < 0.015, "whole {whole}, channel {k}: {}", img.c[k].d[i]);
+            }
+        }
     }
 }
