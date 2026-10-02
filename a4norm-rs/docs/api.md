@@ -233,7 +233,9 @@ fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
   dark.
 - **The ink kept is divided by the light round it** where that is paper, so a faded letter
   in the shadow comes back to its contrast. A pixel round each stroke is kept half.
-  Everything else under the mask is white, and nothing outside it changes.
+  Everything else under the mask takes the paper's own tone, the brightest third of what
+  lies round the mask (a cream sheet stays cream, a white one white). Nothing outside the
+  mask changes.
 - **What a fold bleached to the shadow's own tone is not in the pixels any more.** It is
   left white. Show the result at once, with undo.
 
