@@ -209,6 +209,43 @@ Measured on the local corpus, the examples and 20 more passport and card photos:
 - no zone is found where there is none;
 - every other page is byte for byte as before.
 
+## Paper cleaned by hand: `cleanArea`
+
+```js
+const jpg = cleanArea(r.pages[i], mask);        // mask: w*h bytes (non-zero: clean) or RGBA (alpha)
+const jpg = cleanArea(r.pages[i], mask, 90);    // the JPEG's quality, 88 by default
+```
+
+The site's brush or box. Under the mask, a grey shadow behind the print (a receipt's
+fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
+
+- **Strokes are told by their width, not their tone.**
+  - The black-hat measures how much darker each pixel is than what lies round it within
+    1.2 mm: the luma's closing less the luma.
+  - A wide shadow scores nothing. A stroke on it scores what it stands out from it.
+  - The threshold is the area's own noise (4 robust deviations, at least 4 % of white),
+    not Otsu.
+- **What goes, though it scores:**
+  - parts of "ink" thicker than 1 mm (the rims of wide things);
+  - anything on a coloured ground, or brown or orange itself: a desk, not paper. A blue
+    pen or a red stamp keeps its colour.
+- **Near-black stays whatever its width** (a logo, a black bar). No shadow on paper is that
+  dark.
+- **The ink kept is divided by the light round it** where that is paper, so a faded letter
+  in the shadow comes back to its contrast. A pixel round each stroke is kept half.
+  Everything else under the mask is white, and nothing outside it changes.
+- **What a fold bleached to the shadow's own tone is not in the pixels any more.** It is
+  left white. Show the result at once, with undo.
+
+**Measured** on a real receipt page, 200 dpi:
+- the grey bands behind "Tel: +49 30 …", "Liefer-, und Leistungsdatum" and "Vielen Dank"
+  went white, every letter whole;
+- the dotted rules stayed;
+- the brown desk under a second receipt went white;
+- a near-black line along a receipt's edge stays.
+
+The whole page takes about 0.35 s natively; a brushed strip, a fraction of that.
+
 ## Does a page look like a blank form? `looksLikeForm`
 
 ```js
