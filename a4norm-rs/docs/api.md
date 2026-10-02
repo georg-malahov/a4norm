@@ -231,6 +231,21 @@ fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
     pen or a red stamp keeps its colour.
 - **Near-black stays whatever its width** (a logo, a black bar). No shadow on paper is that
   dark.
+- **Dust goes.** The grain of a shadow (a thermal receipt's fold) leaves grey specks
+  that score like print, and a second pass kept them again. A part of the ink is dust when
+  it is all of:
+  - lighter than the print: its darkest point past 60 % of the way from the print's own
+    (the median over parts of half a square mm and more) to paper;
+  - grey (a blue pen or a red stamp is not dust) and at most 4 mm across (a pencil word
+    or a signature is bigger);
+  - in no line: four parts or more, faint or flat, side by side on one centre line
+    within 2.5 mm of each other, 8 mm long (a dotted or dashed rule, dark or faded; a
+    whole faded line of text). A speck between letters is not saved by the letters;
+  - and no dash: along its own axes (askew too) at most 1 mm thick, 1.2 mm long, 2.5
+    times as long as thick, and solid. A dashed rule photographed askew links dash to
+    dash along their axes.
+
+  Full stops, commas, the dots on i and ä are as dark as the print and stay.
 - **The ink kept is divided by the light round it** where that is paper, so a faded letter
   in the shadow comes back to its contrast. A pixel round each stroke is kept half.
   Everything else under the mask takes the paper's own tone, the brightest third of what
@@ -245,6 +260,12 @@ fold, a desk at its edge) goes white and the print stays (`src/clean.rs`).
 - the dotted rules stayed;
 - the brown desk under a second receipt went white;
 - a near-black line along a receipt's edge stays.
+
+Dust, measured on two photos of a receipt with a fold (whole page under the mask): the
+specks along the fold went (13 % and 26 % of what was kept as ink before). Every letter,
+colon, comma, umlaut and full stop stayed, and every dashed rule, including one faded to
+light grey and one photographed 7° askew; lost was one 1 mm piece of a dash 6 mm from the
+rest of its rule. A second pass changes nothing.
 
 The whole page takes about 0.35 s natively; a brushed strip, a fraction of that.
 

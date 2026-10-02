@@ -13,6 +13,9 @@
 //! - A part of that ink thicker than 1 mm across is no stroke: the rim of
 //!   something wide; it goes. Anything near black stays whatever its width
 //!   (a logo, a bar): no shadow on paper is that dark.
+//! - Dust goes: the grey specks a shadow's grain leaves (a thermal
+//!   receipt's fold), lighter than the print, small, grey and in no line
+//!   and no dash (`drop_specks`). A second pass found them again before.
 //! - Under the mask the ink keeps its colour, divided by the light round
 //!   it (a faded letter in the shadow comes back to its contrast), a pixel
 //!   round it half so, and the rest is the paper's own tone: the brightest
@@ -37,6 +40,18 @@ const STROKE_MM: f64 = 1.0;
 /// black bar): no shadow on paper is near black. A brown desk is not grey.
 const BLACK: f32 = 0.4;
 const GREY: f32 = 0.08;
+/// Dust is no more than this across, mm; a part of a line is no thicker
+/// than `FLAT_MM` or as faint as dust, and the line's parts lie within
+/// `GAP_MM` of each other along `LINE_MM` at least.
+const SPECK_MM: f64 = 4.0;
+const FLAT_MM: f64 = 1.0;
+const GAP_MM: f64 = 2.5;
+const LINE_MM: f64 = 8.0;
+const DASH_MM: f64 = 1.2;
+/// Lighter than print by this share of the way to paper is faint: dust is
+/// further (0.7 of it and more on a receipt's fold), a faint logo's letter
+/// or a faded dash nearer.
+const FAINT: f32 = 0.6;
 
 /// `img` cleaned under `mask` (true: clean; `img.w` x `img.h`), at `dpi`.
 /// Returns the share of the masked pixels kept as ink.
@@ -98,6 +113,17 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
         let (lo, hi) = img.c.iter().fold((1f32, 0f32), |(lo, hi), p| (lo.min(p.d[i]), hi.max(p.d[i])));
         *k |= luma.d[j] < BLACK && hi - lo < GREY;
     }
+    // dust: a grey speck the shadow's grain left, lighter than the print
+    let b = |j: usize| if bg.d[j] >= 0.5 { bg.d[j] } else { 1.0 };
+    let rel: Vec<f32> = (0..rw * rh).map(|j| luma.d[j] / b(j)).collect();
+    let grey: Vec<bool> = (0..rw * rh)
+        .map(|j| {
+            let i = (y0 + j / rw) * w + x0 + j % rw;
+            let (lo, hi) = img.c.iter().fold((1f32, 0f32), |(lo, hi), p| (lo.min(p.d[i]), hi.max(p.d[i])));
+            hi - lo < GREY
+        })
+        .collect();
+    drop_specks(&mut ink, &rel, &grey, rw, rh, px_mm);
     let near: Vec<bool> = (0..rw * rh)
         .map(|i| {
             let (x, y) = (i % rw, i / rw);
@@ -135,7 +161,7 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
             let j = yy * rw + xx;
             // divided by the light round it where that is paper (in the
             // shadow too); on a dark ground (a desk's black edge) kept as it is
-            let b = if bg.d[j] >= 0.5 { bg.d[j] } else { 1.0 };
+            let b = b(j);
             for (k, p) in img.c.iter_mut().enumerate() {
                 let (v, t) = (p.d[i], paper[k.min(2)]);
                 p.d[i] = t * if ink[j] {
@@ -153,6 +179,156 @@ pub fn clean_area(img: &mut Img, mask: &[bool], dpi: f64) -> f64 {
         0.0
     } else {
         kept as f64 / masked as f64
+    }
+}
+
+/// Dust under the mask: the grain of a shadow (a thermal receipt's fold)
+/// leaves grey specks the black-hat takes for print, and a second pass keeps
+/// them again. A part of `ink` goes when it is
+/// - lighter than print: its darkest point (`rel`, the luma divided by the
+///   light round it) past `FAINT` of the way from the print's own (the
+///   median over parts of half a square mm and more) to paper;
+/// - grey (a blue pen or a red stamp is not dust) and no more than
+///   `SPECK_MM` across (a pencil word or a signature is bigger);
+/// - in no line: four parts or more, of one height and side by side
+///   within `GAP_MM` on one centre line, `LINE_MM` long. Faint or flat
+///   ones only, so a speck between letters is not saved by the letters: a
+///   dotted or dashed rule, dark or faded, lives, and so does a whole faded
+///   line of text;
+/// - and no dash: along its own axes (askew too) no thicker than `FLAT_MM`,
+///   `DASH_MM` long, two and a half times as long as thick and solid (a
+///   rule a fold has thinned to a few dashes). Dust is round.
+fn drop_specks(ink: &mut [bool], rel: &[f32], grey: &[bool], w: usize, h: usize, px_mm: f64) {
+    struct Part {
+        px: Vec<usize>,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        lo: f32,
+        grey: bool,
+        // the centre, and the length and thickness along the part's own
+        // axes (a rule photographed askew is askew), the long one's direction
+        c: (f64, f64),
+        along: f64,
+        across: f64,
+        dir: (f64, f64),
+    }
+    let mut seen = vec![false; w * h];
+    let mut parts = vec![];
+    for s in 0..w * h {
+        if !ink[s] || seen[s] {
+            continue;
+        }
+        seen[s] = true;
+        let mut stack = vec![s];
+        let (mut px, mut x0, mut y0, mut x1, mut y1, mut lo, mut greys) = (vec![], w, h, 0, 0, 1f32, 0);
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            lo = lo.min(rel[i]);
+            greys += grey[i] as usize;
+            px.push(i);
+            for yy in y.saturating_sub(1)..(y + 2).min(h) {
+                for xx in x.saturating_sub(1)..(x + 2).min(w) {
+                    let j = yy * w + xx;
+                    if ink[j] && !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        let n = px.len() as f64;
+        let (mx, my) = px.iter().fold((0.0, 0.0), |(a, b), &i| (a + (i % w) as f64 / n, b + (i / w) as f64 / n));
+        let (sxx, syy, sxy) = px.iter().fold((0.0, 0.0, 0.0), |(a, b, c), &i| {
+            let (dx, dy) = ((i % w) as f64 - mx, (i / w) as f64 - my);
+            (a + dx * dx / n, b + dy * dy / n, c + dx * dy / n)
+        });
+        let (half, root) = ((sxx + syy) / 2.0, (((sxx - syy) / 2.0).powi(2) + sxy * sxy).sqrt());
+        let t = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let grey = greys * 2 > px.len();
+        parts.push(Part { px, x0, y0, x1, y1, lo, grey, c: (mx, my), along: (12.0 * (half + root)).sqrt(), across: (12.0 * (half - root)).max(1.0).sqrt(), dir: (t.cos(), t.sin()) });
+    }
+    let mut los: Vec<f32> = parts.iter().filter(|p| p.px.len() as f64 >= 0.5 * px_mm * px_mm).map(|p| p.lo).collect();
+    if los.is_empty() {
+        return;
+    }
+    los.sort_by(f32::total_cmp);
+    let mid = los[los.len() / 2] + FAINT * (1.0 - los[los.len() / 2]);
+    let faint: Vec<bool> = parts.iter().map(|p| p.lo > mid).collect();
+    let (flat, gap, long) = (FLAT_MM * px_mm, GAP_MM * px_mm, LINE_MM * px_mm);
+    let dash = |p: &Part| p.across <= flat && p.along >= 2.5 * p.across && p.px.len() as f64 >= 0.95 * p.along * p.across;
+    fn find(r: &mut [usize], k: usize) -> usize {
+        let mut k = k;
+        while r[k] != k {
+            r[k] = r[r[k]];
+            k = r[k];
+        }
+        k
+    }
+    // one of a line with the other: side by side on one centre line, as a
+    // rule's dots or a line's letters; or one a dash and the other a piece
+    // of one on its axis, as thin and turned its way (a dashed rule askew)
+    let span = |p: &Part, across: bool| if across { ((p.y0, p.y1), (p.x0, p.x1)) } else { ((p.x0, p.x1), (p.y0, p.y1)) };
+    let side_by_side = |k: usize, across: bool| faint[k] || { let (_, (c0, c1)) = span(&parts[k], across); (c1 - c0) as f64 <= flat };
+    let linked = |a: usize, c: usize, across: bool| {
+        let (a, c, ka, kc) = (&parts[a], &parts[c], a, c);
+        let (((a0, a1), (ac0, ac1)), ((c0, c1), (cc0, cc1))) = (span(a, across), span(c, across));
+        let (ha, hc) = ((ac1 - ac0) as f64, (cc1 - cc0) as f64);
+        let off = ((ac0 + ac1) as f64 - (cc0 + cc1) as f64).abs() / 2.0;
+        let apart = (c0.max(a0) as f64 - c1.min(a1) as f64).max(0.0);
+        if side_by_side(ka, across) && side_by_side(kc, across) && apart <= gap && off <= 0.35 * ha.min(hc) && ha.max(hc) <= 1.5 * ha.min(hc) {
+            return true;
+        }
+        let (a, c) = if dash(a) { (a, c) } else { (c, a) };
+        let askew = c.along >= 2.0 * c.across && (a.dir.0 * c.dir.0 + a.dir.1 * c.dir.1).abs() < 0.985;
+        let piece = c.along >= 0.5 * a.along && c.along >= 1.5 * c.across;
+        if !dash(a) || !piece || c.across > flat || a.across.max(c.across) > 1.5 * a.across.min(c.across) || askew {
+            return false;
+        }
+        let (dx, dy) = (c.c.0 - a.c.0, c.c.1 - a.c.1);
+        let (on, side) = ((dx * a.dir.0 + dy * a.dir.1).abs(), (dx * a.dir.1 - dy * a.dir.0).abs());
+        side <= 0.5 * a.across.max(c.across) && on - (a.along + c.along) / 2.0 <= gap
+    };
+    let cand: Vec<usize> = (0..parts.len()).filter(|&k| side_by_side(k, false) || side_by_side(k, true) || dash(&parts[k])).collect();
+    // along x, then along y (a rule standing up)
+    let mut in_line = vec![false; parts.len()];
+    for across in [false, true] {
+        let mut root: Vec<usize> = (0..parts.len()).collect();
+        let key = |k: usize| if across { parts[k].y0 } else { parts[k].x0 };
+        let end = |k: usize| if across { parts[k].y1 } else { parts[k].x1 };
+        let mut idx = cand.clone();
+        idx.sort_by_key(|&k| key(k));
+        for (n, &a) in idx.iter().enumerate() {
+            for &c in &idx[n + 1..] {
+                if key(c) as f64 > end(a) as f64 + gap {
+                    break;
+                }
+                if linked(a, c, across) {
+                    let (ra, rc) = (find(&mut root, a), find(&mut root, c));
+                    root[ra] = rc;
+                }
+            }
+        }
+        let mut lines: std::collections::HashMap<usize, (usize, usize, usize, usize, usize)> = Default::default();
+        for &k in &cand {
+            let p = &parts[k];
+            let e = lines.entry(find(&mut root, k)).or_insert((0, w, h, 0, 0));
+            *e = (e.0 + 1, e.1.min(p.x0), e.2.min(p.y0), e.3.max(p.x1), e.4.max(p.y1));
+        }
+        for &k in &cand {
+            let (n, x0, y0, x1, y1) = lines[&find(&mut root, k)];
+            in_line[k] |= n >= 4 && (x1 - x0).max(y1 - y0) as f64 >= long;
+        }
+    }
+    for (k, p) in parts.iter().enumerate() {
+        let long_side = (p.x1 - p.x0).max(p.y1 - p.y0) as f64;
+        if faint[k] && p.grey && long_side <= SPECK_MM * px_mm && !in_line[k] && !(dash(p) && p.along >= DASH_MM * px_mm) {
+            for &i in &p.px {
+                ink[i] = false;
+            }
+        }
     }
 }
 
@@ -374,5 +550,63 @@ mod tests {
                 assert!((img.c[k].d[i] - cream[k]).abs() < 0.015, "whole {whole}, channel {k}: {}", img.c[k].d[i]);
             }
         }
+    }
+
+    #[test]
+    fn the_dust_goes_the_dots_stay() {
+        // the shadow's grain: grey specks in it, lighter than the print and
+        // strewn about; a full stop, a faded dashed rule, the dotted one and
+        // the faded strokes are print
+        let (mut img, probes) = receipt();
+        let (w, h) = (img.w, img.h);
+        let mut put = |img: &mut Img, x: usize, y: usize, n: usize, v: f32| {
+            for yy in y..y + n {
+                for xx in x..x + n {
+                    for p in img.c.iter_mut() {
+                        p.d[yy * w + xx] = v;
+                    }
+                }
+            }
+        };
+        let mut specks = vec![];
+        let mut seed = 7u32;
+        for _ in 0..40 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            // in the shadow, off the rows of print
+            let y = [153, 197, 232][(seed >> 12) as usize % 3] + (seed >> 20) as usize % 14;
+            let (x, n) = (30 + (seed >> 8) as usize % 420, 2 + (seed >> 4) as usize % 3);
+            put(&mut img, x, y, n, 0.62 * 0.78);
+            specks.push((x + n / 2, y + n / 2));
+        }
+        put(&mut img, 455, 311, 3, 0.12);
+        for k in 0..30 {
+            for x in 20 + k * 12..28 + k * 12 {
+                for y in 380..382 {
+                    put(&mut img, x, y, 1, 0.8);
+                }
+            }
+        }
+        let mask: Vec<bool> = (0..w * h).map(|i| i / w >= 30).collect();
+        clean_area(&mut img, &mask, 150.0);
+        let g = img.gray();
+        for (x, y) in specks {
+            assert!(g.d[y * w + x] > 0.97, "speck at {x},{y}: {}", g.d[y * w + x]);
+        }
+        assert!(g.d[312 * w + 456] < 0.3, "full stop: {}", g.d[312 * w + 456]);
+        assert!(g.d[380 * w + 24] < 0.95, "faded dash: {}", g.d[380 * w + 24]);
+        for (x, y, what) in probes {
+            let v = g.d[y * w + x];
+            match what {
+                "ink" => assert!(v < 0.3, "{what} at {x},{y}: {v}"),
+                "faded" => assert!(v < 0.85, "{what} at {x},{y}: {v}"),
+                "dot" => assert!(v < 0.9, "{what} at {x},{y}: {v}"),
+                _ => {}
+            }
+        }
+        // a second pass leaves it as it is
+        let once = img.clone();
+        clean_area(&mut img, &mask, 150.0);
+        let diff = img.c.iter().zip(&once.c).flat_map(|(a, b)| a.d.iter().zip(&b.d).map(|(x, y)| (x - y).abs())).fold(0f32, f32::max);
+        assert!(diff < 0.05, "second pass moved {diff}");
     }
 }
