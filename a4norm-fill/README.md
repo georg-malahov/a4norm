@@ -1,7 +1,8 @@
 # a4norm-fill — a form filled in, no models
 
 Where each answer goes and how large (`fill`), and the filled form as a PDF over its own
-pages or a scan's pictures (`pdf`), in Arimo (`font`, `fonts/`, SIL OFL 1.1). No tract, no
+pages or a scan's pictures (`pdf`), in Arimo, and Arimo Bold for a field styled bold
+(`font`, `fonts/`, SIL OFL 1.1). No tract, no
 models. The OCR module (`a4norm-ocr`) uses this crate for its own `fillLayout`, `fillPdf`
 and `fillScan`, so there is one implementation; how it places and writes is described in
 a4norm-ocr's README ("Where the answers go", "The filled form as a PDF").
@@ -37,6 +38,18 @@ const { pdf } = fillScan(request, [r.pages[0].jpg], [signaturePng]);   // or fil
 
   Turned, the picture is still the one image and the text is still text. Without `rotate`
   the PDF is as before, byte for byte.
+- **Style.** A field (and a free text) may carry `style: { bold, underline }`, to set the
+  person's own note apart from the form's print:
+  ```js
+  { key: "kontrast", type: "text", place: { page: 2, box: [380, 512, 560, 526] }, style: { bold: true, underline: true } }
+  ```
+  - `bold`: Arimo Bold, embedded as a font of its own and only when used. The value is fitted
+    and broken by the Bold's widths.
+  - `underline`: a rule under each line, 0.08·size below the baseline, size/18 thick, as long
+    as the line is wide, in the request's `color`. It follows the size the value took when it
+    was made smaller.
+
+  Without `style` the PDF is as before, byte for byte (`tests/style.rs`).
 
 ## Several PDFs as one: `mergePdf`
 

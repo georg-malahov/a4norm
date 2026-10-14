@@ -266,8 +266,15 @@ The request is `{inspections, template, answers, color?, minSize?, images?, text
 - `shift: [dx, dy]` (pt, right and down): all the field puts on its page moves by that
   much, after it has been placed: a text, a comb's characters, a choice's cross, and
   `placed`'s `x`, `y`.
+- `style: {bold?, underline?}`: the field's text set apart from the form's own print (a
+  note the site writes in the person's name, "NEIN – nicht einverstanden" by a printed
+  consent). `bold` sets it in Arimo Bold and fits and breaks it by the Bold's widths;
+  `underline` draws a rule under each of its lines, 0.08 of its size below the baseline,
+  size/18 thick, as long as the line is wide, in the request's `color`, at whatever size
+  the value took. A comb's characters each get their own. A free text (`texts[]`) takes
+  `style` too.
 
-Without them everything is as below.
+Without them everything is as below, and the PDF is byte for byte the same.
 
 The result is `{baseSize, placed: [{key, page, x, y, size, lines, overflow, kind,
 candidate?, lost?}]}`:

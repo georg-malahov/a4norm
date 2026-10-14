@@ -1,7 +1,11 @@
 //! The filled form as a PDF (A4Norm Forms E4): the answers as vector text in
 //! Arimo, near black, over the form's own pages. The font is embedded as the
 //! glyphs the answers use (a CID font with a ToUnicode map, so the text
-//! copies as written), a few kilobytes.
+//! copies as written), a few kilobytes; Arimo Bold as well, as a font of its
+//! own, only when a field is styled bold. An underlined field has a rule
+//! under each of its lines: 0.08 of its size below the baseline, an
+//! eighteenth of it thick, as long as the line is wide, in the answers'
+//! colour.
 //!
 //! - A scan: each page its JPEG, full page, and the text over it.
 //! - A PDF: a new PDF whose pages are the source's pages as Form XObjects,
@@ -26,10 +30,40 @@ pub struct Output {
     pub fallback: bool,
 }
 
+/// The answers' fonts as embedded: the Regular, and the Bold when some text
+/// is set in it; each with the map from the font's glyph numbers to its
+/// subset's.
+struct Fonts {
+    regular: (ObjectId, GlyphRemapper),
+    bold: Option<(ObjectId, GlyphRemapper)>,
+}
+
+impl Fonts {
+    fn embed(doc: &mut Document, layout: &Layout) -> Result<Fonts, String> {
+        let regular = embed_font(doc, layout, false)?;
+        let any_bold = layout.marks.iter().any(|m| matches!(m, Mark::Text { style, .. } if style.bold));
+        let bold = if any_bold { Some(embed_font(doc, layout, true)?) } else { None };
+        Ok(Fonts { regular, bold })
+    }
+
+    /// The page resources' /Font: A4nFont, and A4nFontB for the Bold.
+    fn resource(&self) -> lopdf::Dictionary {
+        let mut d = dictionary! { "A4nFont" => self.regular.0 };
+        if let Some((b, _)) = &self.bold {
+            d.set("A4nFontB", *b);
+        }
+        d
+    }
+}
+
+/// The underline's place under a line of text and its thickness, per size.
+const UNDER: f32 = 0.08;
+const UNDER_THICK: f32 = 1.0 / 18.0;
+
 /// The overlay's content for a page: the marks of `page`, drawn in points
 /// from the page's top left, with `to_pdf` the matrix from there into the
 /// page's space (it flips the y axis).
-fn overlay(layout: &Layout, page: u32, to_pdf: [f32; 6], glyphs: &GlyphRemapper, pictures: &[Picture]) -> Vec<u8> {
+fn overlay(layout: &Layout, page: u32, to_pdf: [f32; 6], fonts: &Fonts, pictures: &[Picture]) -> Vec<u8> {
     let [r, g, b] = layout.color;
     let mut s = format!("q {} cm {r:.3} {g:.3} {b:.3} rg {r:.3} {g:.3} {b:.3} RG 1 J\n", matrix(to_pdf));
     // pictures first, the answers over them; y runs down, so each is drawn
@@ -47,12 +81,29 @@ fn overlay(layout: &Layout, page: u32, to_pdf: [f32; 6], glyphs: &GlyphRemapper,
     }
     for m in &layout.marks {
         match m {
-            Mark::Text { page: p, x, y, size, angle, text } if *p == page => {
+            Mark::Text { page: p, x, y, size, angle, text, style } if *p == page => {
                 let (sin, cos) = angle.sin_cos();
+                let (name, glyphs) = match (&fonts.bold, style.bold) {
+                    (Some((_, g)), true) => ("A4nFontB", g),
+                    _ => ("A4nFont", &fonts.regular.1),
+                };
                 // y runs down here: the glyphs' up is -y
                 // two bytes a glyph: its number in the embedded subset
-                let hex: String = text.chars().map(|c| format!("{:04X}", glyphs.get(font::glyph(c).0 .0).unwrap_or(0))).collect();
-                s += &format!("BT /A4nFont {size:.2} Tf {cos:.5} {sin:.5} {sin:.5} {:.5} {x:.2} {y:.2} Tm <{hex}> Tj ET\n", -cos);
+                let hex: String = text.chars().map(|c| format!("{:04X}", glyphs.get(font::glyph_of(style.bold, c).0 .0).unwrap_or(0))).collect();
+                s += &format!("BT /{name} {size:.2} Tf {cos:.5} {sin:.5} {sin:.5} {:.5} {x:.2} {y:.2} Tm <{hex}> Tj ET\n", -cos);
+                if style.underline {
+                    // under the baseline (down the glyphs, -sin, cos as y
+                    // runs down), along it as far as the text is wide; flat
+                    // ends, so it is no longer than the text
+                    let (d, w) = (UNDER * size, font::width_of(style.bold, text, *size));
+                    let (x0, y0) = (x - d * sin, y + d * cos);
+                    s += &format!(
+                        "q {:.2} w 0 J {x0:.2} {y0:.2} m {:.2} {:.2} l S Q\n",
+                        UNDER_THICK * size,
+                        x0 + w * cos,
+                        y0 + w * sin
+                    );
+                }
             }
             Mark::Cross { page: p, b, width } if *p == page => {
                 s += &format!(
@@ -123,25 +174,30 @@ fn pictures(doc: &mut Document, places: &[crate::fill::ImagePlace], images: &[&[
     Ok(out)
 }
 
-/// Arimo as the glyphs `layout` sets, embedded in `doc`: a Type0 font over a
-/// CIDFontType2 with the subset as its FontFile2, the glyphs' widths, and a
-/// ToUnicode map so the text copies as written. Also the map from the
-/// font's glyph numbers to the subset's, which the text is written in.
-fn embed_font(doc: &mut Document, layout: &Layout) -> Result<(ObjectId, GlyphRemapper), String> {
-    let f = font::face();
+/// Arimo (its Bold when `bold`) as the glyphs `layout` sets in it,
+/// embedded in `doc`: a Type0 font over a CIDFontType2 with the subset as
+/// its FontFile2, the glyphs' widths, and a ToUnicode map so the text copies
+/// as written. Also the map from the font's glyph numbers to the subset's,
+/// which the text is written in.
+fn embed_font(doc: &mut Document, layout: &Layout, bold: bool) -> Result<(ObjectId, GlyphRemapper), String> {
+    let f = font::face_of(bold);
     let mut glyphs = GlyphRemapper::new();
     // each glyph of the subset, and the character it stands for
     let mut unicode: BTreeMap<u16, char> = BTreeMap::new();
     for m in &layout.marks {
-        if let Mark::Text { text, .. } = m {
+        if let Mark::Text { text, style, .. } = m {
+            if style.bold != bold {
+                continue;
+            }
             for c in text.chars() {
-                let (g, lost) = font::glyph(c);
+                let (g, lost) = font::glyph_of(bold, c);
                 let new = glyphs.remap(g.0);
                 unicode.entry(new).or_insert(if lost { '?' } else { c });
             }
         }
     }
-    let subset = subsetter::subset(font::DATA, 0, &glyphs).map_err(|e| format!("font subset: {e:?}"))?;
+    let data = if bold { font::BOLD_DATA } else { font::DATA };
+    let subset = subsetter::subset(data, 0, &glyphs).map_err(|e| format!("font subset: {e:?}"))?;
     let upm = f.units_per_em() as f32;
     let k = |v: i16| (v as f32 * 1000.0 / upm).round() as i64;
     // the subset's tag, six capitals before the name, from what it holds
@@ -150,7 +206,7 @@ fn embed_font(doc: &mut Document, layout: &Layout) -> Result<(ObjectId, GlyphRem
         h = (h ^ (*g as u32 ^ *c as u32)).wrapping_mul(16777619);
     }
     let tag: String = (0..6).map(|i| (b'A' + ((h >> (i * 5)) % 26) as u8) as char).collect();
-    let name = format!("{tag}+Arimo-Regular").into_bytes();
+    let name = format!("{tag}+Arimo-{}", if bold { "Bold" } else { "Regular" }).into_bytes();
     let mut file = Stream::new(dictionary! { "Length1" => subset.len() as i64 }, subset);
     let _ = file.compress();
     let file = doc.add_object(file);
@@ -159,11 +215,11 @@ fn embed_font(doc: &mut Document, layout: &Layout) -> Result<(ObjectId, GlyphRem
         "Type" => "FontDescriptor", "FontName" => Object::Name(name.clone()), "Flags" => 32,
         "FontBBox" => vec![k(bbox.x_min).into(), k(bbox.y_min).into(), k(bbox.x_max).into(), k(bbox.y_max).into()],
         "ItalicAngle" => 0, "Ascent" => k(f.ascender()), "Descent" => k(f.descender()),
-        "CapHeight" => k(f.capital_height().unwrap_or(f.ascender())), "StemV" => 80, "FontFile2" => file,
+        "CapHeight" => k(f.capital_height().unwrap_or(f.ascender())), "StemV" => if bold { 140 } else { 80 }, "FontFile2" => file,
     });
     // the subset's glyphs' widths, from glyph 0 on
     let widths: Vec<Object> =
-        glyphs.remapped_gids().map(|o| Object::Integer(font::advance(ttf_parser::GlyphId(o)).round() as i64)).collect();
+        glyphs.remapped_gids().map(|o| Object::Integer(font::advance_of(bold, ttf_parser::GlyphId(o)).round() as i64)).collect();
     let cid = doc.add_object(dictionary! {
         "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => Object::Name(name.clone()),
         "CIDSystemInfo" => dictionary! {
@@ -204,7 +260,7 @@ fn embed_font(doc: &mut Document, layout: &Layout) -> Result<(ObjectId, GlyphRem
 pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) -> Result<Vec<u8>, String> {
     let mut doc = Document::with_version("1.4");
     let pages_id = doc.new_object_id();
-    let (font, glyphs) = embed_font(&mut doc, layout)?;
+    let fonts = Fonts::embed(&mut doc, layout)?;
     let pics = pictures(&mut doc, images.0, images.1)?;
     let mut kids = vec![];
     for (i, jpeg) in pages.iter().enumerate() {
@@ -221,7 +277,7 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) ->
         // the picture as it came, the page the right way up turned from it
         let [pw, ph] = if turn % 180 == 90 { [size[1], size[0]] } else { size };
         let mut content = format!("q {pw:.2} 0 0 {ph:.2} 0 0 cm /A4nScan Do Q\n").into_bytes();
-        content.extend(overlay(layout, i as u32 + 1, shown([0.0, 0.0, pw, ph], turn as i64, 1.0), &glyphs, &pics));
+        content.extend(overlay(layout, i as u32 + 1, shown([0.0, 0.0, pw, ph], turn as i64, 1.0), &fonts, &pics));
         let mut xobjects = dictionary! { "A4nScan" => image };
         for p in pics.iter().filter(|p| p.page == i as u32 + 1) {
             xobjects.set(p.name.clone(), p.id);
@@ -235,7 +291,7 @@ pub fn scan(pages: &[&[u8]], sizes: &Sizes, layout: &Layout, images: &Images) ->
             "Contents" => contents,
             "Resources" => dictionary! {
                 "XObject" => xobjects,
-                "Font" => dictionary! { "A4nFont" => font },
+                "Font" => fonts.resource(),
             },
         })));
     }
@@ -386,7 +442,7 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> R
     if doc.is_encrypted() {
         return Err("encrypted, and it does not open without a password".into());
     }
-    let (font, glyphs) = embed_font(&mut doc, layout)?;
+    let fonts = Fonts::embed(&mut doc, layout)?;
     let pics = pictures(&mut doc, images.0, images.1)?;
     let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
     for (i, &page) in pages.iter().enumerate() {
@@ -425,7 +481,7 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> R
             body.extend(format!("q {} cm /{name} Do Q\n", matrix(cm)).into_bytes());
             shown.set(name, ap);
         }
-        body.extend(overlay(layout, i as u32 + 1, m, &glyphs, &pics));
+        body.extend(overlay(layout, i as u32 + 1, m, &fonts, &pics));
         for p in pics.iter().filter(|p| p.page == i as u32 + 1) {
             shown.set(p.name.clone(), p.id);
         }
@@ -435,7 +491,7 @@ pub fn over(source: &[u8], sizes: &Sizes, layout: &Layout, images: &Images) -> R
         let d = doc.get_dictionary_mut(page).map_err(|e| e.to_string())?;
         d.set("Contents", contents);
         shown.set("A4nPage", form);
-        d.set("Resources", dictionary! { "XObject" => shown, "Font" => dictionary! { "A4nFont" => font } });
+        d.set("Resources", dictionary! { "XObject" => shown, "Font" => fonts.resource() });
         d.set("MediaBox", media.iter().map(|&v| Object::Real(v)).collect::<Vec<_>>());
         d.set("CropBox", crop.iter().map(|&v| Object::Real(v)).collect::<Vec<_>>());
         d.set("Rotate", rotate);

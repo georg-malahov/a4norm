@@ -22,6 +22,12 @@
 //! shared size), and its `shift` moves all it puts on the page, text,
 //! cells and cross alike. The request's `texts` are free text of the
 //! person's own, set where they put it.
+//!
+//! A field's (or a free text's) `style` sets it apart from the form's own
+//! print, a note the site writes in the person's name: `bold` in Arimo
+//! Bold, measured in it (so a bold value is fitted and broken by its own
+//! widths), and `underline`, a rule under each line of it (pdf.rs). No
+//! style is the plain Regular, as ever.
 
 use crate::font::{self, CAP, DESCENT};
 use serde::{Deserialize, Serialize};
@@ -124,6 +130,18 @@ pub struct Field {
     /// `[dx, dy]` in points, right and down: moves all the field puts on
     /// its page
     pub shift: Option<[f32; 2]>,
+    /// bold, underlined: the field's text set apart from the form's print
+    #[serde(default)]
+    pub style: Style,
+}
+
+/// How a text is set: in Arimo Bold, and with a rule under it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct Style {
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub underline: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,6 +187,8 @@ pub struct FreeText {
     pub size: f32,
     pub text: String,
     pub rotate: Option<f32>,
+    #[serde(default)]
+    pub style: Style,
 }
 
 /// A picture's place: fitted into `box` (points from the page's top left),
@@ -211,8 +231,8 @@ pub struct Placed {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mark {
     /// text from its baseline's start, turned by `angle` radians (down to
-    /// the right when positive, as the page's lines run)
-    Text { page: u32, x: f32, y: f32, size: f32, angle: f32, text: String },
+    /// the right when positive, as the page's lines run), in `style`
+    Text { page: u32, x: f32, y: f32, size: f32, angle: f32, text: String, style: Style },
     /// a cross over `[x0, y0, x1, y1]`
     Cross { page: u32, b: [f32; 4], width: f32 },
 }
@@ -314,7 +334,7 @@ pub fn layout(req: &Request) -> Layout {
             Some(s) if s > 0.0 => Sizes { base: s, cap: s, min: s, exact: true },
             _ => full,
         };
-        if let Some((p, m)) = place_text(&text, place, ins, z) {
+        if let Some((p, m)) = place_text(&text, place, ins, z, f.style) {
             texts.push((f, text, p, m));
         }
     }
@@ -347,7 +367,7 @@ pub fn layout(req: &Request) -> Layout {
             if p.size > step && p.room < 1.5 * usual {
                 let place = f.place.as_ref().unwrap();
                 let ins = page(&req.inspections, place.page).unwrap();
-                if let Some(again) = place_text(text, place, ins, Sizes { cap: step, ..full }) {
+                if let Some(again) = place_text(text, place, ins, Sizes { cap: step, ..full }, f.style) {
                     (texts[i].2, texts[i].3) = again;
                 }
             }
@@ -370,11 +390,11 @@ pub fn layout(req: &Request) -> Layout {
             // the baseline's start turned about the text's middle
             angle = deg.to_radians();
             let (sin, cos) = angle.sin_cos();
-            let (cx, cy) = (t.x + font::width(text, t.size) / 2.0, t.y + (DESCENT - CAP) * t.size / 2.0);
+            let (cx, cy) = (t.x + font::width_of(t.style.bold, text, t.size) / 2.0, t.y + (DESCENT - CAP) * t.size / 2.0);
             let (dx, dy) = (t.x - cx, t.y - cy);
             (x, y) = (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
         }
-        out.marks.push(Mark::Text { page: t.page, x, y, size: t.size, angle, text: text.to_string() });
+        out.marks.push(Mark::Text { page: t.page, x, y, size: t.size, angle, text: text.to_string(), style: t.style });
     }
     // in the template's order
     let order = |k: &str| req.template.fields.iter().position(|f| f.key == k);
@@ -383,13 +403,13 @@ pub fn layout(req: &Request) -> Layout {
 }
 
 /// A text value at its place: one candidate, or several it runs on over.
-fn place_text(text: &str, place: &Place, ins: &Inspection, z: Sizes) -> Option<(Placed, Vec<Mark>)> {
+fn place_text(text: &str, place: &Place, ins: &Inspection, z: Sizes, style: Style) -> Option<(Placed, Vec<Mark>)> {
     if place.candidates.len() > 1 {
-        return run_on(text, &place.candidates, ins, z, place.page);
+        return run_on(text, &place.candidates, ins, z, place.page, style);
     }
     let one = Place { candidate: place.candidate.or(place.candidates.first().copied()), ..place.clone() };
     let (target, candidate) = snap(ins, &one, false)?;
-    let (placed, marks) = set(text, target, ins, z, place.page);
+    let (placed, marks) = set(text, target, ins, z, place.page, style);
     Some((Placed { candidate, ..placed }, marks))
 }
 
@@ -462,7 +482,7 @@ fn check(out: &mut Layout, f: &Field, place: &Place, ins: &Inspection, answer: &
 /// the cells of combs one after another; or into lines and fields, as many
 /// words into each as fit at the base size, the rest into the next, the
 /// last taking what is left by the usual rules. Placed where it starts.
-fn run_on(text: &str, ids: &[usize], ins: &Inspection, z: Sizes, page: u32) -> Option<(Placed, Vec<Mark>)> {
+fn run_on(text: &str, ids: &[usize], ins: &Inspection, z: Sizes, page: u32, style: Style) -> Option<(Placed, Vec<Mark>)> {
     let mut ids = ids.to_vec();
     ids.sort_unstable();
     let targets: Vec<Target> = ids.iter().filter_map(|&id| candidate(ins, id).map(|t| t.0)).collect();
@@ -487,7 +507,7 @@ fn run_on(text: &str, ids: &[usize], ins: &Inspection, z: Sizes, page: u32) -> O
             }
             let w = zone_width(t);
             let mut k = 0;
-            while k < words.len() && font::width(&words[..=k].join(" "), z.cap) <= w {
+            while k < words.len() && font::width_of(style.bold, &words[..=k].join(" "), z.cap) <= w {
                 k += 1;
             }
             let k = k.max(1).min(words.len());
@@ -501,13 +521,13 @@ fn run_on(text: &str, ids: &[usize], ins: &Inspection, z: Sizes, page: u32) -> O
         if chunk.is_empty() {
             continue;
         }
-        let (p, m) = set(chunk, *t, ins, z, page);
+        let (p, m) = set(chunk, *t, ins, z, page, style);
         (lines, overflow) = (lines + p.lines, overflow | p.overflow);
         first.get_or_insert(Placed { candidate: Some(*id), ..p });
         marks.extend(m);
     }
     let mut placed = first?;
-    (placed.lines, placed.overflow, placed.lost) = (lines, overflow, font::lost(text));
+    (placed.lines, placed.overflow, placed.lost) = (lines, overflow, font::lost_of(style.bold, text));
     Some((placed, marks))
 }
 
@@ -600,8 +620,9 @@ fn snap(ins: &Inspection, place: &Place, want_check: bool) -> Option<(Target, Op
 }
 
 /// A text or a comb value set in its target.
-fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Placed, Vec<Mark>) {
-    let lost = font::lost(text);
+fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32, style: Style) -> (Placed, Vec<Mark>) {
+    let lost = font::lost_of(style.bold, text);
+    let width = |s: &str, size: f32| font::width_of(style.bold, s, size);
     let placed = |x, y, size, lines, overflow, kind| Placed {
         key: String::new(),
         page,
@@ -620,7 +641,7 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
         Target::Comb(b, cells) => {
             let chars: Vec<String> = text.chars().filter(|c| !c.is_whitespace()).map(String::from).collect();
             let cw = (b[2] - b[0]) / cells.max(1) as f32;
-            let widest = chars.iter().map(|c| font::width(c, 1.0)).fold(0.5, f32::max);
+            let widest = chars.iter().map(|c| width(c, 1.0)).fold(0.5, f32::max);
             let size = if z.exact { z.base } else { z.base.min(0.7 * (b[3] - b[1])).min(0.8 * cw / widest) };
             let y = (b[1] + b[3]) / 2.0 + CAP * size / 2.0;
             let marks = chars
@@ -629,11 +650,12 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
                 .enumerate()
                 .map(|(i, c)| Mark::Text {
                     page,
-                    x: b[0] + (i as f32 + 0.5) * cw - font::width(c, size) / 2.0,
+                    x: b[0] + (i as f32 + 0.5) * cw - width(c, size) / 2.0,
                     y,
                     size,
                     angle: skew,
                     text: c.clone(),
+                    style,
                 })
                 .collect();
             (placed(b[0] + 0.5 * cw, y, size, 1, chars.len() > cells, "comb"), marks)
@@ -642,7 +664,7 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
             let (x0, x1) = (l.x0 + PAD, l.x1 - 1.0);
             let at = |x: f32| l.y0 + (l.y1 - l.y0) * (x - l.x0) / (l.x1 - l.x0).max(1.0);
             let room = room_above(ins, &l);
-            let (size, rows, overflow) = fit(text, x1 - x0, room, z);
+            let (size, rows, overflow) = fit(text, x1 - x0, room, z, style.bold);
             // descenders clear the line
             let foot = at(x0) - DESCENT * size - 0.8;
             let angle = ((l.y1 - l.y0) / (l.x1 - l.x0).max(1.0)).atan();
@@ -650,7 +672,7 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
             let marks = rows
                 .into_iter()
                 .enumerate()
-                .map(|(i, t)| Mark::Text { page, x: x0, y: foot - (n - 1 - i) as f32 * LEADING * size, size, angle, text: t })
+                .map(|(i, t)| Mark::Text { page, x: x0, y: foot - (n - 1 - i) as f32 * LEADING * size, size, angle, text: t, style })
                 .collect::<Vec<_>>();
             let y = foot - (n - 1) as f32 * LEADING * size;
             (Placed { room, ..placed(x0, y, size, n as u8, overflow, "text") }, marks)
@@ -671,14 +693,14 @@ fn set(text: &str, target: Target, ins: &Inspection, z: Sizes, page: u32) -> (Pl
                 .fold(b[1], f32::max)
                 .min(b[3] - 1.0);
             let zone = [b[0] + PAD, label + 0.5, b[2] - PAD, b[3] - 0.5];
-            let (size, rows, overflow) = fit(text, zone[2] - zone[0], zone[3] - zone[1], z);
+            let (size, rows, overflow) = fit(text, zone[2] - zone[0], zone[3] - zone[1], z, style.bold);
             // the lines' glyphs, cap to descender, centred in the zone
             let n = rows.len() as f32;
             let first = (zone[1] + zone[3]) / 2.0 - (n - 1.0) * LEADING * size / 2.0 + (CAP - DESCENT) * size / 2.0;
             let marks = rows
                 .into_iter()
                 .enumerate()
-                .map(|(i, t)| Mark::Text { page, x: zone[0], y: first + i as f32 * LEADING * size, size, angle: skew, text: t })
+                .map(|(i, t)| Mark::Text { page, x: zone[0], y: first + i as f32 * LEADING * size, size, angle: skew, text: t, style })
                 .collect();
             (Placed { room: zone[3] - zone[1], ..placed(zone[0], first, size, n as u8, overflow, "text") }, marks)
         }
@@ -708,13 +730,14 @@ fn room_above(ins: &Inspection, l: &ILine) -> f32 {
 /// The size and lines of `text` in `w` x `h`: as large as it may be, if it
 /// fits; else smaller, down to `min`; else on two lines if they fit at
 /// `min` or more; else one line at `min`, overflowing. Sizes below `base`
-/// are steps of its ladder.
-fn fit(text: &str, w: f32, h: f32, z: Sizes) -> (f32, Vec<String>, bool) {
+/// are steps of its ladder. Measured in the Bold when `bold`.
+fn fit(text: &str, w: f32, h: f32, z: Sizes, bold: bool) -> (f32, Vec<String>, bool) {
+    let width = |s: &str, size: f32| font::width_of(bold, s, size);
     // a size set by hand takes the height it needs
     let h = if z.exact { f32::INFINITY } else { h };
     // one line needs its glyphs' height, cap to descender, and a little air
     let top = z.step(z.cap.min(h / (CAP + DESCENT + 0.05)).max(z.min));
-    let one = font::width(text, top);
+    let one = width(text, top);
     if one <= w {
         return (top, vec![text.to_string()], false);
     }
@@ -727,11 +750,11 @@ fn fit(text: &str, w: f32, h: f32, z: Sizes) -> (f32, Vec<String>, bool) {
     let best = (1..words.len())
         .map(|k| (words[..k].join(" "), words[k..].join(" ")))
         .min_by(|a, b| {
-            let m = |p: &(String, String)| font::width(&p.0, 1.0).max(font::width(&p.1, 1.0));
+            let m = |p: &(String, String)| width(&p.0, 1.0).max(width(&p.1, 1.0));
             m(a).total_cmp(&m(b))
         });
     if let Some((a, b)) = best {
-        let widest = font::width(&a, 1.0).max(font::width(&b, 1.0));
+        let widest = width(&a, 1.0).max(width(&b, 1.0));
         let s2 = (w / widest).min(top).min(h / (2.0 * LEADING));
         if s2 >= z.min {
             return (z.step(s2), vec![a, b], false);

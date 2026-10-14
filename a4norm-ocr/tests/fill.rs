@@ -376,7 +376,7 @@ fn free_text_where_it_was_put() {
     let l = fill::layout(&r);
     assert_eq!(l.placed.len(), 1, "free text is no answer");
     let free: Vec<&Mark> = l.marks.iter().filter(|m| matches!(m, Mark::Text { x, .. } if *x == 320.0)).collect();
-    assert_eq!(free, [&Mark::Text { page: 1, x: 320.0, y: 200.0, size: 12.0, angle: 0.0, text: "Straße ş ł".into() }]);
+    assert_eq!(free, [&Mark::Text { page: 1, x: 320.0, y: 200.0, size: 12.0, angle: 0.0, text: "Straße ş ł".into(), style: Default::default() }]);
     assert_eq!(l.marks.len(), 2, "blank text is left out");
 }
 
